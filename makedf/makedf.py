@@ -36,6 +36,17 @@ TRUE_KE_THRESHOLDS = {"nmu_27MeV": ["muon", 0.027],
                       "nn_0MeV": ["neutron", 0.0]
                       }
 
+# ── helper: filter branches to those present in the tree ──────────────────────
+def filter_existing_branches(tree, branches):
+    """Return only branches that exist in the tree."""
+    available = set(tree.keys())
+    missing = [b for b in branches if b not in available]
+    if missing:
+        print(f"Warning: skipping missing branches: {missing}")
+    return [b for b in branches if b in available]
+
+# ──────────────────────────────────────────────────────────────────────────────
+
 def make_envdf(f):
     env = getenv.get_env(f)
     return env
@@ -178,6 +189,10 @@ def make_opflashdf(f):
     opflashdf = loadbranches(f["recTree"], opflashbranches).rec.opflashes
     return opflashdf
 
+def make_bcfmdf(f):
+     bcfmdf = loadbranches(f["recTree"], barycenterFMbranches).rec
+     return bcfmdf
+    
 def make_trkdf(f, scoreCut=False, requiret0=False, requireCosmic=False, mcs=False, det="SBND", updatecalo=None):
     trkdf = loadbranches(f["recTree"], trkbranches)
     if scoreCut:
@@ -215,10 +230,6 @@ def make_trkdf(f, scoreCut=False, requiret0=False, requireCosmic=False, mcs=Fals
             dedx_redo = chi2pid.dedx(trkhitdf, gain=det, calibrate=det, plane=plane, isMC=ismc, new_calo_params=chi2pid.CALO_VARIATIONS[updatecalo])
 
             trkhitdf["dedx_redo"] = dedx_redo
-            # TODO: check if score is reproduced
-            # dedx_bias = (dedx_redo - trkhitdf.dedx) / trkhitdf.dedx
-            # trkhitdf["dedx_bias"] = dedx_bias
-            # print("bias", list(dedx_bias.head()))
             for par in ['muon', 'proton']:
                 this_chi2_new, this_chi2_ndof = chi2pid.chi2par(trkhitdf, dedxname="dedx_redo", par=par)
                 this_chi2_col = ('pfp', 'trk', 'chi2pid', 'I' + str(plane), 'chi2_' + par + '_new', '')
@@ -442,13 +453,9 @@ def make_pandora_df(f, trkScoreCut=False, trkDistCut=50., cutClearCosmic=False, 
             trkhitdf = make_trkhitdf(f, plane)
             if det == "SBND": ## FIXME
                 trkhitdf = trkhitdf[InFV(df = trkhitdf, inzback = 0., det = "SBND_nohighyz")]
-            #dqdx_redo = chi2pid.dqdx(trkhitdf, gain=det, calibrate=det, isMC=ismc)
             dedx_redo = chi2pid.dedx(trkhitdf, gain=det, calibrate=det, plane=plane, isMC=ismc)
             dedx_bias = (dedx_redo - trkhitdf.dedx) / trkhitdf.dedx
             trkhitdf["dedx_redo"] = dedx_redo
-            #trkhitdf["dqdx_redo"] = dqdx_redo
-            #trkhitdf["dedx_bias"] = dedx_bias
-            #print(trkhitdf[trkhitdf.rr < 26.].head(50))
             for par in ['muon', 'proton']:
                 this_chi2_new, this_chi2_ndof = chi2pid.chi2par(trkhitdf, dedxname="dedx_redo", par=par)
                 this_chi2_col = ('pfp', 'trk', 'chi2pid', 'I' + str(plane), 'chi2_' + par + '_new', '')
@@ -474,7 +481,6 @@ def make_pandora_df(f, trkScoreCut=False, trkDistCut=50., cutClearCosmic=False, 
     if requireFiducial:
         slcdf = slcdf[InFV(slcdf.slc.vertex, 50)]
 
-    #print(slcdf.pfp.trk.chi2pid.head(50))
     return slcdf
 
 def make_spine_df(f, trkDistCut=-1, requireFiducial=True, **trkArgs):
@@ -489,7 +495,7 @@ def make_spine_df(f, trkDistCut=-1, requireFiducial=True, **trkArgs):
 
     if trkDistCut > 0:
         eslcdf = eslcdf[eslcdf.dist_to_vertex < trkDistCut]
-    # require fiducial verex
+    # require fiducial vertex
     if requireFiducial:
         eslcdf = eslcdf[InFV(eslcdf.vertex, 50)]
 
@@ -557,7 +563,6 @@ def make_stubs(f, det="ICARUS"):
     stubdf.Q = stubdf.Q.fillna(0)
 
     stubdf["dedx"] = stubdf.ke / stubdf.length
-
     stubdf["dedx_callo"] = stubdf.ke_callo / stubdf.length
     stubdf["dedx_calhi"] = stubdf.ke_calhi / stubdf.length
 
@@ -573,30 +578,14 @@ def make_stubs(f, det="ICARUS"):
     stubdf['pass_proton_stub'] = hasstub
     return stubdf
 
-    ## It seems there is a bug. First stub in each length is included for a slice...
-    # only take collection plane
-    #stubdf = stubdf[stubdf.plane == 2]
-
-    #stub_length_bins = [0, 0.5, 1, 2, 3, 4]
-    #stub_length_name = ["l0_5cm", "l1cm", "l2cm", "l3cm", "l4cm"]
-    #tosave = ["dedx", "dedx_callo", "dedx_calhi", "Q", "length", "charge", "inc_charge"]
-
-    #df_tosave = []
-    #for blo, bhi, name in zip(stub_length_bins[:-1], stub_length_bins[1:], stub_length_name):
-    #    stub_tosave = stubdf.dedx[(stubdf.length > blo) & (stubdf.length < bhi)].groupby(level=[0,1]).idxmax()
-    #    for col in tosave:
-    #        s = stubdf.loc[stub_tosave, col]
-    #        s.name = ("stub", name, col, "", "", "")
-    #        s.index = s.index.droplevel(-1)
-    #        df_tosave.append(s)
-
-    #return pd.concat(df_tosave, axis=1)
-
 def make_spineslcdf(f):
-    eslcdf = loadbranches(f["recTree"], eslcbranches)
+    # Filter to only branches present in this CAF version
+    existing_eslcbranches = filter_existing_branches(f["recTree"], eslcbranches)
+    eslcdf = loadbranches(f["recTree"], existing_eslcbranches)
     eslcdf = eslcdf.rec.dlp
 
-    etintdf = loadbranches(f["recTree"], etruthintbranches)
+    existing_etruthintbranches = filter_existing_branches(f["recTree"], etruthintbranches)
+    etintdf = loadbranches(f["recTree"], existing_etruthintbranches)
     etintdf = etintdf.rec.dlp_true
     
     # match to the truth info
@@ -604,36 +593,38 @@ def make_spineslcdf(f):
     # mc is truth
     mcdf.columns = pd.MultiIndex.from_tuples([tuple(["truth"] + list(c)) for c in mcdf.columns])
 
-    # Do matching
-    # 
-    # First get the ML true particle IDs matched to each reco particle
-    eslc_matchdf = loadbranches(f["recTree"], eslcmatchedbranches)
-    eslc_match_overlap_df = loadbranches(f["recTree"], eslcmatchovrlpbranches)
-    eslc_match_overlap_df.index.names = eslc_matchdf.index.names
-
-    eslc_matchdf = multicol_merge(eslc_matchdf, eslc_match_overlap_df, left_index=True, right_index=True, how="left", validate="one_to_one")
-    eslc_matchdf = eslc_matchdf.rec.dlp
-
-    # Then use bestmatch.match to get the nu ids in etintdf
-    eslc_matchdf_wids = pd.merge(eslc_matchdf, etintdf, left_on=["entry", "match"], right_on=["entry", "id"], how="left")
-    eslc_matchdf_wids.index = eslc_matchdf.index
-
-    # Now use nu_ids to get the true interaction information
-    eslc_matchdf_trueints = multicol_merge(eslc_matchdf_wids, mcdf, left_on=["entry", "nu_id"], right_index=True, how="left")
-    eslc_matchdf_trueints.index = eslc_matchdf_wids.index
-
-    # delete unnecesary matching branches
-    del eslc_matchdf_trueints[("match", "")]
-    del eslc_matchdf_trueints[("nu_id", "")]
-    del eslc_matchdf_trueints[("id", "")]
-
-    # first match is best match
-    bestmatch = eslc_matchdf_trueints.groupby(level=list(range(eslc_matchdf_trueints.index.nlevels-1))).first()
-
-    # add extra levels to eslcdf columns
+    # add extra levels to eslcdf columns (always needed)
     eslcdf.columns = pd.MultiIndex.from_tuples([tuple(list(c) + [""]*2) for c in eslcdf.columns])
 
-    eslcdf_withmc = multicol_merge(eslcdf, bestmatch, left_index=True, right_index=True, how="left")
+    # Do matching only if match branches are defined
+    if eslcmatchedbranches and eslcmatchovrlpbranches:
+        eslc_matchdf = loadbranches(f["recTree"], eslcmatchedbranches)
+        eslc_match_overlap_df = loadbranches(f["recTree"], eslcmatchovrlpbranches)
+        eslc_match_overlap_df.index.names = eslc_matchdf.index.names
+
+        eslc_matchdf = multicol_merge(eslc_matchdf, eslc_match_overlap_df, left_index=True, right_index=True, how="left", validate="one_to_one")
+        eslc_matchdf = eslc_matchdf.rec.dlp
+
+        # Then use bestmatch.match to get the nu ids in etintdf
+        eslc_matchdf_wids = pd.merge(eslc_matchdf, etintdf, left_on=["entry", "match"], right_on=["entry", "id"], how="left")
+        eslc_matchdf_wids.index = eslc_matchdf.index
+
+        # Now use nu_ids to get the true interaction information
+        eslc_matchdf_trueints = multicol_merge(eslc_matchdf_wids, mcdf, left_on=["entry", "nu_id"], right_index=True, how="left")
+        eslc_matchdf_trueints.index = eslc_matchdf_wids.index
+
+        # delete unnecessary matching branches
+        del eslc_matchdf_trueints[("match", "")]
+        del eslc_matchdf_trueints[("nu_id", "")]
+        del eslc_matchdf_trueints[("id", "")]
+
+        # first match is best match
+        bestmatch = eslc_matchdf_trueints.groupby(level=list(range(eslc_matchdf_trueints.index.nlevels-1))).first()
+
+        eslcdf_withmc = multicol_merge(eslcdf, bestmatch, left_index=True, right_index=True, how="left")
+    else:
+        # no matching — just return eslcdf without truth matching
+        eslcdf_withmc = eslcdf
 
     # Fix position names (I0, I1, I2) -> (x, y, z)
     def mappos(s):
@@ -650,49 +641,45 @@ def make_spineslcdf(f):
     return eslcdf_withmc
 
 def make_spinepartdf(f):
-    epartdf = loadbranches(f["recTree"], eparticlebranches)
+    # Filter to only branches present in this CAF version
+    existing_eparticlebranches = filter_existing_branches(f["recTree"], eparticlebranches)
+    epartdf = loadbranches(f["recTree"], existing_eparticlebranches)
     epartdf = epartdf.rec.dlp.particles
 
     tpartdf = loadbranches(f["recTree"], trueparticlebranches)
     tpartdf = tpartdf.rec.true_particles
-    # cut out EMShowerDaughters
-    # tpartdf = tpartdf[(tpartdf.parent == 0)]
 
-    etpartdf = loadbranches(f["recTree"], etrueparticlebranches)
+    existing_etrueparticlebranches = filter_existing_branches(f["recTree"], etrueparticlebranches)
+    etpartdf = loadbranches(f["recTree"], existing_etrueparticlebranches)
     etpartdf = etpartdf.rec.dlp_true.particles
     etpartdf.columns = [s for s in etpartdf.columns]
-    
-    # Do matching
-    # 
-    # First get the ML true particle IDs matched to each reco particle
-    epart_matchdf = loadbranches(f["recTree"], eparticlematchedbranches)
-    epart_match_overlap_df = loadbranches(f["recTree"], eparticlematchovrlpbranches)
-    epart_match_overlap_df.index.names = epart_matchdf.index.names
-    epart_matchdf = multicol_merge(epart_matchdf, epart_match_overlap_df, left_index=True, right_index=True, how="left", validate="one_to_one")
-    epart_matchdf = epart_matchdf.rec.dlp.particles
-    # get the best match (highest match_overlap), assume it's sorted
-    bestmatch = epart_matchdf.groupby(level=list(range(epart_matchdf.index.nlevels-1))).first()
-    bestmatch.columns = [s for s in bestmatch.columns]
 
-    # Then use betmatch.match to get the G4 track IDs in etpartdf
-    bestmatch_wids = pd.merge(bestmatch, etpartdf, left_on=["entry", "match"], right_on=["entry", "id"], how="left")
-    bestmatch_wids.index = bestmatch.index
-
-    # Now use the G4 track IDs to get the true particle information
-    bestmatch_trueparticles = multicol_merge(bestmatch_wids, tpartdf, left_on=["entry", "track_id"], right_on=["entry", ("G4ID", "")], how="left")
-    bestmatch_trueparticles.index = bestmatch_wids.index
-
-    # delete unnecesary matching branches
-    del bestmatch_trueparticles[("match", "")]
-    del bestmatch_trueparticles[("track_id", "")]
-    del bestmatch_trueparticles[("id", "")]
-
-    # add extra level to epartdf columns
+    # add extra level to epartdf columns (always needed)
     epartdf.columns = pd.MultiIndex.from_tuples([tuple(list(c) + [""]) for c in epartdf.columns])
 
-    # put everything in epartdf
-    for c in bestmatch_trueparticles.columns:
-        epartdf[tuple(["truth"] + list(c))] = bestmatch_trueparticles[c]
+    # Do matching only if match branches are defined
+    if eparticlematchedbranches and eparticlematchovrlpbranches:
+        epart_matchdf = loadbranches(f["recTree"], eparticlematchedbranches)
+        epart_match_overlap_df = loadbranches(f["recTree"], eparticlematchovrlpbranches)
+        epart_match_overlap_df.index.names = epart_matchdf.index.names
+        epart_matchdf = multicol_merge(epart_matchdf, epart_match_overlap_df, left_index=True, right_index=True, how="left", validate="one_to_one")
+        epart_matchdf = epart_matchdf.rec.dlp.particles
+        bestmatch = epart_matchdf.groupby(level=list(range(epart_matchdf.index.nlevels-1))).first()
+        bestmatch.columns = [s for s in bestmatch.columns]
+
+        bestmatch_wids = pd.merge(bestmatch, etpartdf, left_on=["entry", "match"], right_on=["entry", "id"], how="left")
+        bestmatch_wids.index = bestmatch.index
+
+        bestmatch_trueparticles = multicol_merge(bestmatch_wids, tpartdf, left_on=["entry", "track_id"], right_on=["entry", ("G4ID", "")], how="left")
+        bestmatch_trueparticles.index = bestmatch_wids.index
+
+        del bestmatch_trueparticles[("match", "")]
+        del bestmatch_trueparticles[("track_id", "")]
+        del bestmatch_trueparticles[("id", "")]
+
+        # put truth matching into epartdf
+        for c in bestmatch_trueparticles.columns:
+            epartdf[tuple(["truth"] + list(c))] = bestmatch_trueparticles[c]
 
     # Fix position names (I0, I1, I2) -> (x, y, z)
     def mappos(s):
