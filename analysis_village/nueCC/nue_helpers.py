@@ -46,6 +46,12 @@ CAT_LABELS = {
    -1: r"Unknown",
 }
 
+PID_PHOTON = 0
+PID_ELECTRON = 1
+PID_MUON = 2
+PID_PION = 3
+PID_PROTON = 4
+
 # ============================================================
 # ParticleView / InteractionView wrappers (unchanged)
 # ============================================================
@@ -295,6 +301,215 @@ def plot_stacked_hist(series_list, labels, colors, bins, weights=None,
 
     return ax.get_figure(), ax
 
+
+# ============================================================
+# Threshold scan plots (shower-quality cut optimisation)
+# ============================================================
+def threshold_plots(evtdf, cut_flow_result, cut_stage, metric_col,
+                    bounds, xaxis_name, plot_title,
+                    threshold_range, cut_dir='<', legend_loc='right',
+                    truth_categories=None, fig_width=7,
+                    save_name=None, plot_folder="plots"):       
+
+    from nue_selection import PID_ELECTRON, classify_truth
+
+    il         = inter_levels(evtdf)
+    presel_idx = cut_flow_result[cut_stage]["inter_index"]
+
+    if truth_categories is None:
+        cat = classify_truth(evtdf, verbose=False)
+    else:
+        cat = truth_categories
+
+    rp    = reco_particles(evtdf)
+    rp_df = rp._df
+
+    # ── Resolve to a SCALAR column key (always one column, never a block) ─
+    # pid_scores   → ('pid_scores',   'I1')   electron score
+    # primary_scores → ('primary_scores', 'I1') electron primary score
+    # everything else → plain string or ('col', '')
+    _MULTI_COL_ELECTRON_IDX = {
+        'pid_scores':     ('pid_scores',     'I1'),
+        'primary_scores': ('primary_scores', 'I1'),
+    }
+
+    if isinstance(metric_col, str) and metric_col in _MULTI_COL_ELECTRON_IDX:
+        col_key = _MULTI_COL_ELECTRON_IDX[metric_col]
+    elif isinstance(metric_col, str):
+        if metric_col in rp_df.columns:
+            col_key = metric_col
+        elif (metric_col, '') in rp_df.columns:
+            col_key = (metric_col, '')
+        else:
+            matches = [c for c in rp_df.columns
+                       if (isinstance(c, tuple) and c[0] == metric_col)
+                       or c == metric_col]
+            if not matches:
+                raise KeyError(
+                    f"'{metric_col}' not found in reco_particles.\n"
+                    f"First 40 cols: {list(rp_df.columns)[:40]}"
+                )
+            col_key = matches[0]
+    else:
+        col_key = metric_col   # already a precise tuple
+
+    # Verify it resolves to a single Series, not a DataFrame
+    test = rp_df[col_key]
+    if isinstance(test, pd.DataFrame):
+        raise KeyError(
+            f"col_key={col_key!r} still resolves to a DataFrame "
+            f"with columns {list(test.columns)}. "
+            f"Pass a more specific tuple, e.g. {[(col_key, c) for c in test.columns]}"
+        )
+
+    ke_col  = ('ke',  '') if ('ke',  '') in rp_df.columns else 'ke'
+    pid_col = ('pid', '') if ('pid', '') in rp_df.columns else 'pid'
+
+    # ── Electrons in pre-selected interactions ────────────────────────────
+    inter_idx_of_particle = rp_df.index.droplevel(-1)
+    in_presel  = inter_idx_of_particle.isin(presel_idx)
+    ele_presel = rp_df[in_presel & (rp_df[pid_col] == PID_ELECTRON)]
+
+    # ── Build flat tmp frame — both columns now guaranteed 1-D ───────────
+    tmp = pd.DataFrame({
+        'ke':     ele_presel[ke_col].to_numpy(dtype=float),
+        'metric': ele_presel[col_key].to_numpy(dtype=float),
+    }, index=ele_presel.index)
+
+    # ── Leading electron per interaction: metric at max KE ────────────────
+    def metric_at_max_ke(g):
+        return g.loc[g['ke'].idxmax(), 'metric']
+
+    leading_metric = tmp.groupby(level=il).apply(metric_at_max_ke)
+    inter_index    = leading_metric.index
+
+    # ── Metric & truth ────────────────────────────────────────────────────
+    metric_vals = leading_metric.to_numpy(dtype=float).flatten()
+    is_signal   = (cat.reindex(inter_index).fillna(-1).to_numpy().flatten() == 0)
+
+    assert len(metric_vals) == len(is_signal), \
+        f"BUG: metric={len(metric_vals)} vs signal={len(is_signal)}"
+
+    valid       = ~np.isnan(metric_vals) & (metric_vals != -1)
+    metric_vals = metric_vals[valid]
+    is_signal   = is_signal[valid]
+
+    if len(metric_vals) == 0:
+        print(f"No valid events for '{metric_col}'. Skipping.")
+        return None, None
+
+    # ── Histogram ─────────────────────────────────────────────────────────
+    xmin, xmax = bounds
+    bin_edges  = np.linspace(xmin, xmax, 51)
+
+    signal_vals     = metric_vals[is_signal]
+    background_vals = metric_vals[~is_signal]
+
+    fig = plt.figure(figsize=(fig_width, 8))
+    gs  = fig.add_gridspec(4, 1, hspace=0.05)
+    ax1 = fig.add_subplot(gs[:3, 0])
+
+    ax1.hist(background_vals, bins=bin_edges, histtype='step',
+             label=f'Background ({len(background_vals):,} events)',
+             color='orange', density=True, linewidth=1.5)
+    ax1.hist(signal_vals, bins=bin_edges, histtype='step',
+             label=r'Signal $\nu_e$ CC' + f' ({len(signal_vals):,} events)',
+             color='blue', density=True, linewidth=1.5)
+
+    ax1.set_ylabel('Probability Density', fontsize=14)
+    ax1.set_title(plot_title, fontsize=16, pad=10)
+    ax1.legend(loc=f'upper {legend_loc}', framealpha=0.3, fontsize=12)
+    ax1.set_xlim(xmin, xmax)
+    ax1.tick_params(labelbottom=False)
+    ax1.minorticks_on()
+    ax1.tick_params(axis='both', which='major', length=8, labelsize=12,
+                    direction='in', width=1.2)
+    ax1.tick_params(axis='both', which='minor', length=4,
+                    direction='in', width=0.8)
+    ax1.grid(True, which='major', linestyle='-', linewidth=0.5, alpha=0.3)
+    for spine in ax1.spines.values():
+        spine.set_color('black')
+        spine.set_linewidth(1.2)
+
+    # ── Threshold scan ────────────────────────────────────────────────────
+    start, stop, step = threshold_range
+    thresholds = np.arange(start, stop + step / 2, step)
+    if len(thresholds) <= 1:
+        thresholds = np.linspace(start, stop, 120)
+
+    total_signal = is_signal.sum()
+    keep_above   = (cut_dir == '>')
+
+    purities, efficiencies, f1s = [], [], []
+    for thresh in thresholds:
+        passed       = (metric_vals > thresh) if keep_above else (metric_vals < thresh)
+        n_passed     = passed.sum()
+        n_sig_passed = (passed & is_signal).sum()
+
+        pur = n_sig_passed / n_passed     if n_passed     > 0 else 0.0
+        eff = n_sig_passed / total_signal if total_signal > 0 else 0.0
+        f1  = 2 * pur * eff / (pur + eff) if (pur + eff)  > 0 else 0.0
+
+        purities.append(pur)
+        efficiencies.append(eff)
+        f1s.append(f1)
+
+    f1s        = np.array(f1s)
+    opt_idx    = np.argmax(f1s)
+    opt_thresh = float(thresholds[opt_idx])
+    max_f1     = float(f1s[opt_idx])
+
+    # ── Performance panel ─────────────────────────────────────────────────
+    ax2 = fig.add_subplot(gs[3, 0])
+    ax2.plot(thresholds, purities,     'b-',           label='Purity',     linewidth=1.5)
+    ax2.plot(thresholds, efficiencies, 'r-',           label='Efficiency', linewidth=1.5)
+    ax2.plot(thresholds, f1s,          color='purple', label='F1 Score',   linewidth=1.5)
+    ax2.axvline(opt_thresh, color='purple', linestyle='--', linewidth=1.5)
+
+    ax2.set_xlabel(xaxis_name, fontsize=14)
+    ax2.set_ylabel('Performance', fontsize=14)
+    ax2.set_xlim(xmin, xmax)
+    ax2.set_ylim(0, 1)
+    ax2.legend(loc=f'upper {legend_loc}', framealpha=0.3, fontsize=12)
+
+    range_x = xmax - xmin
+    if cut_dir == '<':
+        text_x, ha = opt_thresh + range_x * 0.05, 'left'
+    else:
+        text_x, ha = opt_thresh - range_x * 0.05, 'right'
+
+    ax2.text(text_x, 0.05, f'Max F1 at {opt_thresh:.3f}',
+             color='purple', va='bottom', ha=ha, fontsize=13,
+             bbox=dict(boxstyle="round,pad=0.3", facecolor='white',
+                       edgecolor='none', alpha=0.5))
+
+    ax2.minorticks_on()
+    ax2.tick_params(axis='both', which='major', length=6, labelsize=12,
+                    direction='in', width=1)
+    ax2.tick_params(axis='both', which='minor', length=3,
+                    direction='in', width=0.8)
+    ax2.grid(True, which='major', linestyle='-', linewidth=0.5, alpha=0.3)
+    for spine in ax2.spines.values():
+        spine.set_color('black')
+        spine.set_linewidth(1.2)
+
+    plt.tight_layout()
+    if save_name is not None:
+        save_plot(save_name, fig=fig, folder_name=plot_folder)
+    plt.show()
+
+    print(f"\n{'─'*42}")
+    print(f"  Variable  : {metric_col}")
+    print(f"  Cut dir   : {cut_dir} {opt_thresh:.4f}")
+    print(f"  Efficiency: {efficiencies[opt_idx]*100:.1f}%")
+    print(f"  Purity    : {purities[opt_idx]*100:.1f}%")
+    print(f"  Max F1    : {max_f1:.4f}")
+    print(f"{'─'*42}\n")
+
+    return opt_thresh, max_f1
+
+
+    
 # The rest of the plotting helpers are unchanged
 def plot_eff_pur_vs_bin(bin_centers, purs, effs, counts_true=None,
                         xlabel="", title="", ax=None, ax2=None,
@@ -318,17 +533,23 @@ def plot_eff_pur_vs_bin(bin_centers, purs, effs, counts_true=None,
     return ax.get_figure(), ax
 
 def create_purity_efficiency_table(purs, effs, labels, ax):
+    """
+    Create a clean purity/efficiency summary table.
+    Vertical row height now automatically scales with the number of cuts
+    so the table never looks compressed even with 10+ rows.
+    """
     ax.axis("off")
+
     _labels = list(labels)
     pur_pct = [p * 100 if (p is not None and not np.isnan(p)) else np.nan for p in purs]
     eff_pct = [e * 100 if (e is not None and not np.isnan(e)) else np.nan for e in effs]
 
     results = pd.DataFrame({
-        "Cut":         _labels,
-        "Purity [%]":  [f"{p:.2f}" if not np.isnan(p) else "—" for p in pur_pct],
+        "Cut": _labels,
+        "Purity [%]": [f"{p:.2f}" if not np.isnan(p) else "—" for p in pur_pct],
         "Efficiency [%]": [f"{e:.2f}" if not np.isnan(e) else "—" for e in eff_pct],
-        "ΔEff [%]":    ["—"] + [f"{eff_pct[i] - eff_pct[i-1]:.2f}" for i in range(1, len(eff_pct))],
-        "ΔPur [%]":    ["—"] + [f"{pur_pct[i] - pur_pct[i-1]:.2f}" for i in range(1, len(pur_pct))],
+        "ΔEff [%]": ["—"] + [f"{eff_pct[i] - eff_pct[i-1]:.2f}" for i in range(1, len(eff_pct))],
+        "ΔPur [%]": ["—"] + [f"{pur_pct[i] - pur_pct[i-1]:.2f}" for i in range(1, len(pur_pct))],
     })
 
     table = ax.table(
@@ -337,20 +558,28 @@ def create_purity_efficiency_table(purs, effs, labels, ax):
         loc="center",
         cellLoc="center",
     )
-    table.auto_set_font_size(False)
-    table.set_fontsize(10)
-    table.scale(1.0, 2.0)
 
-    # ── Column widths: Cut column is auto; numeric columns are fixed ──────────
+    table.auto_set_font_size(False)
+    table.set_fontsize(10 if len(results) <= 10 else 9)   # slightly smaller font for very long tables
+
+    # ── Dynamic row height: scales automatically with number of rows ──
+    n_rows = len(results) + 1                    # +1 for the header row
+    # This formula keeps the table nicely filling the axes:
+    #   ~10 rows → scale ≈ 1.8–2.0
+    #   ~15 rows → scale ≈ 1.3
+    #   20+ rows → scale ≈ 1.1 (still readable)
+    row_scale = max(1.05, 18.0 / n_rows)
+    table.scale(1.0, row_scale)
+
+    # ── Column widths: Cut column auto, numeric columns fixed ─────────────
     col_widths = {0: None, 1: 0.13, 2: 0.15, 3: 0.12, 4: 0.12}
-    n_rows = len(results) + 1  # +1 for header
 
     for (row, col), cell in table.get_celld().items():
         w = col_widths.get(col)
         if w is not None:
             cell.set_width(w)
 
-        # Header row
+        # Header styling
         if row == 0:
             cell.set_facecolor("#2c3e50")
             cell.set_text_props(color="white", fontweight="bold")
@@ -363,7 +592,7 @@ def create_purity_efficiency_table(purs, effs, labels, ax):
             cell.set_facecolor("#ffffff")
             cell.set_edgecolor("#cccccc")
 
-        # Highlight delta columns in muted tones
+        # Delta columns in muted italic
         if row > 0 and col in (3, 4):
             cell.set_text_props(color="#555555", style="italic")
 
