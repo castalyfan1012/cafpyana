@@ -1,588 +1,314 @@
+#!/usr/bin/env python3
 """
-make_nueCCdf.py
---------------
-cafpyana / makedf functions for the SPINE DLP nueCC inclusive analysis.
+make_nueCC_df.py
+----------------
+SPINE DLP-based nueCC inclusive MC DataFrame makers for cafpyana.
+Called from nueCC_mc.py via run_df_maker.py.
 
-Produces a SKIMMED particle-level DataFrame restricted to interactions that pass:
-  (1) Flash match   rec.dlp.is_flash_matched == 1
-  (2) Fiducial cut  rec.dlp.is_fiducial       == 1
-
-Reduction: ~95% fewer rows vs. the full 'evt' table.
-Column structure is IDENTICAL to the full table, so nue_helpers.py and
-nue_selection.py work without any modification.
-
-Truth information is joined via the best-match DLP interaction stored in
-rec.dlp..match_ids (index 0 = highest-overlap truth interaction).
-
-Usage in a cafpyana config  (nueCC_mc.py):
-    from make_nueCCdf import make_nuecc_evtdf, make_nuecc_statsdf
-    from makedf.makedf import make_hdrdf, make_potdf_bnb
-    DFS   = [make_nuecc_evtdf, make_nuecc_statsdf, make_hdrdf, make_potdf_bnb]
-    NAMES = ["evt",            "stats",             "hdr",      "pot"         ]
-
-NOTE ON BRANCH NAMES
+Two public functions
 --------------------
-Branch names follow the flat-tree convention used by SPINE CAFs at SBND.
-The double-dot (..) marks the vector dimension that becomes a MultiIndex level.
-Verify / adjust them against your CAF with:
+make_nuecc_evtdf(f)
+    Particle-level SPINE df (reco + truth), merged with the MC neutrino
+    record, filtered to interactions passing reco flash-match + FV.
+    Index: (entry, rec.dlp..index, rec.dlp.particles..index)
+    Drop-in replacement for the Pandora make_nueccdf_mc — same column
+    access pattern (nue_helpers.reco_particles / true_particles etc.).
 
-    import uproot
-    with uproot.open("your_file.caf.root") as f:
-        print(f["recTree"].keys())
+make_nuecc_statsdf(f)
+    One-row DataFrame with pre-cut interaction and signal counts.
+    These are the efficiency denominators for the notebook cut-flow
+    table; they are computed BEFORE any reco cut is applied so no
+    signal is lost.
 
-If loadbranches raises a KeyError for any branch, comment it out from the
-relevant list below – the pre-selection and nue_selection logic only require
-the branches that are listed without a "# optional" comment.
+Truth-signal definition (must match nue_selection.py / skim_nue_v2.py):
+    nu_id >= 0  &  current_type == 0  &  is_fiducial (truth) == 1
+    &  exactly 1 primary true electron with KE > ELECTRON_THRESHOLD_MEV
 """
 
-from makedf.makedf import *          # loadbranches, make_hdrdf, make_potdf_bnb, …
-from pyanalib.pandas_helpers import *  # multicol_merge, multicol_add, …
+import warnings
 
 import numpy as np
 import pandas as pd
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Branch lists  –  edit only if your CAF uses a different naming scheme
-# ─────────────────────────────────────────────────────────────────────────────
-
-# ── Reco DLP: interaction-level ───────────────────────────────────────────────
-_DLP_INTER_BRANCHES = [
-    # Vertex
-    "rec.dlp..vertex.x",
-    "rec.dlp..vertex.y",
-    "rec.dlp..vertex.z",
-    # Selection flags  (required for pre-selection)
-    "rec.dlp..is_flash_matched",
-    "rec.dlp..is_fiducial",
-    "rec.dlp..is_contained",
-    "rec.dlp..is_time_contained",
-    "rec.dlp..is_matched",
-    "rec.dlp..is_cathode_crosser",
-    "rec.dlp..is_truth",
-    # Flash
-    "rec.dlp..flash_hypo_pe",
-    "rec.dlp..flash_total_pe",
-    # Multiplicity / size
-    "rec.dlp..id",
-    "rec.dlp..size",
-    "rec.dlp..num_particles",
-    "rec.dlp..num_primary_particles",
-    "rec.dlp..depositions_sum",
-    "rec.dlp..cathode_offset",
-    # Truth-reco matching  (required for truth join)
-    "rec.dlp..match_ids",
-    "rec.dlp..match_overlaps",
-    # Particle counts per PID  (0=photon 1=electron 2=muon 3=pion 4=proton 5=other)
-    "rec.dlp..particle_counts.0",
-    "rec.dlp..particle_counts.1",
-    "rec.dlp..particle_counts.2",
-    "rec.dlp..particle_counts.3",
-    "rec.dlp..particle_counts.4",
-    "rec.dlp..particle_counts.5",
-    "rec.dlp..primary_particle_counts.0",
-    "rec.dlp..primary_particle_counts.1",
-    "rec.dlp..primary_particle_counts.2",
-    "rec.dlp..primary_particle_counts.3",
-    "rec.dlp..primary_particle_counts.4",
-    "rec.dlp..primary_particle_counts.5",
-]
-
-# ── Reco DLP: particle-level ─────────────────────────────────────────────────
-_DLP_PART_BRANCHES = [
-    # PID + scores  (required for cut flow)
-    "rec.dlp.particles..pid",
-    "rec.dlp.particles..pid_scores.0",
-    "rec.dlp.particles..pid_scores.1",    # electron PID softmax
-    "rec.dlp.particles..pid_scores.2",
-    "rec.dlp.particles..pid_scores.3",
-    "rec.dlp.particles..pid_scores.4",
-    "rec.dlp.particles..pid_scores.5",
-    "rec.dlp.particles..chi2_pid",
-    "rec.dlp.particles..chi2_per_pid.0",
-    "rec.dlp.particles..chi2_per_pid.1",
-    "rec.dlp.particles..chi2_per_pid.2",
-    "rec.dlp.particles..chi2_per_pid.3",
-    "rec.dlp.particles..chi2_per_pid.4",
-    "rec.dlp.particles..chi2_per_pid.5",
-    "rec.dlp.particles..primary_scores.0",
-    "rec.dlp.particles..primary_scores.1",  # electron primary softmax
-    # Kinematics  (required for leading-electron observables)
-    "rec.dlp.particles..ke",
-    "rec.dlp.particles..p",
-    "rec.dlp.particles..mass",
-    "rec.dlp.particles..calo_ke",
-    "rec.dlp.particles..csda_ke",
-    "rec.dlp.particles..csda_ke_per_pid.0",
-    "rec.dlp.particles..csda_ke_per_pid.1",
-    "rec.dlp.particles..csda_ke_per_pid.2",
-    "rec.dlp.particles..csda_ke_per_pid.3",
-    "rec.dlp.particles..csda_ke_per_pid.4",
-    "rec.dlp.particles..csda_ke_per_pid.5",
-    "rec.dlp.particles..mcs_ke",
-    "rec.dlp.particles..mcs_ke_per_pid.0",
-    "rec.dlp.particles..mcs_ke_per_pid.1",
-    "rec.dlp.particles..mcs_ke_per_pid.2",
-    "rec.dlp.particles..mcs_ke_per_pid.3",
-    "rec.dlp.particles..mcs_ke_per_pid.4",
-    "rec.dlp.particles..mcs_ke_per_pid.5",
-    # Momentum vector  (required for cos-theta)
-    "rec.dlp.particles..momentum.x",
-    "rec.dlp.particles..momentum.y",
-    "rec.dlp.particles..momentum.z",
-    # Geometry
-    "rec.dlp.particles..start_point.x",
-    "rec.dlp.particles..start_point.y",
-    "rec.dlp.particles..start_point.z",
-    "rec.dlp.particles..end_point.x",
-    "rec.dlp.particles..end_point.y",
-    "rec.dlp.particles..end_point.z",
-    "rec.dlp.particles..start_dir.x",
-    "rec.dlp.particles..start_dir.y",
-    "rec.dlp.particles..start_dir.z",
-    "rec.dlp.particles..end_dir.x",
-    "rec.dlp.particles..end_dir.y",
-    "rec.dlp.particles..end_dir.z",
-    "rec.dlp.particles..length",
-    # Shower quality  (required for shower-quality cut flow)
-    "rec.dlp.particles..start_dedx",
-    "rec.dlp.particles..vertex_distance",
-    "rec.dlp.particles..directional_spread",
-    "rec.dlp.particles..axial_spread",
-    "rec.dlp.particles..start_straightness",
-    "rec.dlp.particles..axial_spread",
-    # Topology flags
-    "rec.dlp.particles..is_primary",
-    "rec.dlp.particles..is_valid",
-    "rec.dlp.particles..is_contained",
-    "rec.dlp.particles..is_matched",
-    "rec.dlp.particles..is_cathode_crosser",
-    "rec.dlp.particles..is_time_contained",
-    "rec.dlp.particles..is_truth",
-    "rec.dlp.particles..shape",
-    "rec.dlp.particles..size",
-    "rec.dlp.particles..num_fragments",
-    "rec.dlp.particles..depositions_sum",
-    "rec.dlp.particles..cathode_offset",
-    "rec.dlp.particles..interaction_id",
-    # Reco↔truth matching (particle level)
-    "rec.dlp.particles..match_ids",
-    "rec.dlp.particles..match_overlaps",
-]
-
-# ── Truth DLP: interaction-level ──────────────────────────────────────────────
-_DLP_TRUE_INTER_BRANCHES = [
-    # Neutrino identity  (required for classify_truth)
-    "rec.dlp_true..nu_id",
-    "rec.dlp_true..pdg_code",
-    "rec.dlp_true..current_type",        # 0=CC 1=NC
-    "rec.dlp_true..interaction_mode",
-    "rec.dlp_true..interaction_type",
-    "rec.dlp_true..lepton_pdg_code",
-    "rec.dlp_true..lepton_p",
-    "rec.dlp_true..lepton_track_id",
-    # Fiducial / containment  (required for classify_truth + true_signal_index)
-    "rec.dlp_true..is_fiducial",
-    "rec.dlp_true..is_contained",
-    "rec.dlp_true..is_matched",
-    "rec.dlp_true..is_flash_matched",
-    "rec.dlp_true..is_time_contained",
-    "rec.dlp_true..is_cathode_crosser",
-    "rec.dlp_true..is_truth",
-    # Position / kinematics
-    "rec.dlp_true..vertex.x",
-    "rec.dlp_true..vertex.y",
-    "rec.dlp_true..vertex.z",
-    "rec.dlp_true..reco_vertex.x",
-    "rec.dlp_true..reco_vertex.y",
-    "rec.dlp_true..reco_vertex.z",
-    "rec.dlp_true..energy_init",
-    "rec.dlp_true..energy_transfer",
-    "rec.dlp_true..momentum.x",
-    "rec.dlp_true..momentum.y",
-    "rec.dlp_true..momentum.z",
-    "rec.dlp_true..momentum_transfer",
-    "rec.dlp_true..momentum_transfer_mag",
-    "rec.dlp_true..inelasticity",
-    "rec.dlp_true..bjorken_x",
-    "rec.dlp_true..hadronic_invariant_mass",
-    "rec.dlp_true..theta",
-    "rec.dlp_true..distance_travel",
-    # Nuclear target
-    "rec.dlp_true..target",
-    "rec.dlp_true..nucleon",
-    "rec.dlp_true..quark",
-    # Size / id
-    "rec.dlp_true..id",
-    "rec.dlp_true..orig_id",
-    "rec.dlp_true..mct_index",
-    "rec.dlp_true..track_id",
-    "rec.dlp_true..num_particles",
-    "rec.dlp_true..num_primary_particles",
-    "rec.dlp_true..size",
-    "rec.dlp_true..size_adapt",
-    "rec.dlp_true..size_g4",
-    "rec.dlp_true..depositions_sum",
-    "rec.dlp_true..depositions_q_sum",
-    "rec.dlp_true..depositions_adapt_sum",
-    "rec.dlp_true..depositions_adapt_q_sum",
-    "rec.dlp_true..depositions_g4_sum",
-    "rec.dlp_true..cathode_offset",
-    "rec.dlp_true..flash_hypo_pe",
-    "rec.dlp_true..flash_total_pe",
-    # Particle counts per PID
-    "rec.dlp_true..particle_counts.0",
-    "rec.dlp_true..particle_counts.1",
-    "rec.dlp_true..particle_counts.2",
-    "rec.dlp_true..particle_counts.3",
-    "rec.dlp_true..particle_counts.4",
-    "rec.dlp_true..particle_counts.5",
-    "rec.dlp_true..primary_particle_counts.0",
-    "rec.dlp_true..primary_particle_counts.1",
-    "rec.dlp_true..primary_particle_counts.2",
-    "rec.dlp_true..primary_particle_counts.3",
-    "rec.dlp_true..primary_particle_counts.4",
-    "rec.dlp_true..primary_particle_counts.5",
-]
-
-# ── Truth DLP: particle-level ─────────────────────────────────────────────────
-_DLP_TRUE_PART_BRANCHES = [
-    # Particle identity  (required for classify_truth: pid, parent_pdg_code)
-    "rec.dlp_true.particles..pid",
-    "rec.dlp_true.particles..pdg_code",
-    "rec.dlp_true.particles..parent_pdg_code",
-    "rec.dlp_true.particles..ancestor_pdg_code",
-    "rec.dlp_true.particles..parent_track_id",
-    # Kinematics  (required for true_leading_electron_ke)
-    "rec.dlp_true.particles..ke",
-    "rec.dlp_true.particles..energy_init",
-    "rec.dlp_true.particles..energy_deposit",
-    "rec.dlp_true.particles..p",
-    "rec.dlp_true.particles..mass",
-    "rec.dlp_true.particles..momentum.x",
-    "rec.dlp_true.particles..momentum.y",
-    "rec.dlp_true.particles..momentum.z",
-    "rec.dlp_true.particles..csda_ke",
-    "rec.dlp_true.particles..csda_ke_per_pid.0",
-    "rec.dlp_true.particles..csda_ke_per_pid.1",
-    "rec.dlp_true.particles..csda_ke_per_pid.2",
-    "rec.dlp_true.particles..csda_ke_per_pid.3",
-    "rec.dlp_true.particles..csda_ke_per_pid.4",
-    "rec.dlp_true.particles..csda_ke_per_pid.5",
-    "rec.dlp_true.particles..mcs_ke",
-    "rec.dlp_true.particles..mcs_ke_per_pid.0",
-    "rec.dlp_true.particles..mcs_ke_per_pid.1",
-    "rec.dlp_true.particles..mcs_ke_per_pid.2",
-    "rec.dlp_true.particles..mcs_ke_per_pid.3",
-    "rec.dlp_true.particles..mcs_ke_per_pid.4",
-    "rec.dlp_true.particles..mcs_ke_per_pid.5",
-    "rec.dlp_true.particles..calo_ke",
-    "rec.dlp_true.particles..reco_ke",
-    "rec.dlp_true.particles..reco_length",
-    # Geometry
-    "rec.dlp_true.particles..start_point.x",
-    "rec.dlp_true.particles..start_point.y",
-    "rec.dlp_true.particles..start_point.z",
-    "rec.dlp_true.particles..end_point.x",
-    "rec.dlp_true.particles..end_point.y",
-    "rec.dlp_true.particles..end_point.z",
-    "rec.dlp_true.particles..start_dir.x",
-    "rec.dlp_true.particles..start_dir.y",
-    "rec.dlp_true.particles..start_dir.z",
-    "rec.dlp_true.particles..end_dir.x",
-    "rec.dlp_true.particles..end_dir.y",
-    "rec.dlp_true.particles..end_dir.z",
-    "rec.dlp_true.particles..length",
-    "rec.dlp_true.particles..distance_travel",
-    # Topology flags  (required for is_primary cuts)
-    "rec.dlp_true.particles..is_primary",
-    "rec.dlp_true.particles..interaction_primary",
-    "rec.dlp_true.particles..group_primary",
-    "rec.dlp_true.particles..is_valid",
-    "rec.dlp_true.particles..is_contained",
-    "rec.dlp_true.particles..is_matched",
-    "rec.dlp_true.particles..is_cathode_crosser",
-    "rec.dlp_true.particles..is_time_contained",
-    "rec.dlp_true.particles..is_truth",
-    # Linking
-    "rec.dlp_true.particles..nu_id",
-    "rec.dlp_true.particles..interaction_id",
-    "rec.dlp_true.particles..group_id",
-    "rec.dlp_true.particles..orig_id",
-    "rec.dlp_true.particles..shape",
-    "rec.dlp_true.particles..size",
-    "rec.dlp_true.particles..size_adapt",
-    "rec.dlp_true.particles..size_g4",
-    "rec.dlp_true.particles..num_fragments",
-    "rec.dlp_true.particles..num_voxels",
-    "rec.dlp_true.particles..depositions_sum",
-    "rec.dlp_true.particles..depositions_q_sum",
-    "rec.dlp_true.particles..depositions_g4_sum",
-    "rec.dlp_true.particles..cathode_offset",
-    "rec.dlp_true.particles..mct_index",
-    "rec.dlp_true.particles..mcst_index",
-    "rec.dlp_true.particles..track_id",
-    "rec.dlp_true.particles..t",
-    "rec.dlp_true.particles..end_t",
-    # Reco-matched info on truth particles
-    "rec.dlp_true.particles..reco_ke",
-    "rec.dlp_true.particles..reco_length",
-    "rec.dlp_true.particles..reco_start_dir.0",
-    "rec.dlp_true.particles..reco_start_dir.1",
-    "rec.dlp_true.particles..reco_start_dir.2",
-    "rec.dlp_true.particles..reco_end_dir.0",
-    "rec.dlp_true.particles..reco_end_dir.1",
-    "rec.dlp_true.particles..reco_end_dir.2",
-    "rec.dlp_true.particles..reco_momentum.0",
-    "rec.dlp_true.particles..reco_momentum.1",
-    "rec.dlp_true.particles..reco_momentum.2",
-]
+from makedf.makedf import (
+    make_all_spine_df,
+    make_mcnudf_nuecc,
+)
+from pyanalib.pandas_helpers import multicol_merge
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Internal helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _safe_load(tree, branches):
-    """
-    Load branches one by one, silently skipping any that are not in the tree.
-    Returns the DataFrame of successfully loaded branches.
-    This guard lets the same branch list work across CAF versions without
-    crashing on newly-added or renamed branches.
-    """
-    available = []
-    for br in branches:
-        try:
-            _ = loadbranches(tree, [br])
-            available.append(br)
-        except Exception:
-            pass
-    if not available:
-        raise RuntimeError("No branches could be loaded from provided list.")
-    return loadbranches(tree, available)
+# =============================================================================
+# Constants  (must match nue_selection.py and skim_nue_v2.py)
+# =============================================================================
+BRANCH_TRUE            = "dlp_true"
+ELECTRON_THRESHOLD_MEV = 75.0
+MUON_THRESHOLD_MEV     = 50.0
+PID_ELECTRON           = 1
+PID_MUON               = 2
 
 
-def _interaction_index_names(df):
-    """Return the index level names that identify a unique interaction (all but last)."""
-    return list(df.index.names[:-1])
+# =============================================================================
+# Column helpers  (same logic as skim_nue_v2, duplicated for standalone use)
+# =============================================================================
 
-
-def _find_col(df, *name_parts):
-    """
-    Find a MultiIndex column whose levels contain all name_parts.
-    Returns the first match or raises KeyError.
-    """
+def _find_col(df, suffix, branch_must_contain=None, branch_must_not_contain=None):
+    """Return the first MultiIndex column whose last non-empty part == suffix."""
     for col in df.columns:
-        col_str = str(col)
-        if all(str(p) in col_str for p in name_parts):
-            return col
-    raise KeyError(f"Could not find column matching {name_parts} in {list(df.columns[:20])}")
+        parts = [p for p in (col if isinstance(col, tuple) else (col,)) if p != ""]
+        if not parts or parts[-1] != suffix:
+            continue
+        if branch_must_contain and not any(branch_must_contain in str(p) for p in col):
+            continue
+        if branch_must_not_contain and any(branch_must_not_contain in str(p) for p in col):
+            continue
+        return col
+    raise KeyError(
+        f"suffix={suffix!r} branch_must_contain={branch_must_contain!r} "
+        f"branch_must_not_contain={branch_must_not_contain!r} not found"
+    )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Public makedf functions
-# ─────────────────────────────────────────────────────────────────────────────
+def _find_col_ends(df, *suffix_parts, branch_must_contain=None):
+    """Find column whose last N non-empty parts equal suffix_parts."""
+    n      = len(suffix_parts)
+    target = tuple(suffix_parts)
+    for col in df.columns:
+        parts = tuple(p for p in (col if isinstance(col, tuple) else (col,)) if p != "")
+        if len(parts) < n or parts[-n:] != target:
+            continue
+        if branch_must_contain and not any(branch_must_contain in str(p) for p in col):
+            continue
+        return col
+    raise KeyError(f"No column ending with {suffix_parts!r}")
+
+
+def _safe(fn, *args, **kwargs):
+    """Call fn; return None on KeyError / StopIteration."""
+    try:
+        return fn(*args, **kwargs)
+    except (KeyError, StopIteration):
+        return None
+
+
+# =============================================================================
+# Truth counting
+# =============================================================================
+
+def _build_truth_counts(df):
+    """
+    Compute per-interaction truth flags and reco preselection flags.
+
+    Adapted from skim_nue_v2.build_truth_info; works on the SPINE df
+    produced by make_all_spine_df (3-level index, no __ntuple level).
+
+    Returns a dict with:
+        idx           : interaction-level MultiIndex
+        cat           : int8 Series (0-7) per interaction
+        is_sig        : bool Series  (cat == 0)
+        passed_fm     : bool Series  (reco flash-match)
+        passed_presel : bool Series  (reco FM & FV)
+    """
+    il    = list(range(df.index.nlevels - 1))   # e.g. [0, 1] for 3-level df
+    inter = df.groupby(level=il).first()
+    idx   = inter.index
+
+    def _b(s):
+        """Reindex to idx, fill False."""
+        return s.reindex(idx, fill_value=False).astype(bool)
+
+    # ── Truth interaction-level flags ─────────────────────────────────────────
+    nu_col   = _safe(_find_col, df, "nu_id",        branch_must_contain=BRANCH_TRUE)
+    cc_col   = _safe(_find_col, df, "current_type", branch_must_contain=BRANCH_TRUE)
+    fv_t_col = _safe(_find_col, df, "is_fiducial",  branch_must_contain=BRANCH_TRUE,
+                                                     branch_must_not_contain=None)
+    is_nu      = _b(inter[nu_col]   >= 0) if nu_col   else pd.Series(False, index=idx)
+    is_cc      = _b(inter[cc_col]   == 0) if cc_col   else pd.Series(False, index=idx)
+    is_fv_true = _b(inter[fv_t_col] == 1) if fv_t_col else pd.Series(False, index=idx)
+
+    # ── Truth particle-level → interaction aggregation ────────────────────────
+    pid_col = _safe(_find_col, df, "pid",          branch_must_contain=BRANCH_TRUE)
+    pri_col = _safe(_find_col, df, "is_primary",   branch_must_contain=BRANCH_TRUE)
+    ke_col  = _safe(_find_col, df, "ke",           branch_must_contain=BRANCH_TRUE)
+    ppd_col = _safe(_find_col, df, "parent_pdg_code", branch_must_contain=BRANCH_TRUE)
+
+    if pid_col and pri_col and ke_col:
+        elec_mask = (
+            (df[pid_col] == PID_ELECTRON) &
+            (df[pri_col] == 1) &
+            (df[ke_col]  > ELECTRON_THRESHOLD_MEV)
+        )
+        has_elec = elec_mask.groupby(level=il).sum().reindex(idx, fill_value=0) == 1
+    else:
+        has_elec = pd.Series(False, index=idx)
+
+    has_muon = (
+        ((df[pid_col] == PID_MUON) & (df[pri_col] == 1) & (df[ke_col] > MUON_THRESHOLD_MEV))
+        .groupby(level=il).any().reindex(idx, fill_value=False)
+    ) if (pid_col and pri_col and ke_col) else pd.Series(False, index=idx)
+
+    has_pi0 = (
+        (df[ppd_col].abs() == 111).groupby(level=il).any().reindex(idx, fill_value=False)
+    ) if ppd_col else pd.Series(False, index=idx)
+
+    # ── Truth categories (mirrors classify_truth / build_truth_info) ──────────
+    cat = pd.Series(7, index=idx, dtype=np.int8)
+    cat[~is_nu]                                          = 6
+    nu = is_nu
+    cat[nu &  is_cc & ~is_fv_true & has_elec]            = 1  # nueCC out FV
+    cat[nu &  is_cc &  is_fv_true & has_elec]            = 0  # nueCC in FV ← signal
+    cat[nu &  is_cc & has_muon    & has_pi0]             = 2  # numuCC + pi0
+    cat[nu & ~is_cc & has_pi0]                           = 3  # NC pi0
+    cat[nu &  is_cc & has_muon    & ~has_pi0]            = 4  # other numuCC
+    cat[nu & ~is_cc & ~has_pi0]                          = 5  # other NC
+
+    # ── Reco preselection flags ───────────────────────────────────────────────
+    fm_col   = _safe(_find_col, df, "is_flash_matched", branch_must_not_contain=BRANCH_TRUE)
+    fv_r_col = _safe(_find_col, df, "is_fiducial",      branch_must_not_contain=BRANCH_TRUE)
+
+    passed_fm = (
+        (df[fm_col] == 1).groupby(level=il).any().reindex(idx, fill_value=False)
+    ) if fm_col else pd.Series(False, index=idx)
+
+    passed_fv = (
+        (df[fv_r_col] == 1).groupby(level=il).any().reindex(idx, fill_value=False)
+    ) if fv_r_col else pd.Series(False, index=idx)
+
+    return dict(
+        idx           = idx,
+        cat           = cat,
+        is_sig        = (cat == 0),
+        passed_fm     = passed_fm,
+        passed_presel = passed_fm & passed_fv,
+    )
+
+
+# =============================================================================
+# Public makers
+# =============================================================================
 
 def make_nuecc_evtdf(f):
     """
-    Load SPINE/DLP branches from a CAF ROOT file and return a pre-skimmed
-    particle-level DataFrame (flashmatch + fiducial interactions only).
+    Main nueCC analysis DataFrame for one CAF file.
 
-    Output MultiIndex
-    -----------------
-    Within a single file (before cafpyana adds '__ntuple'):
-        ['entry', 'rec.dlp..index', 'rec.dlp.particles..index']
+    Steps
+    -----
+    1. Load full SPINE DLP df (reco + truth, interactions + particles) via
+       make_all_spine_df.
+    2. Merge in the MC neutrino record (make_mcnudf_nuecc) via mct_index —
+       adds generator-level variables (is_cc, bjorken_x, particle counts …).
+    3. Apply reco flash-match + fiducial-volume preselection.
 
-    Column structure
-    ----------------
-    Identical to the full 'evt' table (MultiIndex: rec / dlp|dlp_true / …),
-    so nue_helpers.py / nue_selection.py work without any modification.
+    The returned df is structurally identical to the output of skim_nue_v2
+    (evt_0 key) and is consumed by nue_selection.py without modification.
 
-    Truth join
-    ----------
-    For each reco DLP interaction, the best-matching truth interaction
-    (rec.dlp..match_ids, index 0) is looked up and its properties are
-    attached under the 'rec.dlp_true' column namespace.
-    Truth particles from the matched truth interaction are joined similarly
-    via rec.dlp.particles..match_ids.
+    Index  : (entry, rec.dlp..index, rec.dlp.particles..index)
     """
-    tree = f["recTree"]
+    # ── 1. SPINE df ───────────────────────────────────────────────────────────
+    spine_df = make_all_spine_df(f)
+    il       = list(range(spine_df.index.nlevels - 1))
 
-    # ── 1. Reco DLP particles ──────────────────────────────────────────────
-    print("  loading reco DLP particles …")
-    reco_part = _safe_load(tree, _DLP_PART_BRANCHES)
-    # index: (entry, rec.dlp..index, rec.dlp.particles..index)
-
-    # ── 2. Reco DLP interaction-level ─────────────────────────────────────
-    print("  loading reco DLP interactions …")
-    reco_inter = _safe_load(tree, _DLP_INTER_BRANCHES)
-    # index: (entry, rec.dlp..index)
-
-    # ── 3. Truth DLP interactions ──────────────────────────────────────────
-    print("  loading truth DLP interactions …")
-    true_inter = _safe_load(tree, _DLP_TRUE_INTER_BRANCHES)
-    # index: (entry, rec.dlp_true..index)
-
-    # ── 4. Truth DLP particles ─────────────────────────────────────────────
-    print("  loading truth DLP particles …")
-    true_part = _safe_load(tree, _DLP_TRUE_PART_BRANCHES)
-    # index: (entry, rec.dlp_true..index, rec.dlp_true.particles..index)
-
-    # ── 5. Build the merged DataFrame ─────────────────────────────────────
-    #
-    # Strategy:
-    #   a) Repeat interaction-level reco columns onto particle-level rows
-    #   b) Identify the best-matched truth interaction per reco interaction
-    #   c) Attach truth interaction columns (repeated for every reco particle)
-    #   d) Attach truth particle columns aligned by particle match_ids
-    #
-    # This reproduces the structure of the existing full 'evt' table.
-
-    # ── 5a. Broadcast reco interaction cols → particle level ───────────────
-    il_reco = _interaction_index_names(reco_part)  # [entry, rec.dlp..index]
-    evtdf = multicol_merge(
-        reco_part.reset_index(),
-        reco_inter.reset_index(),
-        left_on  = [tuple([n] + [''] * 5) for n in il_reco],
-        right_on = [tuple([n] + [''] * 5) for n in il_reco],
-        how      = "left",
-    )
-    evtdf = evtdf.set_index(reco_part.index.names, verify_integrity=False)
-
-    # ── 5b. Best-matched truth interaction per reco interaction ────────────
-    # rec.dlp..match_ids column: the first entry is the best match
-    # After loadbranches this typically appears as ('rec','dlp','match_ids','','','')
-    # or similar – _find_col handles either naming.
+    # ── 2. MC truth merge ─────────────────────────────────────────────────────
+    # mct_index in rec.dlp_true links each interaction to the MC neutrino table.
+    # Pandas multicol_merge on (entry, mct_index) ↔ (entry, rec.mc.nu..index).
     try:
-        match_id_col = _find_col(reco_inter, "dlp", "match_ids")
-        # match_id_col values are the rec.dlp_true..index of the best match
-        best_match_ser = reco_inter[match_id_col]   # indexed by (entry, rec.dlp..index)
-    except KeyError:
-        # No match_ids available: attach empty truth placeholders
-        print("  WARNING: rec.dlp..match_ids not found; truth info will be NaN.")
-        best_match_ser = pd.Series(
-            np.full(len(reco_inter), np.nan),
-            index=reco_inter.index,
-            name="_best_match",
+        mcdf = make_mcnudf_nuecc(f)
+        mcdf.columns = pd.MultiIndex.from_tuples(
+            [tuple(["mcnu"] + list(c)) for c in mcdf.columns]
         )
+        mct_col = _find_col(spine_df, "mct_index", branch_must_contain=BRANCH_TRUE)
 
-    # ── 5c. Join truth interaction info onto reco interactions ─────────────
-    # Build a DataFrame: (entry, rec.dlp..index) → best-match truth inter index
-    best_match_df = best_match_ser.rename("_best_truth_inter_idx").to_frame()
-    best_match_df = best_match_df.reset_index()   # entry, rec.dlp..index, _best_truth_inter_idx
+        # mc index level name after reset_index  (e.g. "rec.mc.nu..index")
+        mc_nu_idx_name = mcdf.index.names[-1]
 
-    # Reset true_inter to merge on truth inter index
-    true_inter_reset = true_inter.reset_index()
-    # The truth interaction index column name (e.g. 'rec.dlp_true..index')
-    true_inter_idx_col = true_inter.index.names[-1]   # last level
+        spine_reset = spine_df.reset_index()
+        mc_reset    = mcdf.reset_index()
 
-    # Merge reco interactions → best-matched truth interaction
-    reco_with_truth_inter = best_match_df.merge(
-        true_inter_reset,
-        left_on  = ["entry", "_best_truth_inter_idx"],
-        right_on = ["entry", true_inter_idx_col],
-        how      = "left",
-        suffixes = ("_x", "_y"),
-    )
-    # Drop the duplicate index column
-    reco_with_truth_inter = reco_with_truth_inter.drop(
-        columns=["_best_truth_inter_idx"], errors="ignore"
-    )
+        # Locate the column tuples by name content after reset
+        entry_col  = next(c for c in spine_reset.columns
+                         if "entry" in str(c) and "index" not in str(c).lower().replace("entry",""))
+        mc_idx_col = next(c for c in mc_reset.columns
+                         if mc_nu_idx_name in str(c))
 
-    # ── 5d. Broadcast truth interaction cols → particle level ──────────────
-    reco_inter_idx_col = reco_inter.index.names[-1]   # rec.dlp..index
-    evtdf_reset = evtdf.reset_index()
-
-    evtdf_reset = evtdf_reset.merge(
-        reco_with_truth_inter,
-        on    = ["entry", reco_inter_idx_col],
-        how   = "left",
-        suffixes = ("", "_truth_inter"),
-    )
-
-    # ── 5e. Join truth particles via particle-level match_ids ──────────────
-    try:
-        part_match_col = _find_col(reco_part, "dlp", "particles", "match_ids")
-        # part_match_col values: truth particle index matched to each reco particle
-        part_match_vals = reco_part[part_match_col]
-        evtdf_reset["_best_truth_part_idx"] = part_match_vals.values
-
-        true_part_reset = true_part.reset_index()
-        true_part_idx_col = true_part.index.names[-1]   # rec.dlp_true.particles..index
-
-        evtdf_reset = evtdf_reset.merge(
-            true_part_reset,
-            left_on  = ["entry", "_best_truth_part_idx"],
-            right_on = ["entry", true_part_idx_col],
+        merged = multicol_merge(
+            spine_reset,
+            mc_reset,
+            left_on  = [entry_col, mct_col],
+            right_on = [entry_col, mc_idx_col],
             how      = "left",
-            suffixes = ("", "_truth_part"),
         )
-        evtdf_reset = evtdf_reset.drop(
-            columns=["_best_truth_part_idx"], errors="ignore"
-        )
-    except KeyError:
-        print("  WARNING: particle-level match_ids not found; truth particles will be NaN.")
+        spine_df = merged.set_index(list(spine_df.index.names))
 
-    # ── 6. Restore MultiIndex ──────────────────────────────────────────────
-    evtdf = evtdf_reset.set_index(reco_part.index.names, verify_integrity=False)
+    except Exception as e:
+        warnings.warn(f"make_nuecc_evtdf: MC truth merge skipped — {e}")
 
-    # ── 7. Pre-selection: flashmatch + fiducial ────────────────────────────
-    print("  applying pre-selection (flashmatch + fiducial) …")
+    # ── 3. Reco FM + FV preselection ─────────────────────────────────────────
     try:
-        fm_col = _find_col(evtdf, "dlp", "is_flash_matched")
-        fv_col = _find_col(evtdf, "dlp", "is_fiducial")
-        # Avoid accidentally matching dlp_true columns
-        # (dlp_true also has is_fiducial – we want the reco one)
-        fm_col = next(
-            c for c in evtdf.columns
-            if "dlp" in str(c) and "dlp_true" not in str(c)
-               and "is_flash_matched" in str(c)
-        )
-        fv_col = next(
-            c for c in evtdf.columns
-            if "dlp" in str(c) and "dlp_true" not in str(c)
-               and "is_fiducial" in str(c)
-        )
-        keep = (evtdf[fm_col] == 1) & (evtdf[fv_col] == 1)
-        n_before = len(evtdf)
-        evtdf = evtdf[keep]
-        n_after = len(evtdf)
-        print(f"  pre-selection: {n_before:,} → {n_after:,} particle rows")
-    except StopIteration:
-        print("  WARNING: could not locate is_flash_matched / is_fiducial; no pre-selection applied.")
+        fm_col = _find_col(spine_df, "is_flash_matched", branch_must_not_contain=BRANCH_TRUE)
+        fv_col = _find_col(spine_df, "is_fiducial",      branch_must_not_contain=BRANCH_TRUE)
 
-    return evtdf
+        fm_pass  = (spine_df[fm_col] == 1).groupby(level=il).any()
+        fv_pass  = (spine_df[fv_col] == 1).groupby(level=il).any()
+        presel   = fm_pass[fm_pass].index.intersection(fv_pass[fv_pass].index)
+
+        row_mask = spine_df.index.droplevel(-1).isin(presel)
+        spine_df = spine_df[row_mask]
+
+    except Exception as e:
+        warnings.warn(f"make_nuecc_evtdf: FM/FV preselection skipped — {e}")
+
+    return spine_df
 
 
 def make_nuecc_statsdf(f):
     """
-    Return a small one-row DataFrame recording the number of DLP interactions
-    at each pre-selection stage (before the df was skimmed).
+    One-row DataFrame with pre-cut interaction and truth-signal counts.
+
+    These numbers are the efficiency denominators for the notebook cut-flow
+    table.  They MUST be computed on the full, unfiltered SPINE df so that
+    signal interactions that fail the reco preselection are still counted.
 
     Columns
     -------
-    n_total   : total reconstructed DLP interactions in the file
-    n_fm      : interactions passing flash match  (is_flash_matched == 1)
-    n_fm_fv   : interactions passing flash match + fiducial
-
-    These numbers are used in the notebook to display the full cut-flow table
-    (rows 'No cut' and 'Flash match') even though those events were removed
-    from the skimmed evt table.
+    n_inter_total      all reconstructed interactions (pre-cut)
+    n_true_signal      nueCC-in-FV signal interactions before any reco cut
+    n_after_fm         interactions passing reco flash-match
+    n_after_presel     interactions passing reco FM + FV
+    n_sig_after_fm     true signal passing FM
+    n_sig_after_presel true signal passing FM + FV
+    cat_0 … cat_7      truth-category counts (same as skim_nue_v2)
     """
-    tree = f["recTree"]
-    inter = _safe_load(tree, [
-        "rec.dlp..is_flash_matched",
-        "rec.dlp..is_fiducial",
-    ])
+    empty = pd.DataFrame([{
+        "n_inter_total": 0, "n_true_signal": 0,
+        "n_after_fm": 0,    "n_after_presel": 0,
+        "n_sig_after_fm": 0,"n_sig_after_presel": 0,
+        **{f"cat_{c}": 0 for c in range(8)},
+    }])
 
-    fm_col = _find_col(inter, "dlp", "is_flash_matched")
-    fv_col = _find_col(inter, "dlp", "is_fiducial")
+    try:
+        spine_df = make_all_spine_df(f)
+    except Exception as e:
+        warnings.warn(f"make_nuecc_statsdf: could not load spine df — {e}")
+        return empty
 
-    n_total = len(inter)
-    n_fm    = int((inter[fm_col] == 1).sum())
-    n_fm_fv = int(((inter[fm_col] == 1) & (inter[fv_col] == 1)).sum())
+    try:
+        tc = _build_truth_counts(spine_df)
+    except Exception as e:
+        warnings.warn(f"make_nuecc_statsdf: truth counting failed — {e}")
+        return empty
 
-    return pd.DataFrame({
-        "n_total": [n_total],
-        "n_fm":    [n_fm],
-        "n_fm_fv": [n_fm_fv],
-    })
+    is_sig        = tc["is_sig"]
+    passed_fm     = tc["passed_fm"]
+    passed_presel = tc["passed_presel"]
+    cat           = tc["cat"]
+
+    cat_counts = {f"cat_{c}": int((cat == c).sum()) for c in range(8)}
+
+    return pd.DataFrame([{
+        "n_inter_total"     : len(tc["idx"]),
+        "n_true_signal"     : int(is_sig.sum()),
+        "n_after_fm"        : int(passed_fm.sum()),
+        "n_after_presel"    : int(passed_presel.sum()),
+        "n_sig_after_fm"    : int((is_sig & passed_fm).sum()),
+        "n_sig_after_presel": int((is_sig & passed_presel).sum()),
+        **cat_counts,
+    }])

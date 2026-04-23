@@ -198,7 +198,7 @@ def plot_stacked_hist(series_list, labels, colors, bins, weights=None,
         Append the percentage of the total MC to each legend label.
     """
     if ax is None:
-        fig, ax = plt.subplots(figsize=(8, 5))
+        fig, ax = plt.subplots(figsize=(8, 6))
 
     # ── Normalise weights ────────────────────────────────────────────────────
     if weights is None:
@@ -281,24 +281,24 @@ def plot_stacked_hist(series_list, labels, colors, bins, weights=None,
     handles, legend_labels = ax.get_legend_handles_labels()
     if invert_stack_order:
         # Already reversed above — just display as-is so signal is first
-        ax.legend(handles, legend_labels, fontsize=9, ncol=1)
+        ax.legend(handles, legend_labels, fontsize=10, ncol=1, loc="best")
     else:
         # Reverse so the top-stacked (last drawn) category appears first
-        ax.legend(handles[::-1], legend_labels[::-1], fontsize=9, ncol=1)
-
-    # ── Grand total annotation ───────────────────────────────────────────────
-    ax.text(0.98, 0.98,
-            f"Total MC: {grand_total:.1f}",
-            transform=ax.transAxes, va="top", ha="right",
-            fontsize=9, color="gray")
+        ax.legend(handles[::-1], legend_labels[::-1], fontsize=10, ncol=1, loc="best")
 
     ax.set_xlabel(xlabel, fontsize=12)
     ax.set_ylabel(ylabel, fontsize=12)
     ax.set_title(title)
     if pot_label:
         ax.text(0.02, 0.98, pot_label, transform=ax.transAxes,
-                va="top", ha="left", fontsize=9, color="gray")
-
+                va="top", ha="left", fontsize=10, color="gray")
+        ax.text(0.02, 0.93, f"Total MC events: {grand_total:.0f}",
+                transform=ax.transAxes, va="top", ha="left",
+                fontsize=10, color="gray")
+    else:
+        ax.text(0.02, 0.98, f"Total MC events: {grand_total:.0f}",
+                transform=ax.transAxes, va="top", ha="left",
+                fontsize=10, color="gray")
     return ax.get_figure(), ax
 
 

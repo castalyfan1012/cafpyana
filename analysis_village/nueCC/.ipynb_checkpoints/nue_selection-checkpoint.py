@@ -28,7 +28,7 @@ from nue_helpers import (
 # ============================================================
 # Thresholds (MeV) – must match the TOML configuration
 # ============================================================
-ELECTRON_THRESHOLD_MEV = 0.0
+ELECTRON_THRESHOLD_MEV = 75.0
 MUON_THRESHOLD_MEV = 50.0
 PHOTON_THRESHOLD_MEV = 25.0
 PION_THRESHOLD_MEV = 25.0
@@ -65,10 +65,10 @@ CUT_NAMES_MORE = [
     "single_electron",
     "electron_pid_score",
     "electron_primary_score",
-    "start_dedx",
-    "vertex_distance",
-    "directional_spread",
-    "axial_spread"
+    # "start_dedx",
+    # "vertex_distance",
+    # "directional_spread",
+    # "axial_spread"
 ]
 CUT_LABELS_MORE = [
     "No cut",
@@ -78,10 +78,10 @@ CUT_LABELS_MORE = [
     "Final state topology",
     "Electron PID score",
     "Electron Primary score",
-    "Reco start dE/dx",
-    "Conversion gap",
-    "Directional spread",
-    "Axial spread"
+    # "Reco start dE/dx",
+    # "Conversion gap",
+    # "Directional spread",
+    # "Axial spread"
 ]
 
 # ============================================================
@@ -340,27 +340,27 @@ def shower_qual_cuts(evtdf):
 
         if step == "electron_pid_score":
             col = ('pid_scores', 'I1')
-            soft_inter = leading_electron[col] > 0.935
+            soft_inter = leading_electron[col] > 0.93
 
         elif step == "electron_primary_score":
             col = ('primary_scores', 'I1')
             soft_inter = leading_electron[col] > 0.99
 
-        elif step == "start_dedx":
-            col = ('start_dedx', '')
-            soft_inter = leading_electron[col] < 3         
+        # elif step == "start_dedx":
+        #     col = ('start_dedx', '')
+        #     soft_inter = leading_electron[col] < 3.2         
 
-        elif step == "vertex_distance":
-            col = ('vertex_distance', '')
-            soft_inter = leading_electron[col] < 1.05          
+        # elif step == "vertex_distance":
+        #     col = ('vertex_distance', '')
+        #     soft_inter = leading_electron[col] < 1.2          
 
-        elif step == "directional_spread":
-            col = ('directional_spread', '')
-            soft_inter = leading_electron[col] < 0.026         
+        # elif step == "directional_spread":
+        #     col = ('directional_spread', '')
+        #     soft_inter = leading_electron[col] < 0.025         
 
-        elif step == "axial_spread":
-            col = ('axial_spread', '')
-            soft_inter = leading_electron[col] > 0.315          
+        # elif step == "axial_spread":
+        #     col = ('axial_spread', '')
+        #     soft_inter = leading_electron[col] > 0.27          
 
         else:
             raise ValueError(f"Unknown extra cut: {step}")
