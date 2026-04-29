@@ -696,38 +696,91 @@ def plot_stacked_topology(
     return fig, ax, mc_stack
 
 
+def format_heatmap_value(v):
+    """
+    Format numbers for heatmap annotations.
+
+    """
+    if np.isnan(v):
+        return ""
+
+    av = abs(v)
+
+    if av < 1:
+        return f"{v:.4f}"
+
+    elif av < 1e3:
+        return f"{v:.2f}"
+
+    mantissa, exponent = f"{v:.2e}".split("e")
+    exponent = int(exponent)
+
+    return rf"${mantissa}\times10^{{{exponent}}}$"
+    
 def plot_heatmap(
     matrix,
     title,
     var_cfg,
-    axis_labels=None,    # [x_label, y_label] or None → use var_cfg
-    fmt=".2f",
+    axis_labels=None,
+    fmt=".2e",          # scientific notation
     cmap="viridis",
     save_path=None,
 ):
     """
-    Coloured matrix heatmap with bin-range tick labels (cafpyana style).
-    Uses bin_range_labels from analysis_village.unfolding.utils.
+    Coloured matrix heatmap with bin-range tick labels.
     """
     from analysis_village.unfolding.utils import bin_range_labels, get_text_color
+    import re
 
-    bins         = var_cfg.bins
-    n            = len(bins) - 1
-    unif_bin     = np.linspace(0, n, n + 1)
-    extent       = [unif_bin[0], unif_bin[-1], unif_bin[0], unif_bin[-1]]
-    tick_pos     = 0.5 * (unif_bin[:-1] + unif_bin[1:])
-    tick_labels  = bin_range_labels(bins)
+    bins = var_cfg.bins
+    n = len(bins) - 1
+    unif_bin = np.linspace(0, n, n + 1)
+    extent = [unif_bin[0], unif_bin[-1], unif_bin[0], unif_bin[-1]]
+    tick_pos = 0.5 * (unif_bin[:-1] + unif_bin[1:])
+
+    # Remove unnecessary trailing zeros from bin labels
+    raw_labels = bin_range_labels(bins)
+    tick_labels = [
+        re.sub(r'(\d+)\.0+(?!\d)', r'\1', label)
+        for label in raw_labels
+    ]
 
     fig, ax = plt.subplots(figsize=(7, 6))
-    im = ax.imshow(matrix, extent=extent, origin="lower", cmap=cmap,
-                   aspect="auto")
-    plt.colorbar(im, ax=ax)
 
-    ax.set_xticks(tick_pos); ax.set_xticklabels(tick_labels, rotation=45, ha="right")
-    ax.set_yticks(tick_pos); ax.set_yticklabels(tick_labels)
+    im = ax.imshow(
+        matrix,
+        extent=extent,
+        origin="lower",
+        cmap=cmap,
+        aspect="auto"
+    )
 
-    xlbl, ylbl = (axis_labels if axis_labels else [var_cfg.var_labels[2],
-                                                    var_cfg.var_labels[1]])
+    # Colorbar with smaller tick labels
+    cbar = plt.colorbar(im, ax=ax)
+    cbar.ax.tick_params(labelsize=9)
+
+    ax.set_xticks(tick_pos)
+    ax.set_xticklabels(
+        tick_labels,
+        rotation=45,
+        ha="right",
+        fontsize=9
+    )
+
+    ax.set_yticks(tick_pos)
+    ax.set_yticklabels(
+        tick_labels,
+        fontsize=9
+    )
+
+    ax.tick_params(axis='both', labelsize=9)
+
+    xlbl, ylbl = (
+        axis_labels
+        if axis_labels
+        else [var_cfg.var_labels[2], var_cfg.var_labels[1]]
+    )
+
     ax.set_xlabel(xlbl, fontsize=11)
     ax.set_ylabel(ylbl, fontsize=11)
 
@@ -735,13 +788,23 @@ def plot_heatmap(
         for j in range(matrix.shape[1]):
             v = matrix[i, j]
             if not np.isnan(v):
-                ax.text(tick_pos[j], tick_pos[i], f"{v:{fmt}}",
-                        ha="center", va="center",
-                        color=get_text_color(v), fontsize=9)
+                ax.text(
+                    tick_pos[j],
+                    tick_pos[i],
+                    format_heatmap_value(v),
+                    ha="center",
+                    va="center",
+                    color=get_text_color(v),
+                    fontsize=8
+                )
+
     ax.set_title(title, fontsize=13)
+
     plt.tight_layout()
+
     if save_path:
         fig.savefig(save_path, bbox_inches="tight")
+
     return fig, ax
 
 
@@ -788,7 +851,7 @@ def plot_uncertainty_budget(
     ax.set_ylabel(r"Fractional unc. $\sigma / N$", fontsize=12)
     ax.set_title(f"{title}: {var_cfg.var_plot_name}", fontsize=13)
     ax.set_ylim(0, max(tot_frac.max() * 1.5, 0.05))
-    ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left", frameon=False)
+    ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left", frameon=False, fontsize=12)
     ax.grid(alpha=0.2, ls="--")
     plt.tight_layout()
     if save_path:
