@@ -134,6 +134,88 @@ def collapse_to_interactions(evtdf):
     il = inter_levels(evtdf)
     return evtdf.groupby(level=il).first()
 
+
+_SEL_HDF_KEY = "sel_0"
+ 
+ 
+def build_and_save_selection(path, presel_inter, truth_cat_presel,
+                              reco_ke, reco_cos, true_ke, true_cos,
+                              stage_idx_dict, cut_names, pot_scale,
+                            reco_p=None, true_p=None):
+    """
+    Build a compact interaction-level selection DataFrame and write it to HDF5.
+ 
+    One row per interaction in presel_inter.  All reco/true observables and
+    per-stage boolean flags are stored so that plotting cells never need evtdf.
+ 
+    Parameters
+    ----------
+    path             : output path  (e.g. PLOT_DIR/selected_nuecc.df)
+    presel_inter     : pd.MultiIndex — interactions in evtdf (FM+FV baseline)
+    truth_cat_presel : pd.Series    — truth category aligned to presel_inter
+    reco_ke          : pd.Series    — leading-electron reco KE (all presel)
+    reco_cos         : pd.Series    — leading-electron reco costheta
+    true_ke          : pd.Series    — leading-electron true KE
+    true_cos         : pd.Series    — leading-electron true costheta
+    stage_idx_dict   : dict  name → pd.Index  (interaction indices per stage)
+    cut_names        : list[str]    — keys to save (e.g. ns.CUT_NAMES_MORE)
+    pot_scale        : float        — POT scale factor (stored as metadata)
+ 
+    Returns
+    -------
+    pd.DataFrame  (also written to path)
+    """
+    import os, warnings
+    import numpy as np
+    import pandas as pd
+ 
+    sel = pd.DataFrame(index=presel_inter)
+ 
+    # ── Truth ────────────────────────────────────────────────────────────────
+    sel["truth_cat"]    = truth_cat_presel.reindex(presel_inter).astype("int8")
+    sel["is_sig"]       = (sel["truth_cat"] == 0)
+ 
+    # ── Reco observables ─────────────────────────────────────────────────────
+    sel["reco_ke"]       = reco_ke.reindex(presel_inter).astype("float32")
+    sel["reco_costheta"] = reco_cos.reindex(presel_inter).astype("float32")
+    if reco_p is not None:                                  
+        sel["reco_p"] = reco_p.reindex(presel_inter).astype("float32")
+
+    if true_ke is not None:
+        sel["true_ke"]       = true_ke.reindex(presel_inter).astype("float32")
+    if true_cos is not None:
+        sel["true_costheta"] = true_cos.reindex(presel_inter).astype("float32")
+    if true_p is not None:                                 
+        sel["true_p"] = true_p.reindex(presel_inter).astype("float32")
+ 
+    # ── Per-stage boolean flags ───────────────────────────────────────────────
+    # True = this interaction passed up to and including this cut stage
+    for name in cut_names:
+        if name in stage_idx_dict:
+            sel[f"sel_{name}"] = presel_inter.isin(stage_idx_dict[name])
+        else:
+            warnings.warn(f"build_and_save_selection: stage {name!r} missing from stage_idx_dict")
+ 
+    # ── Scalar metadata stored as a constant column ───────────────────────────
+    sel["pot_scale"] = np.float32(pot_scale)
+ 
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    sel.to_hdf(path, key=_SEL_HDF_KEY, mode="w", complevel=1, complib="blosc")
+ 
+    size_mb = os.path.getsize(path) / 1024**2
+    print(f"Saved selection df → {path}")
+    print(f"  shape={sel.shape}  size={size_mb:.1f} MB")
+    return sel
+ 
+ 
+def load_selection(path):
+    """Load a selection df previously written by build_and_save_selection."""
+    import pandas as pd
+    return pd.read_hdf(path, key=_SEL_HDF_KEY)
+
+
+
+    
 # ============================================================
 # Purity / efficiency (unchanged)
 # ============================================================
@@ -285,6 +367,16 @@ def plot_stacked_hist(series_list, labels, colors, bins, weights=None,
     else:
         # Reverse so the top-stacked (last drawn) category appears first
         ax.legend(handles[::-1], legend_labels[::-1], fontsize=10, ncol=1, loc="best")
+    # ── Legend: invert handle order so top of stack = top of legend ─────────
+    handles, legend_labels = ax.get_legend_handles_labels()
+    if invert_stack_order:
+        ax.legend(handles, legend_labels, fontsize=9, ncol=1,
+                  loc="upper right", frameon=True,
+                  framealpha=0.85, edgecolor="none")
+    else:
+        ax.legend(handles[::-1], legend_labels[::-1], fontsize=9, ncol=1,
+                  loc="upper right", frameon=True,
+                  framealpha=0.85, edgecolor="none")
 
     ax.set_xlabel(xlabel, fontsize=12)
     ax.set_ylabel(ylabel, fontsize=12)
@@ -302,6 +394,232 @@ def plot_stacked_hist(series_list, labels, colors, bins, weights=None,
     return ax.get_figure(), ax
 
 
+# ============================================================
+# 2D resolution / bias plots  (true vs reco with marginals)
+# ============================================================
+def plot_hist2d_frac_err(x, y, xlabel='x', ylabel='y', title=None,
+                         cmap='Blues', plot_line=True,
+                         normalize=True, use_errorbar=False,
+                         fit_curve=True, show_fit=False,
+                         log_color=False,
+                         fontsize=13,
+                         **pltkwargs):
+    from scipy.optimize import curve_fit
+    from matplotlib.gridspec import GridSpec
+    from matplotlib.colors import LogNorm
+    from matplotlib.ticker import AutoMinorLocator
+
+    if 'bins' not in pltkwargs:
+        raise ValueError('bins must be provided as a keyword argument')
+    bins        = np.asarray(pltkwargs.pop('bins'))
+    bin_centers = 0.5 * (bins[1:] + bins[:-1])
+
+    # ── Crystal Ball function ─────────────────────────────────────────────
+    def _crystal_ball(t, a, n, mu, sigma):
+        """
+        Single-sided Crystal Ball (left tail).
+        a     : alpha — transition point in units of sigma (> 0)
+        n     : power-law exponent (> 1)
+        mu    : Gaussian mean  → reported as bias
+        sigma : Gaussian sigma → reported as resolution
+        """
+        t     = np.asarray(t, dtype=float)
+        out   = np.empty_like(t)
+        z     = (t - mu) / sigma
+        gauss = z > -a
+
+        # Gaussian core
+        out[gauss] = np.exp(-0.5 * z[gauss] ** 2)
+
+        # Power-law tail
+        A = (n / a) ** n * np.exp(-0.5 * a ** 2)
+        B = n / a - a
+        out[~gauss] = A * (B - z[~gauss]) ** (-n)
+
+        return out
+
+    bias = np.full(len(bin_centers), np.nan)
+    err  = np.full(len(bin_centers), np.nan)
+
+    for i in range(len(bins) - 1):
+        in_range = (x > bins[i]) & (x < bins[i + 1])
+        _xb, _yb = x[in_range], y[in_range]
+
+        if normalize:
+            keep = np.abs(_xb) > 1e-6
+            _xb, _yb = _xb[keep], _yb[keep]
+
+        if len(_xb) < 5:
+            continue
+
+        stat = (_yb - _xb) / _xb if normalize else (_yb - _xb)
+        stat = stat.dropna()
+
+        if len(stat) < 5:
+            continue
+
+        _mean = float(np.nanmean(stat))
+        _std  = max(float(np.nanstd(stat)), 1e-9)
+
+        if fit_curve:
+            _half  = 5.0 * _std
+            _fbins = np.linspace(_mean - _half, _mean + _half, 30)
+            _h, _e = np.histogram(stat, bins=_fbins)
+            _c     = 0.5 * (_e[:-1] + _e[1:])
+
+            try:
+                # p0: alpha=1.5 (transition ~1.5σ from mean),
+                #     n=2 (soft tail), mu=mean, sigma=std
+                popt, _ = curve_fit(
+                    _crystal_ball, _c, _h,
+                    p0    = [1.5, 2.0, _mean, _std],
+                    bounds = ([0.1, 1.01, _mean - 3*_std, 1e-9],
+                               [5.0, 50.0, _mean + 3*_std, 5*_std]),
+                    maxfev = 6000,
+                )
+                # popt = [alpha, n, mu, sigma]
+                bias[i] = popt[2]   # Gaussian mean
+                err[i]  = popt[3]   # Gaussian sigma — core resolution
+            except Exception:
+                # fallback: plain mean/std if CB fit fails
+                bias[i] = _mean
+                err[i]  = _std
+
+            if show_fit:
+                _t = np.linspace(_mean - _half, _mean + _half, 200)
+                plt.figure()
+                plt.hist(stat, bins=_fbins, label=f'Raw (n={len(stat):,})',
+                         density=True, alpha=0.6)
+                # normalise CB curve for overlay
+                _cb  = _crystal_ball(_t, *popt)
+                _cb /= (_cb.sum() * (_t[1] - _t[0]))
+                plt.plot(_t, _cb, lw=2, label=(
+                    f'Crystal Ball\n'
+                    f'μ={popt[2]:.3f}, σ={popt[3]:.3f}\n'
+                    f'α={popt[0]:.2f}, n={popt[1]:.2f}'
+                ))
+                plt.axvline(popt[2],             ls='--', color='blue',  label='μ')
+                plt.axvline(popt[2] - popt[3],   ls=':',  color='green', label='μ±σ')
+                plt.axvline(popt[2] + popt[3],   ls=':',  color='green')
+                plt.title(f'Bin [{bins[i]:.3g}, {bins[i+1]:.3g}]')
+                plt.legend(fontsize=8)
+                plt.show()
+        else:
+            bias[i] = _mean
+            err[i]  = _std
+
+    # ── Layout ────────────────────────────────────────────────────────────
+    fig = plt.figure(figsize=(6, 8))
+    gs  = GridSpec(
+        2, 2,
+        height_ratios = [4, 1],
+        width_ratios  = [20, 1],
+        hspace        = 0.03,
+        wspace        = 0.15,
+    )
+    ax_main = fig.add_subplot(gs[0, 0])
+    ax2     = fig.add_subplot(gs[1, 0])
+    cax     = fig.add_subplot(gs[0, 1])
+
+    plt.setp(ax_main.get_xticklabels(), visible=False)
+
+    valid_mask = x.notna() & y.notna()
+    _norm      = LogNorm() if log_color else None
+
+    h = ax_main.hist2d(
+        x[valid_mask].values, y[valid_mask].values,
+        bins=[bins, bins], cmap=cmap, norm=_norm,
+        **pltkwargs
+    )
+    fig.colorbar(h[3], cax=cax, label='Counts')
+    cax.yaxis.label.set_size(fontsize - 2)
+    cax.tick_params(labelsize=fontsize - 3)
+
+    if plot_line:
+        ax_main.plot(
+            [bins[0], bins[-1]], [bins[0], bins[-1]],
+            ls='--', color='red', lw=1.2, zorder=5,
+        )
+
+    ax_main.set_xlim(bins[0], bins[-1])
+    ax_main.set_ylim(bins[0], bins[-1])
+    ax_main.set_aspect('equal', adjustable='box')
+    ax_main.set_ylabel(ylabel, fontsize=fontsize)
+    ax_main.tick_params(axis='both', labelsize=fontsize - 2)
+    if title:
+        ax_main.set_title(title, fontsize=fontsize)
+
+    if use_errorbar:
+        ax2.errorbar(bin_centers, bias, yerr=err,
+                     fmt='o', color='black', markersize=5)
+    else:
+        ax2.scatter(bin_centers, bias, color='black', s=25,
+                    label='Fractional error', zorder=4)
+        ax2.scatter(bin_centers, err, color='green', s=40,
+                    label='Resolution (CB σ)', marker='*', zorder=4)
+        ax2.legend(fontsize=11, ncol=2, loc='upper right', framealpha=0.35)
+
+    ax2.axhline(0, ls='--', color='black', lw=1)
+    ax2.set_xlabel(xlabel, fontsize=fontsize)
+    ax2.set_ylabel('')
+    ax2.set_xlim(bins[0], bins[-1])
+    ax2.tick_params(axis='both', labelsize=fontsize - 2)
+
+    ax2.xaxis.set_minor_locator(AutoMinorLocator(2))
+    ax2.yaxis.set_minor_locator(AutoMinorLocator(2))
+    ax2.grid(which='major', linestyle='-',  linewidth=0.6, alpha=0.45)
+    ax2.grid(which='minor', linestyle='--', linewidth=0.3, alpha=0.25)
+    ax2.tick_params(which='both', direction='in', top=True, right=True)
+
+    plt.tight_layout()
+
+    fig.canvas.draw()
+    ax1_pos = ax_main.get_position()
+    cax_pos = cax.get_position()
+    cax.set_position([cax_pos.x0, ax1_pos.y0, cax_pos.width, ax1_pos.height])
+
+    return fig, (ax_main, ax2)
+
+def plot_leading_e_resolution(true_series, reco_series,
+                               bins, stage_idx=None,
+                               xlabel='True value',
+                               ylabel='Reco value',
+                               normalize=True,
+                               fit_curve=True,
+                               title=None,
+                               **kwargs):
+    """
+    Wrapper around plot_hist2d_frac_err for leading-electron
+    true-vs-reco plots.
+
+    Parameters
+    ----------
+    true_series : pd.Series  indexed by (ntuple, entry, interaction)
+    reco_series : pd.Series  same index
+    bins        : array-like
+    stage_idx   : pd.Index, optional  — restrict to a specific cut stage
+    normalize   : bool — fractional error if True
+    fit_curve   : bool — Gaussian fit per bin
+    """
+    if stage_idx is not None:
+        mask        = true_series.index.isin(stage_idx)
+        true_series = true_series[mask]
+        reco_series = reco_series[mask]
+
+    valid       = true_series.notna() & reco_series.notna()
+    x           = true_series[valid].astype(float)
+    y           = reco_series[valid].astype(float)
+
+    return plot_hist2d_frac_err(
+        x, y,
+        xlabel    = xlabel,
+        ylabel    = ylabel,
+        title     = title,
+        normalize = normalize,
+        fit_curve = fit_curve,
+        bins      = np.asarray(bins),
+        **kwargs,
+    )
 # ============================================================
 # Threshold scan plots (shower-quality cut optimisation)
 # ============================================================

@@ -32,7 +32,7 @@ import pandas as pd
 
 from makedf.makedf import (
     make_all_spine_df,
-    make_mcnudf_nuecc,
+    make_mcnudf,
 )
 from pyanalib.pandas_helpers import multicol_merge
 
@@ -210,36 +210,28 @@ def make_nuecc_evtdf(f):
     # ── 2. MC truth merge ─────────────────────────────────────────────────────
     # mct_index in rec.dlp_true links each interaction to the MC neutrino table.
     # Pandas multicol_merge on (entry, mct_index) ↔ (entry, rec.mc.nu..index).
+    # In make_nuecc_evtdf, replace the MC merge block with:
     try:
-        mcdf = make_mcnudf_nuecc(f)
+        mcdf = make_mcnudf(f)   # use make_mcnudf directly, not make_mcnudf_nuecc
         mcdf.columns = pd.MultiIndex.from_tuples(
             [tuple(["mcnu"] + list(c)) for c in mcdf.columns]
         )
+        # Merge key confirmed from make_spine_int_mcnu_df:
+        #   left:  ("rec", "dlp_true", "mct_index", "")
+        #   right: (entry, rec.mc.nu..index)
         mct_col = _find_col(spine_df, "mct_index", branch_must_contain=BRANCH_TRUE)
-
-        # mc index level name after reset_index  (e.g. "rec.mc.nu..index")
-        mc_nu_idx_name = mcdf.index.names[-1]
-
-        spine_reset = spine_df.reset_index()
-        mc_reset    = mcdf.reset_index()
-
-        # Locate the column tuples by name content after reset
-        entry_col  = next(c for c in spine_reset.columns
-                         if "entry" in str(c) and "index" not in str(c).lower().replace("entry",""))
-        mc_idx_col = next(c for c in mc_reset.columns
-                         if mc_nu_idx_name in str(c))
-
-        merged = multicol_merge(
-            spine_reset,
-            mc_reset,
-            left_on  = [entry_col, mct_col],
-            right_on = [entry_col, mc_idx_col],
+    
+        spineint_mcnu_df = multicol_merge(
+            lhs=spine_df.reset_index(level=list(range(1, spine_df.index.nlevels))),
+            rhs=mcdf.reset_index(),
+            left_on  = ["entry", mct_col],
+            right_on = ["entry", mcdf.index.names[-1]],  # "rec.mc.nu..index"
             how      = "left",
+            validate = "many_to_one",
         )
-        spine_df = merged.set_index(list(spine_df.index.names))
-
+        spine_df = spineint_mcnu_df.set_index(list(spine_df.index.names))
     except Exception as e:
-        warnings.warn(f"make_nuecc_evtdf: MC truth merge skipped — {e}")
+        warnings.warn(f"make_nuecc_evtdf: MC merge skipped — {e}")
 
     # ── 3. Reco FM + FV preselection ─────────────────────────────────────────
     try:

@@ -36,26 +36,22 @@ Notes
   MUST stay in sync with nue_selection.py and skim_nue_v2.py.
 """
 import sys, os
-
-# run_df_maker.py exec()s this file from the cafpyana working directory.
-# Insert the directory containing make_nueCC_df.py so it can be imported.
 sys.path.insert(0, os.path.dirname(os.path.abspath(args.config)))
 
-from make_nueCC_df  import make_nuecc_evtdf, make_nuecc_statsdf
-from makedf.makedf  import make_hdrdf, make_potdf_bnb   # standard cafpyana helpers
+from make_nueCC_df import make_nuecc_evtdf, make_nuecc_statsdf
+from makedf.makedf import make_hdrdf, make_potdf_bnb, make_mcnuwgtdf_slim
 
-# ── DFS list (one function per output table) ──────────────────────────────────
-# Order must match NAMES exactly.
 DFS = [
-    make_nuecc_evtdf,     # → "evt"
-    make_nuecc_statsdf,   # → "stats"
-    make_hdrdf,           # → "hdr"
-    make_potdf_bnb,       # → "pot"  (change to make_potdf_numi for NuMI beam)
+    make_nuecc_evtdf,
+    make_nuecc_statsdf,
+    make_hdrdf,
+    make_potdf_bnb,
+    make_mcnuwgtdf_slim,   # ← commented out for now
 ]
-
 NAMES = [
     "evt",
     "stats",
     "hdr",
     "pot",
+    "mcnu",
 ]

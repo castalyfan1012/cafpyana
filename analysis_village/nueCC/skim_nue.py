@@ -276,6 +276,8 @@ def build_truth_info(df, label=""):
     # cat 7 = neutrino catch-all (anything not matched above)
 
     # ── Reco preselection flags ───────────────────────────────────────────
+
+    
     if fm_col is not None:
         passed_fm = (
             (df[fm_col] == 1).groupby(level=IL).any().reindex(idx, fill_value=False)

@@ -46,8 +46,8 @@ from tqdm.auto import tqdm
 # CONFIG
 # =============================================================================
 CONFIG = dict(
-    input_glob    = "/exp/sbnd/data/users/castalyf/nue_sel/production_files/gen1/skimmed_df/*_skimmed.df",
-    output_file   = "/exp/sbnd/data/users/castalyf/nue_sel/production_files/gen1/skimmed_df/merged.df",
+    input_glob    = "/pnfs/sbnd/scratch/users/castalyf/cafpyana_out/dfs/2026_04_27_234922__dfs/*.df",
+    output_file   = "/exp/sbnd/data/users/castalyf/nue_sel/production_files/gen1/mc1e20_nueCC_sys.df",
     ntuple_stride = 10_000,
     n_files       = None,   # None = all; set to int to cap
     dry_run       = False,

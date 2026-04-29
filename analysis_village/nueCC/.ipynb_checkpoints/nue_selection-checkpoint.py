@@ -414,21 +414,6 @@ def leading_electron_ke(evtdf, particle_mask=None):
         m = m & particle_mask
     return reco_particles(evtdf).ke[m].groupby(level=il).max()
 
-def leading_electron_costheta(evtdf, particle_mask=None):
-    il = inter_levels(evtdf)
-    m = primary_electron_mask(evtdf)
-    if particle_mask is not None:
-        m = m & particle_mask
-    rp = reco_particles(evtdf)
-    ke = rp.ke[m]
-    idx_max = ke.groupby(level=il).idxmax().dropna()
-    mom = rp.momentum
-    px = mom.x.loc[idx_max]
-    py = mom.y.loc[idx_max]
-    pz = mom.z.loc[idx_max]
-    pmag = np.sqrt(px**2 + py**2 + pz**2)
-    return pd.Series((pz / pmag).values, index=idx_max.index)
-
 def true_leading_electron_ke(evtdf):
     """Strong debug version to see what tp.ke really contains"""
     il = inter_levels(evtdf)
@@ -461,6 +446,44 @@ def true_leading_electron_ke(evtdf):
     # For now, return the raw so we can see
     return raw_ke.groupby(level=il).max()
 
+def leading_electron_p(evtdf, particle_mask=None):
+    """Momentum magnitude [MeV/c] of the leading primary reco electron."""
+    il = inter_levels(evtdf)
+    m  = primary_electron_mask(evtdf)
+    if particle_mask is not None:
+        m = m & particle_mask
+    rp = reco_particles(evtdf)
+    ke = rp.ke[m]
+    idx_max = ke.groupby(level=il).idxmax().dropna()
+    return rp.p.loc[idx_max].set_axis(idx_max.index)
+
+
+def true_leading_electron_p(evtdf):
+    """Momentum magnitude [MeV/c] of the leading primary true electron."""
+    il = inter_levels(evtdf)
+    tp = true_particles(evtdf)
+    m  = (tp.pid == PID_ELECTRON) & (tp.is_primary == 1)
+    if m.sum() == 0:
+        return pd.Series(dtype=float)
+    ge      = tp.energy_init[m]
+    idx_max = ge.groupby(level=il).idxmax().dropna()
+    return tp.p.loc[idx_max].set_axis(idx_max.index)
+
+def leading_electron_costheta(evtdf, particle_mask=None):
+    il = inter_levels(evtdf)
+    m = primary_electron_mask(evtdf)
+    if particle_mask is not None:
+        m = m & particle_mask
+    rp = reco_particles(evtdf)
+    ke = rp.ke[m]
+    idx_max = ke.groupby(level=il).idxmax().dropna()
+    mom = rp.momentum
+    px = mom.x.loc[idx_max]
+    py = mom.y.loc[idx_max]
+    pz = mom.z.loc[idx_max]
+    pmag = np.sqrt(px**2 + py**2 + pz**2)
+    return pd.Series((pz / pmag).values, index=idx_max.index)
+    
 def true_leading_electron_costheta(evtdf):
     il = inter_levels(evtdf)
     tp = true_particles(evtdf)
