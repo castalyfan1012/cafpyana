@@ -46,7 +46,19 @@ MUON_THRESHOLD_MEV     = 50.0
 PID_ELECTRON           = 1
 PID_MUON               = 2
 
+# =============================================================================
+# SPINE df cache — avoids loading the full df twice per file
+# (make_nuecc_evtdf and make_nuecc_statsdf both need it)
+# =============================================================================
+_spine_cache = {}
 
+def _get_spine_df(f):
+    """Load SPINE df once per file, reuse for both evtdf and statsdf."""
+    fname = str(f)
+    if fname not in _spine_cache:
+        _spine_cache.clear()          # never hold more than one file in memory
+        _spine_cache[fname] = make_all_spine_df(f)
+    return _spine_cache[fname]
 # =============================================================================
 # Column helpers  (same logic as skim_nue_v2, duplicated for standalone use)
 # =============================================================================
@@ -204,7 +216,7 @@ def make_nuecc_evtdf(f):
     Index  : (entry, rec.dlp..index, rec.dlp.particles..index)
     """
     # ── 1. SPINE df ───────────────────────────────────────────────────────────
-    spine_df = make_all_spine_df(f)
+    spine_df = _get_spine_df(f)
     il       = list(range(spine_df.index.nlevels - 1))
 
     # ── 2. MC truth merge ─────────────────────────────────────────────────────
@@ -277,7 +289,7 @@ def make_nuecc_statsdf(f):
     }])
 
     try:
-        spine_df = make_all_spine_df(f)
+        spine_df = _get_spine_df(f)
     except Exception as e:
         warnings.warn(f"make_nuecc_statsdf: could not load spine df — {e}")
         return empty
