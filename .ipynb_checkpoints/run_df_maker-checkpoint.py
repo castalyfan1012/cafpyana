@@ -192,8 +192,8 @@ def run_grid(inputfiles):
 --tar_file_name "dropbox://$(pwd)/bin_dir.tar" \\
 -N %d \\
 --disk 100GB \\
---cpu 4 \\
---memory 10GB \\
+--cpu 3 \\
+--memory 20GB \\
 --expected-lifetime 3h \\
 "file://$(pwd)/grid_executable.sh" \\
 "%s" \\
