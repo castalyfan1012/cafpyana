@@ -150,7 +150,9 @@ def run_grid(inputfiles):
         flist = flistForEachJob[i_flist]
         out = open(MasterJobDir + '/run_%s.sh'%(i_flist),'w')
         out.write('#!/bin/bash\n')
-        cmd = 'python run_df_maker.py -c ' + args.config + ' -o ' + args.output + '_%d'%i_flist + '.df -ncpu 7 -i'
+        cmd = ('python run_df_maker.py -c ' + args.config + 
+       ' -o ' + args.output + '_%d'%i_flist + 
+       '.df -ncpu %d -i' % max(1, args.NCPU))
         for i_f in range(0,len(flist)):
             out.write('echo "[run_%s.sh] input %d : %s"\n'%(i_flist, i_f, flist[i_f]))
             if i_f == 0:
@@ -181,23 +183,23 @@ def run_grid(inputfiles):
     os.system(tar_cmd)
 
     submitCMD = '''jobsub_submit \\
--G sbnd \\
---auth-methods="token" \\
--e LC_ALL=C \\
---role=Analysis \\
---resource-provides="usage_model=DEDICATED,OPPORTUNISTIC" \\
--l '+SingularityImage=\\"/cvmfs/singularity.opensciencegrid.org/fermilab/fnal-wn-el9\:9.7\\"' \\
---lines '+FERMIHTC_AutoRelease=True' --lines '+FERMIHTC_GraceMemory=2000' --lines '+FERMIHTC_GraceLifetime=3600' \\
---append_condor_requirements='(TARGET.HAS_SINGULARITY=?=true)' \\
---tar_file_name "dropbox://$(pwd)/bin_dir.tar" \\
--N %d \\
---disk 100GB \\
---cpu 3 \\
---memory 20GB \\
---expected-lifetime 3h \\
-"file://$(pwd)/grid_executable.sh" \\
-"%s" \\
-"%s"'''%(ngrid,OutputDir,args.output)
+    -G sbnd \\
+    --auth-methods="token" \\
+    -e LC_ALL=C \\
+    --role=Analysis \\
+    --resource-provides="usage_model=DEDICATED,OPPORTUNISTIC" \\
+    -l '+SingularityImage=\\"/cvmfs/singularity.opensciencegrid.org/fermilab/fnal-wn-el9\:9.7\\"' \\
+    --lines '+FERMIHTC_AutoRelease=True' --lines '+FERMIHTC_GraceMemory=2000' --lines '+FERMIHTC_GraceLifetime=7200' \\
+    --append_condor_requirements='(TARGET.HAS_SINGULARITY=?=true)' \\
+    --tar_file_name "dropbox://$(pwd)/bin_dir.tar" \\
+    -N %d \\
+    --disk 100GB \\
+    --cpu %d \\
+    --memory %dGB \\
+    --expected-lifetime 3h \\
+    "file://$(pwd)/grid_executable.sh" \\
+    "%s" \\
+    "%s"'''%(ngrid, max(1, args.NCPU), max(1, args.NCPU) * 8, OutputDir, args.output)
 
     print(submitCMD)
     os.system(submitCMD)

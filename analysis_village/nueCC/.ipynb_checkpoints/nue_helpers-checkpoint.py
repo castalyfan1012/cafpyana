@@ -826,7 +826,212 @@ def threshold_plots(evtdf, cut_flow_result, cut_stage, metric_col,
 
     return opt_thresh, max_f1
 
+def threshold_plots_cumulative(evtdf, cut_flow_result, cut_stage,
+                                shower_cuts, truth_categories=None,
+                                opt_thresholds_prev=None,
+                                fig_width=7, plot_folder="plots"):
+    """
+    Sequential threshold scan: each cut is applied to survivors of all
+    previous cuts. Histograms show the remaining population at each stage.
 
+    Parameters
+    ----------
+    shower_cuts : list of tuples — same format as the notebook shower_cuts list:
+        (metric_col, bounds, xaxis_name, threshold_range, cut_dir, legend_loc, save_name)
+    opt_thresholds_prev : dict  col → threshold  (pre-applied before scanning)
+        Pass previously determined thresholds to start from a partially-cut sample.
+
+    Returns
+    -------
+    dict  col → optimal_threshold
+    """
+    from nue_selection import PID_ELECTRON, classify_truth
+
+    il         = inter_levels(evtdf)
+    presel_idx = cut_flow_result[cut_stage]["inter_index"]
+
+    if truth_categories is None:
+        cat = classify_truth(evtdf, verbose=False)
+    else:
+        cat = truth_categories
+
+    rp    = reco_particles(evtdf)
+    rp_df = rp._df
+
+    _MULTI_COL_ELECTRON_IDX = {
+        'pid_scores':     ('pid_scores',     'I1'),
+        'primary_scores': ('primary_scores', 'I1'),
+    }
+
+    def _resolve_col(metric_col):
+        if isinstance(metric_col, str) and metric_col in _MULTI_COL_ELECTRON_IDX:
+            return _MULTI_COL_ELECTRON_IDX[metric_col]
+        if isinstance(metric_col, str):
+            if metric_col in rp_df.columns:
+                return metric_col
+            if (metric_col, '') in rp_df.columns:
+                return (metric_col, '')
+            matches = [c for c in rp_df.columns
+                       if (isinstance(c, tuple) and c[0] == metric_col) or c == metric_col]
+            if not matches:
+                raise KeyError(f"'{metric_col}' not found in reco_particles.")
+            return matches[0]
+        return metric_col
+
+    ke_col  = ('ke',  '') if ('ke',  '') in rp_df.columns else 'ke'
+    pid_col = ('pid', '') if ('pid', '') in rp_df.columns else 'pid'
+
+    # ── Build per-interaction metric frame for ALL shower variables at once ──
+    inter_idx_of_particle = rp_df.index.droplevel(-1)
+    in_presel  = inter_idx_of_particle.isin(presel_idx)
+    ele_presel = rp_df[in_presel & (rp_df[pid_col] == PID_ELECTRON)]
+
+    # Build a flat df: one row per interaction, one column per metric
+    metric_frames = {}
+    for (metric_col, *_) in shower_cuts:
+        col_key = _resolve_col(metric_col)
+        tmp = pd.DataFrame({
+            'ke':     ele_presel[ke_col].to_numpy(dtype=float),
+            'metric': ele_presel[col_key].to_numpy(dtype=float),
+        }, index=ele_presel.index)
+        def _max_ke_metric(g):
+            return g.loc[g['ke'].idxmax(), 'metric']
+        metric_frames[metric_col] = tmp.groupby(level=il).apply(_max_ke_metric)
+
+    # Master frame: interactions × metrics
+    master = pd.DataFrame(metric_frames)
+    master['is_signal'] = (cat.reindex(master.index).fillna(-1) == 0).values
+
+    # ── Apply any pre-existing thresholds to start from survivors ────────────
+    surviving_mask = pd.Series(True, index=master.index)
+    if opt_thresholds_prev:
+        for metric_col, bounds, xaxis_name, trange, cut_dir, lloc, sname in shower_cuts:
+            if metric_col in opt_thresholds_prev:
+                thresh = opt_thresholds_prev[metric_col]
+                col_vals = master[metric_col]
+                if cut_dir == '>':
+                    surviving_mask &= (col_vals > thresh)
+                else:
+                    surviving_mask &= (col_vals < thresh)
+
+    opt_thresholds = {}
+
+    for metric_col, bounds, xaxis_name, trange, cut_dir, lloc, sname in shower_cuts:
+        col_key    = _resolve_col(metric_col)
+        xmin, xmax = bounds
+
+        # ── Current survivors (after all previous cuts) ───────────────────
+        current    = master[surviving_mask]
+        metric_vals= current[metric_col].to_numpy(dtype=float)
+        is_signal  = current['is_signal'].to_numpy()
+
+        valid       = ~np.isnan(metric_vals)
+        metric_vals = metric_vals[valid]
+        is_signal   = is_signal[valid]
+
+        n_total     = len(metric_vals)
+        n_signal    = is_signal.sum()
+        n_bkg       = (~is_signal).sum()
+
+        signal_vals     = metric_vals[is_signal]
+        background_vals = metric_vals[~is_signal]
+
+        # ── Plot ──────────────────────────────────────────────────────────
+        fig = plt.figure(figsize=(fig_width, 8))
+        gs  = fig.add_gridspec(4, 1, hspace=0.05)
+        ax1 = fig.add_subplot(gs[:3, 0])
+
+        ax1.hist(background_vals, bins=np.linspace(xmin, xmax, 51),
+                 histtype='step', density=True,
+                 label=f'Background ({n_bkg:,} remaining)',
+                 color='orange', linewidth=1.5)
+        ax1.hist(signal_vals, bins=np.linspace(xmin, xmax, 51),
+                 histtype='step', density=True,
+                 label=r'Signal $\nu_e$CC' + f' ({n_signal:,} remaining)',
+                 color='blue', linewidth=1.5)
+
+        n_cuts_applied = sum(1 for c, *_ in shower_cuts
+                             if c in opt_thresholds or
+                             (opt_thresholds_prev and c in opt_thresholds_prev))
+        ax1.set_title(
+            f"{xaxis_name} — threshold scan\n"
+            f"({n_total:,} interactions surviving previous cuts)",
+            fontsize=14, pad=8
+        )
+        ax1.set_ylabel('Probability Density', fontsize=13)
+        ax1.legend(loc=f'upper {lloc}', framealpha=0.3, fontsize=11)
+        ax1.set_xlim(xmin, xmax)
+        ax1.tick_params(labelbottom=False)
+        ax1.grid(True, which='major', linestyle='-', linewidth=0.5, alpha=0.3)
+
+        # ── Threshold scan on surviving population ────────────────────────
+        start, stop, step = trange
+        thresholds = np.arange(start, stop + step / 2, step)
+        total_signal = is_signal.sum()
+        keep_above   = (cut_dir == '>')
+
+        purities, efficiencies, f1s = [], [], []
+        for thresh in thresholds:
+            passed       = (metric_vals > thresh) if keep_above else (metric_vals < thresh)
+            n_passed     = passed.sum()
+            n_sig_passed = (passed & is_signal).sum()
+            pur = n_sig_passed / n_passed     if n_passed     > 0 else 0.0
+            eff = n_sig_passed / total_signal if total_signal > 0 else 0.0
+            f1  = 2 * pur * eff / (pur + eff) if (pur + eff)  > 0 else 0.0
+            purities.append(pur); efficiencies.append(eff); f1s.append(f1)
+
+        f1s        = np.array(f1s)
+        opt_idx    = np.argmax(f1s)
+        opt_thresh = float(thresholds[opt_idx])
+        max_f1     = float(f1s[opt_idx])
+
+        ax2 = fig.add_subplot(gs[3, 0])
+        ax2.plot(thresholds, purities,     'b-',           label='Purity',     linewidth=1.5)
+        ax2.plot(thresholds, efficiencies, 'r-',           label='Efficiency', linewidth=1.5)
+        ax2.plot(thresholds, f1s,          color='purple', label='F1 Score',   linewidth=1.5)
+        ax2.axvline(opt_thresh, color='purple', linestyle='--', linewidth=1.5)
+        ax2.set_xlabel(xaxis_name, fontsize=13)
+        ax2.set_ylabel('Performance', fontsize=13)
+        ax2.set_xlim(xmin, xmax); ax2.set_ylim(0, 1)
+        ax2.legend(loc=f'upper {lloc}', framealpha=0.3, fontsize=11)
+        range_x = xmax - xmin
+        if cut_dir == '<':
+            text_x, ha = opt_thresh + range_x * 0.05, 'left'
+        else:
+            text_x, ha = opt_thresh - range_x * 0.05, 'right'
+        ax2.text(text_x, 0.05, f'Max F1 at {opt_thresh:.3f}',
+                 color='purple', va='bottom', ha=ha, fontsize=12,
+                 bbox=dict(boxstyle="round,pad=0.3", facecolor='white',
+                           edgecolor='none', alpha=0.5))
+        ax2.grid(True, which='major', linestyle='-', linewidth=0.5, alpha=0.3)
+
+        plt.tight_layout()
+        if sname:
+            save_plot(sname + "_cumulative", fig=fig, folder_name=plot_folder)
+        plt.show()
+
+        print(f"\n{'─'*50}")
+        print(f"  Variable   : {metric_col}")
+        print(f"  Remaining  : {n_total:,} interactions ({n_signal} signal, {n_bkg} bkg)")
+        print(f"  Cut dir    : {cut_dir} {opt_thresh:.4f}")
+        print(f"  Efficiency : {efficiencies[opt_idx]*100:.1f}%  (of remaining signal)")
+        print(f"  Purity     : {purities[opt_idx]*100:.1f}%")
+        print(f"  Max F1     : {max_f1:.4f}")
+        print(f"{'─'*50}\n")
+
+        opt_thresholds[metric_col] = opt_thresh
+
+        # ── Apply this cut to survivors for the next iteration ────────────
+        col_vals = master[metric_col]
+        if cut_dir == '>':
+            surviving_mask &= (col_vals > opt_thresh)
+        else:
+            surviving_mask &= (col_vals < opt_thresh)
+
+    print(f"\nFinal surviving interactions: {surviving_mask.sum():,}")
+    return opt_thresholds
+
+    
     
 # The rest of the plotting helpers are unchanged
 def plot_eff_pur_vs_bin(bin_centers, purs, effs, counts_true=None,
