@@ -194,12 +194,12 @@ def run_grid(inputfiles):
     --tar_file_name "dropbox://$(pwd)/bin_dir.tar" \\
     -N %d \\
     --disk 100GB \\
-    --cpu %d \\
-    --memory %dGB \\
+    --cpu 1 \\
+    --memory 25GB \\
     --expected-lifetime 3h \\
     "file://$(pwd)/grid_executable.sh" \\
     "%s" \\
-    "%s"'''%(ngrid, max(1, args.NCPU), max(1, args.NCPU) * 8, OutputDir, args.output)
+    "%s"'''%(ngrid, OutputDir, args.output)
 
     print(submitCMD)
     os.system(submitCMD)

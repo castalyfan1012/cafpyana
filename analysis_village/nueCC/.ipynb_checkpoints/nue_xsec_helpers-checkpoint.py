@@ -234,6 +234,48 @@ class VariableConfig:
         )
 
 
+def make_equal_stats_bins(reference_vals, n_bins, lo=None, hi=None):
+    """
+    Build bin edges so each bin contains approximately equal numbers of events.
+
+    Parameters
+    ----------
+    reference_vals : array-like — values to derive quantiles from
+                     (use selected signal reco KE, for example)
+    n_bins         : int   — desired number of bins
+    lo, hi         : float — hard lower/upper limits; edges are forced to these
+                     values regardless of the quantiles.  Values outside [lo, hi)
+                     are excluded before computing quantiles.
+
+    Returns
+    -------
+    np.ndarray of shape (n_bins+1,) with strictly increasing edges.
+    """
+    import warnings
+    vals = np.asarray(reference_vals, dtype=float)
+    vals = vals[np.isfinite(vals)]
+    if lo is not None:
+        vals = vals[vals >= lo]
+    if hi is not None:
+        vals = vals[vals <  hi]
+
+    if len(vals) == 0:
+        raise ValueError("make_equal_stats_bins: no finite values inside [lo, hi)")
+
+    pcts  = np.linspace(0, 100, n_bins + 1)
+    edges = np.percentile(vals, pcts)
+
+    if lo is not None: edges[0]  = lo
+    if hi is not None: edges[-1] = hi
+
+    edges = np.unique(edges)          # drop duplicate edges from sparse regions
+    if len(edges) < n_bins + 1:
+        warnings.warn(
+            f"make_equal_stats_bins: only {len(edges)-1} unique edges produced "
+            f"(requested {n_bins}). Consider fewer bins or a wider range."
+        )
+    return edges
+    
 # =============================================================================
 # Truth categorisation
 # =============================================================================

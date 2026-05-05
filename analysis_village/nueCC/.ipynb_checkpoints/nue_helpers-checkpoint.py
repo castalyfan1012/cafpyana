@@ -415,28 +415,16 @@ def plot_hist2d_frac_err(x, y, xlabel='x', ylabel='y', title=None,
     bin_centers = 0.5 * (bins[1:] + bins[:-1])
 
     # ── Crystal Ball function ─────────────────────────────────────────────
-    def _crystal_ball(t, a, n, mu, sigma):
-        """
-        Single-sided Crystal Ball (left tail).
-        a     : alpha — transition point in units of sigma (> 0)
-        n     : power-law exponent (> 1)
-        mu    : Gaussian mean  → reported as bias
-        sigma : Gaussian sigma → reported as resolution
-        """
+    def _crystal_ball(t, A, a, n, mu, sigma):   # <-- added A
         t     = np.asarray(t, dtype=float)
         out   = np.empty_like(t)
         z     = (t - mu) / sigma
         gauss = z > -a
-
-        # Gaussian core
-        out[gauss] = np.exp(-0.5 * z[gauss] ** 2)
-
-        # Power-law tail
-        A = (n / a) ** n * np.exp(-0.5 * a ** 2)
-        B = n / a - a
-        out[~gauss] = A * (B - z[~gauss]) ** (-n)
-
-        return out
+        out[gauss]  = np.exp(-0.5 * z[gauss]**2)
+        Ac    = (n / a)**n * np.exp(-0.5 * a**2)
+        B     = n / a - a
+        out[~gauss] = Ac * (B - z[~gauss])**(-n)
+        return A * out                           # <-- scaled by A
 
     bias = np.full(len(bin_centers), np.nan)
     err  = np.full(len(bin_centers), np.nan)
@@ -470,16 +458,17 @@ def plot_hist2d_frac_err(x, y, xlabel='x', ylabel='y', title=None,
             try:
                 # p0: alpha=1.5 (transition ~1.5σ from mean),
                 #     n=2 (soft tail), mu=mean, sigma=std
+                A0 = max(float(_h.max()), 1.0)
                 popt, _ = curve_fit(
                     _crystal_ball, _c, _h,
-                    p0    = [1.5, 2.0, _mean, _std],
-                    bounds = ([0.1, 1.01, _mean - 3*_std, 1e-9],
-                               [5.0, 50.0, _mean + 3*_std, 5*_std]),
-                    maxfev = 6000,
+                    p0     = [A0,   1.5,  2.0,  _mean,        _std          ],
+                    bounds = ([0,   0.1,  1.01, _mean - 3*_std, 1e-9        ],
+                              [20*A0+1, 5.0, 50.0, _mean + 3*_std, 5*_std   ]),
+                    maxfev = 8000,
                 )
-                # popt = [alpha, n, mu, sigma]
-                bias[i] = popt[2]   # Gaussian mean
-                err[i]  = popt[3]   # Gaussian sigma — core resolution
+                # popt = [A, alpha, n, mu, sigma]  — shift indices by 1
+                bias[i] = popt[3]   # mu    (was popt[2])
+                err[i]  = popt[4]   # sigma (was popt[3])
             except Exception:
                 # fallback: plain mean/std if CB fit fails
                 bias[i] = _mean
@@ -491,16 +480,17 @@ def plot_hist2d_frac_err(x, y, xlabel='x', ylabel='y', title=None,
                 plt.hist(stat, bins=_fbins, label=f'Raw (n={len(stat):,})',
                          density=True, alpha=0.6)
                 # normalise CB curve for overlay
+                # inside the show_fit block — update index references
                 _cb  = _crystal_ball(_t, *popt)
                 _cb /= (_cb.sum() * (_t[1] - _t[0]))
                 plt.plot(_t, _cb, lw=2, label=(
                     f'Crystal Ball\n'
-                    f'μ={popt[2]:.3f}, σ={popt[3]:.3f}\n'
-                    f'α={popt[0]:.2f}, n={popt[1]:.2f}'
+                    f'μ={popt[3]:.3f}, σ={popt[4]:.3f}\n'   # 3,4 not 2,3
+                    f'α={popt[1]:.2f}, n={popt[2]:.2f}'     # 1,2 not 0,1
                 ))
-                plt.axvline(popt[2],             ls='--', color='blue',  label='μ')
-                plt.axvline(popt[2] - popt[3],   ls=':',  color='green', label='μ±σ')
-                plt.axvline(popt[2] + popt[3],   ls=':',  color='green')
+                plt.axvline(popt[3],             ls='--', color='blue',  label='μ')
+                plt.axvline(popt[3] - popt[4],   ls=':',  color='green', label='μ±σ')
+                plt.axvline(popt[3] + popt[4],   ls=':',  color='green')
                 plt.title(f'Bin [{bins[i]:.3g}, {bins[i+1]:.3g}]')
                 plt.legend(fontsize=8)
                 plt.show()
@@ -549,6 +539,15 @@ def plot_hist2d_frac_err(x, y, xlabel='x', ylabel='y', title=None,
     if title:
         ax_main.set_title(title, fontsize=fontsize)
 
+    # ── "SBND Simulation" watermark ───────────────────────────────────────
+    ax_main.text(
+        0.03, 0.97,
+        r'$\mathbf{SBND}$ Simulation',
+        transform  = ax_main.transAxes,
+        va='top', ha='left',
+        fontsize   = fontsize - 2,
+        color      = 'gray',
+    )
     if use_errorbar:
         ax2.errorbar(bin_centers, bias, yerr=err,
                      fmt='o', color='black', markersize=5)
@@ -556,13 +555,14 @@ def plot_hist2d_frac_err(x, y, xlabel='x', ylabel='y', title=None,
         ax2.scatter(bin_centers, bias, color='black', s=25,
                     label='Fractional error', zorder=4)
         ax2.scatter(bin_centers, err, color='green', s=40,
-                    label='Resolution (CB σ)', marker='*', zorder=4)
-        ax2.legend(fontsize=11, ncol=2, loc='upper right', framealpha=0.35)
+                    label='Resolution (Crystal-Ball fit σ)', marker='*', zorder=4)
+        ax2.legend(fontsize=11, ncol=1, loc='upper right', framealpha=0.35)
 
     ax2.axhline(0, ls='--', color='black', lw=1)
     ax2.set_xlabel(xlabel, fontsize=fontsize)
     ax2.set_ylabel('')
     ax2.set_xlim(bins[0], bins[-1])
+    ax2.set_ylim(-0.05, 0.2)
     ax2.tick_params(axis='both', labelsize=fontsize - 2)
 
     ax2.xaxis.set_minor_locator(AutoMinorLocator(2))
