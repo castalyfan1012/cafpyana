@@ -35,7 +35,7 @@ Notes
 * ELECTRON_THRESHOLD_MEV and the truth-signal definition in make_nueCC_df.py
   MUST stay in sync with nue_selection.py and skim_nue_v2.py.
 """
-# nueCC_mc_noweights.py
+# nueCC_mc.py
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(args.config)))
 from make_nueCC_df import make_nuecc_evtdf, make_nuecc_statsdf

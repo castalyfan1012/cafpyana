@@ -316,3 +316,64 @@ def make_nuecc_statsdf(f):
         "n_sig_after_presel": int((is_sig & passed_presel).sum()),
         **cat_counts,
     }])
+
+
+def make_nuecc_wgtdf(f):
+    """
+    BNB + GENIE universe weights for FM+FV preselected interactions only.
+    
+    Key: passes only the preselected mct_index values to bnbsyst/geniesyst,
+    reducing memory from ~25 GB to ~2 GB per file.
+    This is the "apply cuts before loading" approach.
+    """
+    from makedf import bnbsyst, geniesyst
+    from pyanalib.pandas_helpers import multicol_concat
+
+    # ── Step 1: get preselected mct_index values via the cached SPINE df ──
+    spine_df = _get_spine_df(f)
+    il       = list(range(spine_df.index.nlevels - 1))
+
+    try:
+        fm_col = _find_col(spine_df, "is_flash_matched", branch_must_not_contain=BRANCH_TRUE)
+        fv_col = _find_col(spine_df, "is_fiducial",      branch_must_not_contain=BRANCH_TRUE)
+        fm_pass  = (spine_df[fm_col] == 1).groupby(level=il).any()
+        fv_pass  = (spine_df[fv_col] == 1).groupby(level=il).any()
+        presel   = fm_pass[fm_pass].index.intersection(fv_pass[fv_pass].index)
+    except Exception as e:
+        warnings.warn(f"make_nuecc_wgtdf: FM/FV filter failed — {e}")
+        presel = spine_df.groupby(level=il).first().index
+
+    # mct_index links preselected reco interactions → MC neutrino table
+    mct_col = _safe(_find_col, spine_df, "mct_index", branch_must_contain=BRANCH_TRUE)
+    if mct_col is None:
+        warnings.warn("make_nuecc_wgtdf: mct_index not found — returning empty df")
+        return pd.DataFrame()
+
+    inter_df        = spine_df.groupby(level=il).first()
+    presel_mct_idx  = (inter_df.loc[inter_df.index.isin(presel), mct_col]
+                       .dropna().astype(int))
+
+    print(f"  make_nuecc_wgtdf: {len(presel_mct_idx)} preselected MC nu indices "
+          f"(of {len(inter_df)} total)")
+
+    # ── Step 2: load base MC nu df, subset to preselected indices ─────────
+    mcdf     = make_mcnudf(f, include_weights=False)   # CV only — small
+    mcdf_sel = mcdf[mcdf.index.get_level_values(-1).isin(presel_mct_idx)]
+    ind_sel  = mcdf_sel.index.get_level_values(-1)
+
+    # ── Step 3: compute BNB + GENIE weights for preselected indices only ──
+    try:
+        bnb_wgt = bnbsyst.bnbsyst(f, ind_sel, multisim_nuniv=100, slim=True)
+    except Exception as e:
+        warnings.warn(f"make_nuecc_wgtdf: BNB weights failed — {e}")
+        bnb_wgt = pd.DataFrame(index=mcdf_sel.index)
+
+    try:
+        genie_wgt = geniesyst.geniesyst(f, ind_sel, multisim_nuniv=100, slim=True)
+    except Exception as e:
+        warnings.warn(f"make_nuecc_wgtdf: GENIE weights failed — {e}")
+        genie_wgt = pd.DataFrame(index=mcdf_sel.index)
+
+    wgtdf = multicol_concat(mcdf_sel, bnb_wgt)
+    wgtdf = multicol_concat(wgtdf,    genie_wgt)
+    return wgtdf
