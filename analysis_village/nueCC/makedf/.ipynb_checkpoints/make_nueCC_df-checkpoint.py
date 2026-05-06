@@ -320,72 +320,74 @@ def make_nuecc_statsdf(f):
 
 def make_nuecc_wgtdf(f):
     """
-    BNB + GENIE universe weights for FM+FV preselected interactions only.
+    BNB + GENIE weights, filtered to FM+FV preselected interactions only.
     
-    Key: passes only the preselected mct_index values to bnbsyst/geniesyst,
-    reducing memory from ~25 GB to ~2 GB per file.
-    This is the "apply cuts before loading" approach.
+    Strategy:
+      1. Get preselected mct_index values from cached SPINE df
+      2. Compute weights for ALL MC neutrinos (bnbsyst/geniesyst need full ind)
+      3. Filter output rows to preselected indices only → small output df
+    Memory: BNB ~3 GB, GENIE ~6 GB peak (full), but output is tiny
     """
     from makedf import bnbsyst, geniesyst
     from pyanalib.pandas_helpers import multicol_concat
 
-    # ── Step 1: get preselected mct_index values via the cached SPINE df ──
+    # ── Step 1: get preselected mct_index values ──────────────────────────
     spine_df = _get_spine_df(f)
     il       = list(range(spine_df.index.nlevels - 1))
 
     try:
         fm_col = _find_col(spine_df, "is_flash_matched", branch_must_not_contain=BRANCH_TRUE)
         fv_col = _find_col(spine_df, "is_fiducial",      branch_must_not_contain=BRANCH_TRUE)
-        fm_pass  = (spine_df[fm_col] == 1).groupby(level=il).any()
-        fv_pass  = (spine_df[fv_col] == 1).groupby(level=il).any()
-        presel   = fm_pass[fm_pass].index.intersection(fv_pass[fv_pass].index)
+        fm_pass = (spine_df[fm_col] == 1).groupby(level=il).any()
+        fv_pass = (spine_df[fv_col] == 1).groupby(level=il).any()
+        presel  = fm_pass[fm_pass].index.intersection(fv_pass[fv_pass].index)
     except Exception as e:
         warnings.warn(f"make_nuecc_wgtdf: FM/FV filter failed — {e}")
         presel = spine_df.groupby(level=il).first().index
 
-    # mct_index links preselected reco interactions → MC neutrino table
     mct_col = _safe(_find_col, spine_df, "mct_index", branch_must_contain=BRANCH_TRUE)
     if mct_col is None:
         warnings.warn("make_nuecc_wgtdf: mct_index not found — returning empty df")
         return pd.DataFrame()
 
-    inter_df        = spine_df.groupby(level=il).first()
-    presel_mct_idx  = (inter_df.loc[inter_df.index.isin(presel), mct_col]
-                       .dropna().astype(int))
+    inter_df       = spine_df.groupby(level=il).first()
+    presel_mct_set = set(
+        inter_df.loc[inter_df.index.isin(presel), mct_col]
+        .dropna().astype(int).values
+    )
 
-    print(f"  make_nuecc_wgtdf: {len(presel_mct_idx)} preselected MC nu indices "
-          f"(of {len(inter_df)} total)")
+    # ── Step 2: load full MC nu df + compute weights for ALL interactions ──
+    # bnbsyst/geniesyst MUST receive the full ind aligned to the full mcdf
+    mcdf      = make_mcnudf(f, include_weights=False)
+    mcdf["ind"] = mcdf.index.get_level_values(-1)
+    full_ind    = mcdf["ind"]
 
-    # ── Step 2: load base MC nu df, subset to preselected indices ─────────
-    mcdf     = make_mcnudf(f, include_weights=False)
-    mcdf_sel = mcdf[mcdf.index.get_level_values(-1).isin(presel_mct_idx)].copy()
+    print(f"  make_nuecc_wgtdf: {len(presel_mct_set)} preselected of "
+          f"{len(mcdf)} total MC nu — computing full weights then filtering")
 
-    # bnbsyst/geniesyst expect a Series (not Index) — same as make_mcnudf's mcdf["ind"]
-    mcdf_sel["ind"] = mcdf_sel.index.get_level_values(-1)
-    ind_sel         = mcdf_sel["ind"]
-
-    print(f"  make_nuecc_wgtdf: {len(ind_sel)} preselected MC nu indices "
-          f"(of {len(mcdf)} total)")
-
-    # ── Step 3: compute weights for preselected indices only ──────────────
-    wgtdf = mcdf_sel.copy()
+    wgtdf = mcdf.copy()
 
     try:
-        bnb_wgt = bnbsyst.bnbsyst(f, ind_sel, multisim_nuniv=100, slim=True)
+        bnb_wgt = bnbsyst.bnbsyst(f, full_ind, multisim_nuniv=100, slim=True)
         if not bnb_wgt.empty:
             wgtdf = multicol_concat(wgtdf, bnb_wgt)
-        else:
-            warnings.warn("make_nuecc_wgtdf: BNB weights empty")
     except Exception as e:
         warnings.warn(f"make_nuecc_wgtdf: BNB weights failed — {e}")
 
     try:
-        genie_wgt = geniesyst.geniesyst(f, ind_sel, multisim_nuniv=100, slim=True)
+        genie_wgt = geniesyst.geniesyst(f, full_ind, multisim_nuniv=100, slim=True)
         if not genie_wgt.empty:
             wgtdf = multicol_concat(wgtdf, genie_wgt)
-        else:
-            warnings.warn("make_nuecc_wgtdf: GENIE weights empty")
     except Exception as e:
         warnings.warn(f"make_nuecc_wgtdf: GENIE weights failed — {e}")
 
-    return wgtdf
+    # ── Step 3: filter to preselected rows only ───────────────────────────
+    # Output is tiny: only FM+FV passed interactions (~5% of all)
+    presel_mask = wgtdf.index.get_level_values(-1).isin(presel_mct_set)
+    wgtdf_sel   = wgtdf[presel_mask].copy()
+
+    print(f"  make_nuecc_wgtdf: output {len(wgtdf_sel)} rows "
+          f"(was {len(wgtdf)} before filter)")
+
+    del wgtdf, mcdf
+    return wgtdf_sel
