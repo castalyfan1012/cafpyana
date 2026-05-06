@@ -319,25 +319,16 @@ def make_nuecc_statsdf(f):
 
 
 def make_nuecc_wgtdf(f):
-    """
-    BNB + GENIE weights, filtered to FM+FV preselected interactions only.
-    
-    Strategy:
-      1. Get preselected mct_index values from cached SPINE df
-      2. Compute weights for ALL MC neutrinos (bnbsyst/geniesyst need full ind)
-      3. Filter output rows to preselected indices only → small output df
-    Memory: BNB ~3 GB, GENIE ~6 GB peak (full), but output is tiny
-    """
     from makedf import bnbsyst, geniesyst
     from pyanalib.pandas_helpers import multicol_concat
 
-    # ── Step 1: get preselected mct_index values ──────────────────────────
+    # ── Step 1: get preselected (entry, mct_index) pairs ─────────────────
     spine_df = _get_spine_df(f)
     il       = list(range(spine_df.index.nlevels - 1))
 
     try:
-        fm_col = _find_col(spine_df, "is_flash_matched", branch_must_not_contain=BRANCH_TRUE)
-        fv_col = _find_col(spine_df, "is_fiducial",      branch_must_not_contain=BRANCH_TRUE)
+        fm_col  = _find_col(spine_df, "is_flash_matched", branch_must_not_contain=BRANCH_TRUE)
+        fv_col  = _find_col(spine_df, "is_fiducial",      branch_must_not_contain=BRANCH_TRUE)
         fm_pass = (spine_df[fm_col] == 1).groupby(level=il).any()
         fv_pass = (spine_df[fv_col] == 1).groupby(level=il).any()
         presel  = fm_pass[fm_pass].index.intersection(fv_pass[fv_pass].index)
@@ -350,20 +341,22 @@ def make_nuecc_wgtdf(f):
         warnings.warn("make_nuecc_wgtdf: mct_index not found — returning empty df")
         return pd.DataFrame()
 
-    inter_df       = spine_df.groupby(level=il).first()
-    presel_mct_set = set(
-        inter_df.loc[inter_df.index.isin(presel), mct_col]
-        .dropna().astype(int).values
-    )
+    inter_df     = spine_df.groupby(level=il).first()
+    inter_presel = inter_df.loc[inter_df.index.isin(presel), mct_col].dropna()
 
-    # ── Step 2: load full MC nu df + compute weights for ALL interactions ──
-    # bnbsyst/geniesyst MUST receive the full ind aligned to the full mcdf
-    mcdf      = make_mcnudf(f, include_weights=False)
+    # Build (entry, mct_index) pairs — entry is index level 0
+    # CRITICAL: filter by pair not just mct_index alone (mct_index resets per entry)
+    entry_vals  = inter_presel.index.get_level_values(0)
+    mct_vals    = inter_presel.astype(int).values
+    presel_pairs = set(zip(entry_vals, mct_vals))
+
+    print(f"  make_nuecc_wgtdf: {len(presel_pairs)} preselected (entry,mct) pairs "
+          f"(of {len(inter_df)} total interactions)")
+
+    # ── Step 2: full ind required by bnbsyst/geniesyst ────────────────────
+    mcdf        = make_mcnudf(f, include_weights=False)
     mcdf["ind"] = mcdf.index.get_level_values(-1)
     full_ind    = mcdf["ind"]
-
-    print(f"  make_nuecc_wgtdf: {len(presel_mct_set)} preselected of "
-          f"{len(mcdf)} total MC nu — computing full weights then filtering")
 
     wgtdf = mcdf.copy()
 
@@ -371,6 +364,7 @@ def make_nuecc_wgtdf(f):
         bnb_wgt = bnbsyst.bnbsyst(f, full_ind, multisim_nuniv=100, slim=True)
         if not bnb_wgt.empty:
             wgtdf = multicol_concat(wgtdf, bnb_wgt)
+            print(f"  BNB weights: {bnb_wgt.shape[1]} columns")
     except Exception as e:
         warnings.warn(f"make_nuecc_wgtdf: BNB weights failed — {e}")
 
@@ -378,16 +372,21 @@ def make_nuecc_wgtdf(f):
         genie_wgt = geniesyst.geniesyst(f, full_ind, multisim_nuniv=100, slim=True)
         if not genie_wgt.empty:
             wgtdf = multicol_concat(wgtdf, genie_wgt)
+            print(f"  GENIE weights: {genie_wgt.shape[1]} columns")
     except Exception as e:
         warnings.warn(f"make_nuecc_wgtdf: GENIE weights failed — {e}")
 
-    # ── Step 3: filter to preselected rows only ───────────────────────────
-    # Output is tiny: only FM+FV passed interactions (~5% of all)
-    presel_mask = wgtdf.index.get_level_values(-1).isin(presel_mct_set)
-    wgtdf_sel   = wgtdf[presel_mask].copy()
+    # ── Step 3: filter to preselected (entry, mct_index) pairs ───────────
+    wgt_entry   = wgtdf.index.get_level_values(0)
+    wgt_mct     = wgtdf.index.get_level_values(-1)
+    presel_mask = np.array([
+        (e, m) in presel_pairs
+        for e, m in zip(wgt_entry, wgt_mct)
+    ])
+    wgtdf_sel = wgtdf[presel_mask].copy()
 
-    print(f"  make_nuecc_wgtdf: output {len(wgtdf_sel)} rows "
-          f"(was {len(wgtdf)} before filter)")
+    print(f"  make_nuecc_wgtdf: {len(wgtdf_sel)} rows after filter "
+          f"(was {len(wgtdf)} before)")
 
     del wgtdf, mcdf
     return wgtdf_sel
