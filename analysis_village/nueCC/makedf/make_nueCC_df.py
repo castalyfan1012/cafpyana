@@ -357,23 +357,35 @@ def make_nuecc_wgtdf(f):
           f"(of {len(inter_df)} total)")
 
     # ── Step 2: load base MC nu df, subset to preselected indices ─────────
-    mcdf     = make_mcnudf(f, include_weights=False)   # CV only — small
-    mcdf_sel = mcdf[mcdf.index.get_level_values(-1).isin(presel_mct_idx)]
-    ind_sel  = mcdf_sel.index.get_level_values(-1)
+    mcdf     = make_mcnudf(f, include_weights=False)
+    mcdf_sel = mcdf[mcdf.index.get_level_values(-1).isin(presel_mct_idx)].copy()
 
-    # ── Step 3: compute BNB + GENIE weights for preselected indices only ──
+    # bnbsyst/geniesyst expect a Series (not Index) — same as make_mcnudf's mcdf["ind"]
+    mcdf_sel["ind"] = mcdf_sel.index.get_level_values(-1)
+    ind_sel         = mcdf_sel["ind"]
+
+    print(f"  make_nuecc_wgtdf: {len(ind_sel)} preselected MC nu indices "
+          f"(of {len(mcdf)} total)")
+
+    # ── Step 3: compute weights for preselected indices only ──────────────
+    wgtdf = mcdf_sel.copy()
+
     try:
         bnb_wgt = bnbsyst.bnbsyst(f, ind_sel, multisim_nuniv=100, slim=True)
+        if not bnb_wgt.empty:
+            wgtdf = multicol_concat(wgtdf, bnb_wgt)
+        else:
+            warnings.warn("make_nuecc_wgtdf: BNB weights empty")
     except Exception as e:
         warnings.warn(f"make_nuecc_wgtdf: BNB weights failed — {e}")
-        bnb_wgt = pd.DataFrame(index=mcdf_sel.index)
 
     try:
         genie_wgt = geniesyst.geniesyst(f, ind_sel, multisim_nuniv=100, slim=True)
+        if not genie_wgt.empty:
+            wgtdf = multicol_concat(wgtdf, genie_wgt)
+        else:
+            warnings.warn("make_nuecc_wgtdf: GENIE weights empty")
     except Exception as e:
         warnings.warn(f"make_nuecc_wgtdf: GENIE weights failed — {e}")
-        genie_wgt = pd.DataFrame(index=mcdf_sel.index)
 
-    wgtdf = multicol_concat(mcdf_sel, bnb_wgt)
-    wgtdf = multicol_concat(wgtdf,    genie_wgt)
     return wgtdf
