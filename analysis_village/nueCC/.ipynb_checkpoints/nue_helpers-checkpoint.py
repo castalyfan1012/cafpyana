@@ -947,15 +947,14 @@ def threshold_plots_cumulative(evtdf, cut_flow_result, cut_stage,
                  color='orange', linewidth=1.5)
         ax1.hist(signal_vals, bins=np.linspace(xmin, xmax, 51),
                  histtype='step', density=True,
-                 label=r'Signal $\nu_e$CC' + f' ({n_signal:,} remaining)',
+                 label=r'Signal $\nu_e$ CC' + f' ({n_signal:,} remaining)',
                  color='blue', linewidth=1.5)
 
         n_cuts_applied = sum(1 for c, *_ in shower_cuts
                              if c in opt_thresholds or
                              (opt_thresholds_prev and c in opt_thresholds_prev))
         ax1.set_title(
-            f"{xaxis_name} — threshold scan\n"
-            f"({n_total:,} interactions surviving previous cuts)",
+            f"{xaxis_name}",
             fontsize=14, pad=8
         )
         ax1.set_ylabel('Probability Density', fontsize=13)
