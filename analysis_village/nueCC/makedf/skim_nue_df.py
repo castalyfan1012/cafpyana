@@ -6,41 +6,30 @@ Step 2 of the two-step nueCC weights pipeline.
 
 Workflow
 --------
-Step 1 (already done — fast, low memory):
-    python run_df_maker.py -c nueCC_mc.py -ngrid <N_files> -l filelist.txt -o mc1e20_nueCC
-    → one .df per ROOT file in the output directory
+Step 1 — make MC dfs (fast, already done):
+    python run_df_maker.py -c nueCC_mc.py -l filelist.txt \\
+        -o mc1e20_nueCC_test -nfile 10 -ncpu 10
 
-Step 2 (this script — sequential, predictable memory):
+Step 2 — compute weights (sequential, memory-safe):
     python skim_nue_df.py \\
         -l  /path/to/caf_filelist.txt \\
-        -df /path/to/dfs/ \\
-        -o  /path/to/weights/ \\
+        -df /path/to/mc1e20_nueCC_test.df \\
+        -o  /path/to/mc1e20_nueCC_sys_test \\
         [-nfile 10] [--nuniv 100] [--dry-run]
 
-File matching
--------------
-CAF files from -l and .df files from -df are paired in sorted order (1:1).
-Both lists must have the same length. Use -ngrid <N_files> in run_df_maker
-to ensure one .df per ROOT file.
+    Output: /path/to/mc1e20_nueCC_sys_test.df  (key: mcnu_0)
 
-Memory profile per file
+How file matching works
 -----------------------
-    mcdf    ~200 MB
-    BNB     ~3 GB
-    GENIE   ~8 GB  (unavoidable — full MC index needed for universe alignment)
-    Total   ~9 GB  (vs ~13 GB with nueCC_weights.py via run_df_maker pool)
+The input .df contains data from N ROOT files stacked with a '__ntuple' index
+level (0..N-1).  CAF file i in -l is matched to __ntuple==i in truth_info.
+This means the filelist order must be the same as when nueCC_mc.py was run.
 
-Requirements
-------------
-truth_info_0 must contain a 'mct_index' column.
-This is produced by the updated make_nueCC_df.py.
-Run with the cafpyana venv:
-    source /home/castalyf/cafpyana/envs/venv_py310_cafpyana/bin/activate
+Memory per file: ~9 GB peak  (vs ~13 GB via run_df_maker pool)
 """
 
 import argparse
 import gc
-import glob
 import os
 import sys
 import time
@@ -65,59 +54,77 @@ from makedf.makedf import make_mcnudf
 from makedf import bnbsyst, geniesyst
 from pyanalib.pandas_helpers import multicol_concat
 
-OUTPUT_KEY = "mcnu_0"
 
+# ── Read truth_info from .df (handles multiple splits) ───────────────────────
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _read_presel_pairs(df_path):
+def _read_truth_info(df_path):
     """
-    Read preselected (entry, mct_index) pairs from truth_info_0.
-    Requires mct_index column (produced by updated make_nueCC_df.py).
+    Read and concatenate all truth_info_* splits from a .df file.
+    Raises if mct_index column is missing.
     """
     with pd.HDFStore(df_path, mode="r") as store:
-        keys    = store.keys()
-        ti_keys = [k for k in keys if "truth_info" in k]
-        if not ti_keys:
+        keys = sorted(k for k in store.keys() if "truth_info" in k)
+        if not keys:
             raise KeyError(
-                f"No truth_info key in {df_path}. Keys: {keys}\n"
-                "Did you run nueCC_mc.py with the updated make_nueCC_df.py?"
+                f"No truth_info key in {df_path}.\n"
+                "Run nueCC_mc.py with the updated make_nueCC_df.py first."
             )
-        truth_info = store[ti_keys[0]]
+        truth_info = pd.concat([store[k] for k in keys])
 
     if "mct_index" not in truth_info.columns:
         raise KeyError(
-            "truth_info_0 is missing 'mct_index'.\n"
+            "truth_info is missing 'mct_index'.\n"
             "Add mct_index to _build_truth_info() in make_nueCC_df.py "
             "and rerun nueCC_mc.py."
         )
+    return truth_info
 
-    presel = truth_info[truth_info["passed_presel"]]
+
+def _presel_pairs_for_ntuple(truth_info, ntuple_idx):
+    """
+    Extract preselected (entry, mct_index) pairs for one ROOT file.
+    ntuple_idx is the __ntuple level value (= position in the input filelist).
+    """
+    NTUPLE_LEVEL = "__ntuple"
+
+    if NTUPLE_LEVEL in truth_info.index.names:
+        try:
+            ti = truth_info.xs(ntuple_idx, level=NTUPLE_LEVEL)
+        except KeyError:
+            return set()   # this ntuple produced no interactions
+    else:
+        # single-file df — no __ntuple level
+        ti = truth_info
+
+    presel = ti[ti["passed_presel"]]
     if presel.empty:
         return set()
 
-    entry_level = presel.index.names.index("entry")
-    mct         = presel["mct_index"]
-    valid       = mct[mct >= 0]
+    mct   = presel["mct_index"]
+    valid = mct[mct >= 0]
     if valid.empty:
         return set()
 
-    valid_entries = presel.index.get_level_values(entry_level)[
+    entry_level = presel.index.names.index("entry")
+    entries     = presel.index.get_level_values(entry_level)[
         presel.index.isin(valid.index)
     ]
-    return set(zip(valid_entries.tolist(), valid.astype(int).tolist()))
+    return set(zip(entries.tolist(), valid.astype(int).tolist()))
 
 
-# ── Per-file processor ────────────────────────────────────────────────────────
+# ── Per-file weights computation ──────────────────────────────────────────────
 
-def process_one(caf_path, df_path, out_path, multisim_nuniv=100):
+def _compute_weights(caf_path, presel_pairs, multisim_nuniv):
+    """
+    Open one ROOT file, run BNB+GENIE, filter to presel_pairs.
+    Returns filtered DataFrame (empty on failure).
+    """
     t0 = time.time()
-
-    presel_pairs = _read_presel_pairs(df_path)
     print(f"    presel pairs : {len(presel_pairs)}")
+
     if not presel_pairs:
-        print("    WARNING: no preselected interactions — skipping")
-        return {"n_presel": 0, "n_out": 0, "elapsed_s": round(time.time()-t0, 1)}
+        print("    no preselected interactions — skipping")
+        return pd.DataFrame(), 0.0
 
     f           = uproot.open(caf_path)
     mcdf        = make_mcnudf(f, include_weights=False)
@@ -128,54 +135,33 @@ def process_one(caf_path, df_path, out_path, multisim_nuniv=100):
     wgtdf = mcdf.copy()
 
     try:
-        bnb_wgt = bnbsyst.bnbsyst(f, full_ind, multisim_nuniv=multisim_nuniv, slim=True)
-        if not bnb_wgt.empty:
-            wgtdf = multicol_concat(wgtdf, bnb_wgt)
-            print(f"    BNB          : {bnb_wgt.shape[1]} columns")
-        del bnb_wgt
-        gc.collect()
+        bnb = bnbsyst.bnbsyst(f, full_ind, multisim_nuniv=multisim_nuniv, slim=True)
+        if not bnb.empty:
+            wgtdf = multicol_concat(wgtdf, bnb)
+            print(f"    BNB          : {bnb.shape[1]} columns")
+        del bnb;  gc.collect()
     except Exception as e:
-        warnings.warn(f"    BNB failed: {e}")
+        warnings.warn(f"BNB failed: {e}")
 
     try:
-        genie_wgt = geniesyst.geniesyst(f, full_ind, multisim_nuniv=multisim_nuniv, slim=True)
-        if not genie_wgt.empty:
-            wgtdf = multicol_concat(wgtdf, genie_wgt)
-            print(f"    GENIE        : {genie_wgt.shape[1]} columns")
-        del genie_wgt
-        gc.collect()
+        genie = geniesyst.geniesyst(f, full_ind, multisim_nuniv=multisim_nuniv, slim=True)
+        if not genie.empty:
+            wgtdf = multicol_concat(wgtdf, genie)
+            print(f"    GENIE        : {genie.shape[1]} columns")
+        del genie; gc.collect()
     except Exception as e:
-        warnings.warn(f"    GENIE failed: {e}")
+        warnings.warn(f"GENIE failed: {e}")
 
-    del f
+    del f, mcdf
 
     e_vals = wgtdf.index.get_level_values(0)
     m_vals = wgtdf.index.get_level_values(-1)
     mask   = np.array([(e, m) in presel_pairs for e, m in zip(e_vals, m_vals)])
     out    = wgtdf[mask].copy()
-    print(f"    filtered     : {mask.sum()} / {len(wgtdf)} rows")
+    print(f"    filtered     : {mask.sum()} / {len(wgtdf)} rows  ({time.time()-t0:.1f}s)")
 
-    del wgtdf, mcdf
-    gc.collect()
-
-    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        out.to_hdf(out_path, key=OUTPUT_KEY, mode="w", complevel=1, complib="blosc")
-        try:
-            with pd.HDFStore(df_path,  mode="r") as src, \
-                 pd.HDFStore(out_path, mode="a") as dst:
-                for k in src.keys():
-                    if "histpotdf" in k:
-                        dst[k] = src[k]
-        except Exception:
-            pass
-
-    stats = dict(n_presel=len(presel_pairs), n_out=int(mask.sum()),
-                 elapsed_s=round(time.time()-t0, 1))
-    print(f"    written      : {out_path}  ({stats['elapsed_s']:.1f}s)")
-    del out
-    return stats
+    del wgtdf; gc.collect()
+    return out, time.time() - t0
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -185,99 +171,116 @@ def main():
         description="nueCC weights skimmer — sequential, memory-safe.",
         formatter_class=argparse.RawTextHelpFormatter,
         epilog="""
-Examples
---------
-  # test run (10 files):
-  python skim_nue_df.py -l caf_filelist.txt -df /path/to/dfs/ -o /path/to/weights/ -nfile 10
-
-  # full production:
-  python skim_nue_df.py -l caf_filelist.txt -df /path/to/dfs/ -o /path/to/weights/
-
-CAF files from -l and .df files from -df are paired in sorted order.
-Both must have the same length (use -ngrid <N_files> in run_df_maker).
+Example
+-------
+  python skim_nue_df.py \\
+      -l  /exp/sbnd/data/.../mc1e20_filelist_1.txt \\
+      -df ../cafpyana_out/mc1e20_nueCC_test_small.df \\
+      -o  ../cafpyana_out/mc1e20_nueCC_sys_test_small \\
+      -nfile 10 --nuniv 100
 """,
     )
     parser.add_argument("-l",        required=True,
-                        help="Text file: one ROOT CAF path per line")
-    parser.add_argument("-df",       required=True, dest="df_dir",
-                        help="Directory containing evt .df files (one per ROOT file)")
-    parser.add_argument("-o",        required=True, dest="output_dir",
-                        help="Output directory for weights .df files")
+                        help="Text file: one ROOT CAF path per line (same order as nueCC_mc.py run)")
+    parser.add_argument("-df",       required=True,
+                        help="Input .df file produced by nueCC_mc.py (e.g. mc1e20_nueCC_test.df)")
+    parser.add_argument("-o",        required=True,
+                        help="Output prefix without .df (e.g. mc1e20_nueCC_sys_test)")
     parser.add_argument("-nfile",  type=int, default=0,
-                        help="Max files to process (0 = all)")
+                        help="Number of CAF files to process (default 0 = all)")
     parser.add_argument("--nuniv",   type=int, default=100,
                         help="Systematic universes (default 100)")
-    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Print plan without processing")
     args = parser.parse_args()
 
-    # ── Build file lists ──────────────────────────────────────────────────────
+    # ── Validate inputs ───────────────────────────────────────────────────────
+    if not os.path.isfile(args.df):
+        print(f"ERROR: -df file not found: {args.df}")
+        sys.exit(1)
+
+    out_path = args.o if args.o.endswith(".df") else args.o + ".df"
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
+
     caf_files = [
         l.strip() for l in open(args.l)
         if l.strip() and not l.startswith("#")
     ]
-    df_files = sorted(glob.glob(os.path.join(args.df_dir, "*.df")))
-
-    if not df_files:
-        print(f"ERROR: no .df files found in {args.df_dir}")
-        sys.exit(1)
-
-    if len(caf_files) != len(df_files):
-        print(f"ERROR: {len(caf_files)} CAF files but {len(df_files)} .df files.")
-        print("  Use -ngrid <N_files> in run_df_maker to get one .df per ROOT file.")
-        print(f"  CAF[0] : {caf_files[0]}")
-        print(f"  DF [0] : {df_files[0]}")
-        sys.exit(1)
-
     if args.nfiles > 0:
         caf_files = caf_files[:args.nfiles]
-        df_files  = df_files[:args.nfiles]
 
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    print(f"Files     : {len(caf_files)}")
-    print(f"DF dir    : {args.df_dir}")
-    print(f"Output    : {args.output_dir}")
+    print(f"Input df  : {args.df}")
+    print(f"CAF files : {len(caf_files)}")
+    print(f"Output    : {out_path}")
     print(f"Universes : {args.nuniv}")
+
     if args.dry_run:
-        print("DRY RUN")
-        for i, (c, d) in enumerate(zip(caf_files, df_files)):
-            print(f"  [{i}] {Path(c).name}  <->  {Path(d).name}")
+        print("\nDRY RUN — reading truth_info to check ntuple coverage …")
+        truth_info = _read_truth_info(args.df)
+        if "__ntuple" in truth_info.index.names:
+            ntuples = truth_info.index.get_level_values("__ntuple").unique().sort_values()
+            print(f"  __ntuple values in df : {list(ntuples)}")
+            print(f"  CAF files requested   : 0 .. {len(caf_files)-1}")
+        else:
+            print("  Single-file df (no __ntuple level)")
+        for i, c in enumerate(caf_files):
+            print(f"  [{i}] {Path(c).name}")
         return
 
-    # ── Process sequentially ──────────────────────────────────────────────────
-    all_stats, failed = [], []
+    # ── Load truth_info once ──────────────────────────────────────────────────
+    print("\nLoading truth_info …")
+    truth_info = _read_truth_info(args.df)
+    print(f"  truth_info rows : {len(truth_info):,}  "
+          f"(presel: {truth_info['passed_presel'].sum():,})")
 
-    for i, (caf_path, df_path) in enumerate(
-        tqdm(zip(caf_files, df_files), total=len(caf_files), unit="file")
-    ):
-        stem     = Path(df_path).stem
-        out_path = os.path.join(args.output_dir, f"{stem}_weights.df")
+    # ── Process files sequentially ────────────────────────────────────────────
+    all_wgt, failed = [], []
 
+    for i, caf_path in enumerate(tqdm(caf_files, unit="file")):
         print(f"\n{'─'*60}")
-        print(f"[{i+1}/{len(caf_files)}]")
-        print(f"  CAF : {Path(caf_path).name}")
-        print(f"  DF  : {Path(df_path).name}")
-        print(f"  OUT : {Path(out_path).name}")
+        print(f"[{i+1}/{len(caf_files)}]  {Path(caf_path).name}  (__ntuple={i})")
 
         try:
-            s = process_one(caf_path, df_path, out_path, args.nuniv)
-            all_stats.append(s)
+            pairs       = _presel_pairs_for_ntuple(truth_info, i)
+            wgt, elapsed = _compute_weights(caf_path, pairs, args.nuniv)
+            if not wgt.empty:
+                all_wgt.append(wgt)
         except Exception as e:
             import traceback
             print(f"  FAILED: {e}")
             traceback.print_exc()
-            failed.append(caf_path)
+            failed.append((i, caf_path))
+
+    # ── Write combined output ─────────────────────────────────────────────────
+    if all_wgt:
+        print(f"\nConcatenating {len(all_wgt)} weight tables …")
+        combined = pd.concat(all_wgt, ignore_index=False)
+        print(f"Writing {len(combined):,} rows → {out_path}")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            combined.to_hdf(out_path, key="mcnu_0", mode="w",
+                            complevel=1, complib="blosc")
+        # copy histpotdf from input df for downstream POT accounting
+        try:
+            with pd.HDFStore(args.df,  mode="r") as src, \
+                 pd.HDFStore(out_path, mode="a") as dst:
+                for k in src.keys():
+                    if "histpotdf" in k:
+                        dst[k] = src[k]
+        except Exception:
+            pass
+        del combined
+    else:
+        print("WARNING: no weight rows produced — output file not written.")
 
     # ── Summary ───────────────────────────────────────────────────────────────
     print(f"\n{'='*60}")
-    print(f"OK : {len(all_stats)}/{len(caf_files)}")
-    if all_stats:
-        print(f"Total output rows : {sum(s['n_out'] for s in all_stats):,}")
-        print(f"Total wall time   : {sum(s['elapsed_s'] for s in all_stats):.0f}s")
+    print(f"OK      : {len(caf_files) - len(failed)}/{len(caf_files)}")
+    print(f"Output  : {out_path}")
     if failed:
         print("Failed:")
-        for f in failed:
-            print(f"  {f}")
+        for idx, f in failed:
+            print(f"  [{idx}] {f}")
     print("=" * 60)
 
 
