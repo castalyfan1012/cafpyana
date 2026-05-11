@@ -206,8 +206,8 @@ Example
         l.strip() for l in open(args.l)
         if l.strip() and not l.startswith("#")
     ]
-    if args.nfiles > 0:
-        caf_files = caf_files[:args.nfiles]
+    if args.nfile > 0:
+        caf_files = caf_files[:args.nfile]
 
     print(f"Input df  : {args.df}")
     print(f"CAF files : {len(caf_files)}")
