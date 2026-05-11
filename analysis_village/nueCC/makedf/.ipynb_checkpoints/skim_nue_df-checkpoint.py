@@ -15,7 +15,7 @@ Step 2 (this script — sequential, predictable memory):
         -l  /path/to/caf_filelist.txt \\
         -df /path/to/dfs/ \\
         -o  /path/to/weights/ \\
-        [--nfiles 10] [--nuniv 100] [--dry-run]
+        [-nfile 10] [--nuniv 100] [--dry-run]
 
 File matching
 -------------
@@ -188,7 +188,7 @@ def main():
 Examples
 --------
   # test run (10 files):
-  python skim_nue_df.py -l caf_filelist.txt -df /path/to/dfs/ -o /path/to/weights/ --nfiles 10
+  python skim_nue_df.py -l caf_filelist.txt -df /path/to/dfs/ -o /path/to/weights/ -nfile 10
 
   # full production:
   python skim_nue_df.py -l caf_filelist.txt -df /path/to/dfs/ -o /path/to/weights/
@@ -203,7 +203,7 @@ Both must have the same length (use -ngrid <N_files> in run_df_maker).
                         help="Directory containing evt .df files (one per ROOT file)")
     parser.add_argument("-o",        required=True, dest="output_dir",
                         help="Output directory for weights .df files")
-    parser.add_argument("--nfiles",  type=int, default=0,
+    parser.add_argument("-nfile",  type=int, default=0,
                         help="Max files to process (0 = all)")
     parser.add_argument("--nuniv",   type=int, default=100,
                         help="Systematic universes (default 100)")
