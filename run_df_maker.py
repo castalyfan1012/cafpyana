@@ -195,7 +195,7 @@ def run_grid(inputfiles):
     -N %d \\
     --disk 100GB \\
     --cpu 1 \\
-    --memory 25GB \\
+    --memory 29GB \\
     --expected-lifetime 12h \\
     "file://$(pwd)/grid_executable.sh" \\
     "%s" \\
