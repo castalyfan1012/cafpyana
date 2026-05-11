@@ -229,11 +229,15 @@ def _build_truth_info(spine_df):
     # cat 7 = neutrino catch-all (nu interactions not matched by any rule above)
 
     # ── Reco preselection flags (stored so the notebook can stage-count) ──
-    if fm_col is not None:
+    ft_col = _safe(_find_col, spine_df, "flash_time", branch_must_not_contain=BRANCH_TRUE)
+
+    if fm_col is not None and ft_col is not None:
+        valid_fm = (spine_df[fm_col] == 1) & spine_df[ft_col].notna()
+        passed_fm = valid_fm.groupby(level=il).any().reindex(idx, fill_value=False)
+    elif fm_col is not None:
+        warnings.warn("_build_truth_info: flash_time column missing — using is_flash_matched only")
         passed_fm = (
-            (spine_df[fm_col] == 1)
-            .groupby(level=il).any()
-            .reindex(idx, fill_value=False)
+            (spine_df[fm_col] == 1).groupby(level=il).any().reindex(idx, fill_value=False)
         )
     else:
         warnings.warn("_build_truth_info: FM column missing — passed_fm=False everywhere")
