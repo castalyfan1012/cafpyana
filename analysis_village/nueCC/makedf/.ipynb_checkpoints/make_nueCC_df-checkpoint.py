@@ -70,7 +70,8 @@ import numpy as np
 import pandas as pd
 
 from makedf.makedf import make_all_spine_df, make_mcnudf
-from pyanalib.pandas_helpers import multicol_merge, multicol_concat
+from pyanalib.pandas_helpers import multicol_merge, multicol_concat, loadbranches
+from makedf.branches import spineint_flashtimes_branches
 
 # =============================================================================
 # Constants — must match nue_selection.py AND skim_nue_v2.py exactly
@@ -92,11 +93,30 @@ _truth_info_cache = {}   # fname -> per-interaction truth_info DataFrame
 def _get_spine_df(f):
     fname = str(f)
     if fname not in _spine_cache:
-        # Drop stale entries from the previous file before loading the new one
         _spine_cache.clear()
         _truth_info_cache.clear()
         gc.collect()
-        _spine_cache[fname] = make_all_spine_df(f)
+        spine_df = make_all_spine_df(f)
+
+        # Synthesize scalar flash_time_first from the flash_times vector
+        # (rec.dlp.flash_time is not a stored CAF branch; flash_times is)
+        try:
+            ft_df   = loadbranches(f["recTree"], spineint_flashtimes_branches)
+            # ft_df: 3-level index (entry, rec.dlp..index, flash..index)
+            # first() gives the first flash time per interaction (2-level index)
+            ft_first = ft_df.groupby(level=[0, 1]).first()
+            ft_col   = ft_first.columns[0]   # MultiIndex col from loadbranches
+            ft_series = ft_first[ft_col]
+
+            # Broadcast interaction-level value to all particle rows in spine_df
+            # by aligning on the two interaction levels (drop particle level)
+            spine_il = spine_df.index.droplevel(-1)   # (entry, rec.dlp..index)
+            new_col  = ("rec", "dlp", "flash_time_first", "")
+            spine_df[new_col] = ft_series.reindex(spine_il).values
+        except Exception as e:
+            warnings.warn(f"_get_spine_df: flash_times load failed — {e}")
+
+        _spine_cache[fname] = spine_df
     return _spine_cache[fname]
 
 # =============================================================================
@@ -173,6 +193,7 @@ def _build_truth_info(spine_df):
     ke_col   = _safe(_find_col, spine_df, "ke",              branch_must_contain=BRANCH_TRUE)
     ppd_col  = _safe(_find_col, spine_df, "parent_pdg_code", branch_must_contain=BRANCH_TRUE)
     fm_col   = _safe(_find_col, spine_df, "is_flash_matched",branch_must_not_contain=BRANCH_TRUE)
+    ft_col   = _safe(_find_col, spine_df, "flash_time_first", branch_must_not_contain=BRANCH_TRUE)
     fv_r_col = _safe(_find_col, spine_df, "is_fiducial",     branch_must_not_contain=BRANCH_TRUE)
 
     required = [nu_col, cc_col, fv_t_col, pid_col, pri_col, ke_col, ppd_col]

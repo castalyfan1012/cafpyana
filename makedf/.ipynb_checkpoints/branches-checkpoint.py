@@ -392,7 +392,6 @@ spineint_branches = [
         "cathode_offset",                       # Distance from the cathode [cm].
         "depositions_sum",                      # Sum of deposited (de-ghosted) energy [MeV].
         "flash_hypo_pe",                        # Total PE of the hypothesized flash from OpT0Finder.
-        "flash_time",
         "flash_total_pe",                       # Total PE of the matched flash (uses OpT0Finder, same order as flash_ids).
         "id",                                   # Interaction ID (dense enumeration starting from 0 within the event).
         "is_cathode_crosser",                   # Whether the interaction is a cathode-crosser (some particle crosses the cathode).
