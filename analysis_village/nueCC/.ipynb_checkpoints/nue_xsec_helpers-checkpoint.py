@@ -29,6 +29,7 @@ and are imported directly in the notebook; only lightweight wrappers for
 heatmap formatting are defined here.
 """
 
+import os
 import warnings
 import numpy as np
 import pandas as pd
@@ -275,7 +276,7 @@ def make_equal_stats_bins(reference_vals, n_bins, lo=None, hi=None):
             f"(requested {n_bins}). Consider fewer bins or a wider range."
         )
     return edges
-    
+
 # =============================================================================
 # Truth categorisation
 # =============================================================================
@@ -971,6 +972,152 @@ def plot_unfolded_result(
     if save_path:
         fig.savefig(save_path, bbox_inches="tight")
     return fig, ax
+
+
+
+
+
+NUE_COSTHETA_BINS = np.array([-1.0, 0.0, 0.5, 0.75, 0.85, 0.95, 1.001])
+NUE_KE_MAX        = 2000.0  # MeV
+NUE_KE_BINS_2D    = np.array([
+    [0,  300,  700, 1200, 2000.],
+    [0,  200,  500, 1000, 2000.],
+    [0,  200,  500, 1000, 2000.],
+    [0,  150,  400,  900, 2000.],
+    [0,  150,  400,  900, 2000.],
+    [0,  150,  400,  900, 2000.],
+], dtype=float)
+
+
+class NueCCBinning2D:
+    """
+    Lightweight 2D binning for nueCC: costheta_e × KE_e (MeV).
+    Drop-in replacement for sbnd Binning2D, no external dependencies.
+    """
+    def __init__(self,
+                 costheta_bins=None,
+                 ke_bins_2d=None):
+        self.diff_costheta_bins     = np.array(costheta_bins if costheta_bins is not None
+                                               else NUE_COSTHETA_BINS)
+        self.diff_momentum_bins_2d  = np.array(ke_bins_2d    if ke_bins_2d    is not None
+                                               else NUE_KE_BINS_2D, dtype=float)
+        self.n_costheta_bins = len(self.diff_costheta_bins) - 1
+        assert self.diff_momentum_bins_2d.shape[0] == self.n_costheta_bins, \
+            "ke_bins_2d rows must match number of costheta bins"
+
+    @property
+    def costheta_labels(self):
+        lo = self.diff_costheta_bins[:-1]
+        hi = np.minimum(self.diff_costheta_bins[1:], 1.0)
+        return [f'${l:.2f} < \\cos\\theta_e < {h:.2f}$' for l, h in zip(lo, hi)]
+
+
+def make_nuecc_binning2d(costheta_bins=None, ke_bins_2d=None):
+    """Return a NueCCBinning2D — no sbnd import needed."""
+    return NueCCBinning2D(costheta_bins=costheta_bins, ke_bins_2d=ke_bins_2d)
+
+
+def plot_nuecc_differential_stacked(
+    sel_df, stage_col, ke_col, costheta_col, truth_cat_col,
+    binning2d, display_cats, labels, colors, pot_scale,
+    frac_unc_ke=None, reco_ke_bins=None,
+    title='', pot_label='', plot_dir=None,
+    filename='nuecc_differential_stacked',
+    plot_stacked_hist_fn=None,   # pass nh.plot_stacked_hist
+):
+    """
+    Grid of stacked KE histograms sliced by costheta_e.
+    No sbnd dependency — uses NueCCBinning2D.
+    """
+    n_cos = binning2d.n_costheta_bins
+    ncols = min(3, n_cos)
+    nrows = (n_cos + ncols - 1) // ncols
+
+    fig, axs = plt.subplots(nrows=nrows, ncols=ncols,
+                            figsize=(ncols * 4.5, nrows * 4.2), squeeze=False)
+    fig.subplots_adjust(hspace=0.48, wspace=0.35)
+
+    sel      = sel_df[sel_df[stage_col]]
+    sel      = sel[sel[ke_col].notna() & sel[costheta_col].notna()]
+    cos_vals = sel[costheta_col].values
+    ke_vals  = sel[ke_col].values
+    cat_vals = sel[truth_cat_col].values
+
+    for ci in range(n_cos):
+        ax      = axs.flatten()[ci]
+        cos_lo  = binning2d.diff_costheta_bins[ci]
+        cos_hi  = binning2d.diff_costheta_bins[ci + 1]
+        ke_bins = binning2d.diff_momentum_bins_2d[ci]
+
+        cos_mask    = (cos_vals >= cos_lo) & (cos_vals < cos_hi)
+        series_list = [ke_vals[cos_mask & (cat_vals == c)] for c in display_cats]
+
+        if plot_stacked_hist_fn is not None:
+            plot_stacked_hist_fn(
+                series_list=series_list,
+                labels=labels, colors=colors,
+                bins=ke_bins, weights=pot_scale,
+                xlabel=r'Reco $e^-$ KE [MeV]',
+                ylabel='Events / bin',
+                ax=ax,
+                invert_stack_order=True,
+                show_counts=True,
+                show_percentage=True,
+                pot_label='',
+            )
+        else:
+            # Fallback: plain stacked bar
+            bot = np.zeros(len(ke_bins) - 1)
+            centers = 0.5 * (ke_bins[:-1] + ke_bins[1:])
+            bw = np.diff(ke_bins)
+            for i, cat in enumerate(display_cats):
+                v, _ = np.histogram(ke_vals[cos_mask & (cat_vals == cat)],
+                                    bins=ke_bins,
+                                    weights=np.full((cos_mask & (cat_vals == cat)).sum(),
+                                                    pot_scale))
+                ax.bar(centers, v, width=bw, bottom=bot,
+                       label=labels[i], color=colors[i], alpha=0.85)
+                bot += v
+            ax.set_xlabel(r'Reco $e^-$ KE [MeV]', fontsize=9)
+            ax.set_ylabel('Events / bin', fontsize=9)
+
+        # Approximate syst band from 1D fractional uncertainty
+        if frac_unc_ke is not None and reco_ke_bins is not None:
+            cov_ctr   = 0.5 * (reco_ke_bins[:-1] + reco_ke_bins[1:])
+            disp_ctr  = 0.5 * (ke_bins[:-1] + ke_bins[1:])
+            frac_s    = np.interp(disp_ctr, cov_ctr, frac_unc_ke,
+                                  left=frac_unc_ke[0], right=frac_unc_ke[-1])
+            total_s   = np.zeros(len(disp_ctr))
+            for cat in display_cats:
+                m = cos_mask & (cat_vals == cat)
+                v, _ = np.histogram(ke_vals[m], bins=ke_bins,
+                                    weights=np.full(m.sum(), pot_scale))
+                total_s += v
+            unc_s = frac_s * total_s
+            bw    = np.diff(ke_bins)
+            ax.bar(ke_bins[:-1], 2 * unc_s, bottom=total_s - unc_s,
+                   width=bw, align='edge', alpha=0.3, color='gray',
+                   hatch='///', linewidth=0, label='Syst.')
+
+        ax.set_title(binning2d.costheta_labels[ci], fontsize=8)
+        ax.set_xlim(ke_bins[0], ke_bins[-1])
+        ax.tick_params(labelsize=7)
+        ax.legend(fontsize=5, ncol=1, loc='upper right',
+                  frameon=True, framealpha=0.8, edgecolor='none')
+
+    for ci in range(n_cos, nrows * ncols):
+        axs.flatten()[ci].set_visible(False)
+
+    if title:
+        fig.suptitle(title, fontsize=11, y=1.01)
+
+    fig.tight_layout()
+    if plot_dir:
+        os.makedirs(plot_dir, exist_ok=True)
+        path = os.path.join(plot_dir, f'{filename}.png')
+        fig.savefig(path, dpi=150, bbox_inches='tight')
+        print(f'Saved -> {path}')
+    return fig, axs
 
 
 # =============================================================================
