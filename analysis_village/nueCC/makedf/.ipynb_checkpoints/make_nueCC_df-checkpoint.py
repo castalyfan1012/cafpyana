@@ -10,6 +10,7 @@ make_nuecc_evtdf(f)          — reco+truth particle df, FM+FV preselected
 make_nuecc_truth_info_df(f)  — per-interaction truth+presel metadata (ALL interactions)
 make_nuecc_statsdf(f)        — alias for make_nuecc_truth_info_df
 make_nuecc_wgtdf(f)          — BNB+GENIE universe weights (preselected only)
+                               NOTE: prefer skim_nue_df.py for production weights
 
 Output HDF5 keys (via nueCC_mc.py config)
 ------------------------------------------
@@ -19,7 +20,7 @@ Output HDF5 keys (via nueCC_mc.py config)
                            has_true_electron, has_true_muon, has_pi0,
                            passed_fm, passed_fv_reco, passed_presel,
                            true_leading_e_ke, true_leading_e_costheta,
-                           true_leading_e_p
+                           true_leading_e_p, mct_index
     hdr_0         run/subrun/event header
     pot_0         BNB POT per file
 
@@ -34,15 +35,17 @@ Truth categories (match nue_selection.py exactly)
     6  cosmic / non-neutrino
     7  neutrino catch-all
 
+Fiducial volume (fiducial_cut_tmp — matches C++ definition)
+------------------------------------------------------------
+    10 < |x| < 190  cm
+    -190 < y < 190  cm   if  10 < z < 250 cm
+    -190 < y < 100  cm   if 250 < z < 450 cm
+    Corresponds to 57 m³ (out of 80 m³ total active volume).
+
 valid_flashmatch proxy (matches C++ definition)
 ------------------------------------------------
     is_flash_matched == 1  AND  flash_total_pe > 0
-
-    C++ definition:
-        flash_times.size() > 0 && is_flash_matched == 1 && !isnan(flash_times[0])
-    rec.dlp.flash_time (scalar) is not stored in the CAF.
-    flash_total_pe > 0 is an equivalent stored-branch proxy:
-    if a valid flash was matched, total PE is always > 0.
+    (proxy for: flash_times.size()>0 && is_flash_matched==1 && !isnan(flash_times[0]))
 """
 
 import gc
@@ -75,6 +78,33 @@ def _get_spine_df(f):
     return _spine_cache[fname]
 
 
+# ── Fiducial volume ───────────────────────────────────────────────────────────
+
+def _fiducial_cut_tmp(x, y, z):
+    """
+    SBND FV: fiducial_cut_tmp from SPINE analysis framework.
+
+    C++ equivalent:
+        (abs(vertex[0]) > 10) && (abs(vertex[0]) < 190) &&
+        (vertex[2] > 10) && (vertex[2] < 450) &&
+        (
+          ((vertex[2] > 250) && (vertex[1] > -190) && (vertex[1] < 100)) ||
+          ((vertex[2] < 250) && (abs(vertex[1]) < 190))
+        )
+
+    x, y, z: pandas Series (vertex coordinates in cm).
+    Returns: boolean Series.
+    """
+    abs_x = x.abs()
+    in_x  = (abs_x > 10) & (abs_x < 190)
+    in_z  = (z > 10) & (z < 450)
+    in_y  = (
+        ((z <= 250) & (y > -190) & (y < 190)) |
+        ((z >  250) & (y > -190) & (y < 100))
+    )
+    return in_x & in_z & in_y
+
+
 # ── Column helpers ────────────────────────────────────────────────────────────
 
 def _find_col(df, suffix, branch_must_contain=None, branch_must_not_contain=None):
@@ -91,7 +121,8 @@ def _find_col(df, suffix, branch_must_contain=None, branch_must_not_contain=None
     raise KeyError(f"column suffix={suffix!r} not found")
 
 
-def _find_col_ends(df, *suffix_parts, branch_must_contain=None):
+def _find_col_ends(df, *suffix_parts, branch_must_contain=None,
+                   branch_must_not_contain=None):
     """Return the first column whose last N non-empty parts equal suffix_parts."""
     n, target = len(suffix_parts), tuple(suffix_parts)
     for col in df.columns:
@@ -99,6 +130,8 @@ def _find_col_ends(df, *suffix_parts, branch_must_contain=None):
         if len(parts) < n or parts[-n:] != target:
             continue
         if branch_must_contain and not any(branch_must_contain in str(p) for p in col):
+            continue
+        if branch_must_not_contain and any(branch_must_not_contain in str(p) for p in col):
             continue
         return col
     raise KeyError(f"column ending with {suffix_parts!r} not found")
@@ -117,33 +150,44 @@ def _build_truth_info(spine_df):
     """
     One row per interaction covering ALL interactions (pre-FM/FV cut).
 
-    Truth flags are computed on the unfiltered df so they are never biased
-    by reco decisions.  Reco presel flags let the notebook reconstruct every
-    cut-stage count without re-scanning the particle-level df.
+    Truth flags computed on the unfiltered df (never biased by reco decisions).
+    Reco presel flags let the notebook reconstruct cut-stage counts without
+    re-scanning the particle-level df.
 
-    valid_flashmatch proxy:
-        passed_fm = (is_flash_matched == 1) AND (flash_total_pe > 0)
+    FV: uses fiducial_cut_tmp geometric definition (not is_fiducial).
+    FM: is_flash_matched==1 AND flash_total_pe>0 (valid_flashmatch proxy).
     """
     il    = list(range(spine_df.index.nlevels - 1))
     inter = spine_df.groupby(level=il).first()
     idx   = inter.index
 
+    # ── Resolve columns ───────────────────────────────────────────────────────
     nu_col   = _safe(_find_col, spine_df, "nu_id",           branch_must_contain=BRANCH_TRUE)
     cc_col   = _safe(_find_col, spine_df, "current_type",    branch_must_contain=BRANCH_TRUE)
-    fv_t_col = _safe(_find_col, spine_df, "is_fiducial",     branch_must_contain=BRANCH_TRUE)
     pid_col  = _safe(_find_col, spine_df, "pid",             branch_must_contain=BRANCH_TRUE)
     pri_col  = _safe(_find_col, spine_df, "is_primary",      branch_must_contain=BRANCH_TRUE)
     ke_col   = _safe(_find_col, spine_df, "ke",              branch_must_contain=BRANCH_TRUE)
     ppd_col  = _safe(_find_col, spine_df, "parent_pdg_code", branch_must_contain=BRANCH_TRUE)
+    mct_col  = _safe(_find_col, spine_df, "mct_index",       branch_must_contain=BRANCH_TRUE)
     fm_col   = _safe(_find_col, spine_df, "is_flash_matched",branch_must_not_contain=BRANCH_TRUE)
     pe_col   = _safe(_find_col, spine_df, "flash_total_pe",  branch_must_not_contain=BRANCH_TRUE)
-    fv_r_col = _safe(_find_col, spine_df, "is_fiducial",     branch_must_not_contain=BRANCH_TRUE)
 
-    required = [nu_col, cc_col, fv_t_col, pid_col, pri_col, ke_col, ppd_col]
+    # Vertex columns for geometric FV (truth and reco)
+    tvx_col  = _safe(_find_col_ends, spine_df, "vertex", "x", branch_must_contain=BRANCH_TRUE)
+    tvy_col  = _safe(_find_col_ends, spine_df, "vertex", "y", branch_must_contain=BRANCH_TRUE)
+    tvz_col  = _safe(_find_col_ends, spine_df, "vertex", "z", branch_must_contain=BRANCH_TRUE)
+    rvx_col  = _safe(_find_col_ends, spine_df, "vertex", "x", branch_must_not_contain=BRANCH_TRUE)
+    rvy_col  = _safe(_find_col_ends, spine_df, "vertex", "y", branch_must_not_contain=BRANCH_TRUE)
+    rvz_col  = _safe(_find_col_ends, spine_df, "vertex", "z", branch_must_not_contain=BRANCH_TRUE)
+
+    # Fallback is_fiducial columns (used only if vertex coords unavailable)
+    fv_t_col = _safe(_find_col, spine_df, "is_fiducial", branch_must_contain=BRANCH_TRUE)
+    fv_r_col = _safe(_find_col, spine_df, "is_fiducial", branch_must_not_contain=BRANCH_TRUE)
+
+    required = [nu_col, cc_col, pid_col, pri_col, ke_col, ppd_col]
     if any(c is None for c in required):
         missing = [name for name, col in zip(
-            ["nu_id", "current_type", "is_fiducial(T)", "pid",
-             "is_primary", "ke", "parent_pdg_code"],
+            ["nu_id", "current_type", "pid", "is_primary", "ke", "parent_pdg_code"],
             required,
         ) if col is None]
         warnings.warn(f"_build_truth_info: missing columns {missing}")
@@ -153,10 +197,21 @@ def _build_truth_info(spine_df):
         return s.reindex(idx, fill_value=False).astype(bool)
 
     # ── Truth flags ───────────────────────────────────────────────────────────
-    is_nu      = _b(inter[nu_col]   >= 0)
-    is_cc      = _b(inter[cc_col]   == 0)
-    is_fv_true = _b(inter[fv_t_col] == 1)
+    is_nu = _b(inter[nu_col] >= 0)
+    is_cc = _b(inter[cc_col] == 0)
 
+    # FV (truth vertex) — geometric cut, fallback to is_fiducial
+    if tvx_col and tvy_col and tvz_col:
+        is_fv_true = _fiducial_cut_tmp(
+            inter[tvx_col], inter[tvy_col], inter[tvz_col]
+        ).reindex(idx, fill_value=False).astype(bool)
+    elif fv_t_col:
+        warnings.warn("_build_truth_info: truth vertex coords missing, using is_fiducial")
+        is_fv_true = _b(inter[fv_t_col] == 1)
+    else:
+        is_fv_true = pd.Series(False, index=idx)
+
+    # Particle-level truth masks
     _elec_mask = (
         (spine_df[pid_col] == PID_ELECTRON) &
         (spine_df[pri_col] == 1) &
@@ -177,7 +232,7 @@ def _build_truth_info(spine_df):
         .reindex(idx, fill_value=False)
     )
 
-    # ── Truth category (priority order matches nue_selection.py) ─────────────
+    # ── Truth category ────────────────────────────────────────────────────────
     cat = pd.Series(7, index=idx, dtype=np.int8)
     cat[~is_nu]                                              = 6
     nu = is_nu
@@ -189,6 +244,7 @@ def _build_truth_info(spine_df):
     cat[nu & ~is_cc & ~has_pi0]                              = 5
 
     # ── Reco preselection flags ───────────────────────────────────────────────
+    # valid_flashmatch: is_flash_matched==1 AND flash_total_pe>0
     if fm_col is not None:
         fm_pass = (spine_df[fm_col] == 1)
         if pe_col is not None:
@@ -197,7 +253,13 @@ def _build_truth_info(spine_df):
     else:
         passed_fm = pd.Series(False, index=idx)
 
-    if fv_r_col is not None:
+    # FV (reco vertex) — geometric cut, fallback to is_fiducial
+    if rvx_col and rvy_col and rvz_col:
+        passed_fv_reco = _fiducial_cut_tmp(
+            inter[rvx_col], inter[rvy_col], inter[rvz_col]
+        ).reindex(idx, fill_value=False).astype(bool)
+    elif fv_r_col:
+        warnings.warn("_build_truth_info: reco vertex coords missing, using is_fiducial")
         passed_fv_reco = (
             (spine_df[fv_r_col] == 1)
             .groupby(level=il).any()
@@ -207,6 +269,13 @@ def _build_truth_info(spine_df):
         passed_fv_reco = pd.Series(False, index=idx)
 
     passed_presel = passed_fm & passed_fv_reco
+
+    # ── mct_index (needed by skim_nue_df.py for weights step) ────────────────
+    mct_index_vals = (
+        inter[mct_col].fillna(-1).astype(np.int32)
+        if mct_col is not None
+        else pd.Series(-1, index=idx, dtype=np.int32)
+    )
 
     # ── Leading true-electron kinematics (NaN for non-electron interactions) ─
     true_leading_e_ke       = pd.Series(np.nan, index=idx, dtype=np.float32)
@@ -238,7 +307,7 @@ def _build_truth_info(spine_df):
             true_leading_e_costheta = (pz / pmag).reindex(idx).astype(np.float32)
             true_leading_e_p        = pmag.reindex(idx).astype(np.float32)
     except Exception:
-        pass   # leading-electron kinematics are optional
+        pass
 
     # ── Assemble ──────────────────────────────────────────────────────────────
     return pd.DataFrame({
@@ -256,6 +325,7 @@ def _build_truth_info(spine_df):
         "true_leading_e_ke"      : true_leading_e_ke,
         "true_leading_e_costheta": true_leading_e_costheta,
         "true_leading_e_p"       : true_leading_e_p,
+        "mct_index"              : mct_index_vals,
     }, index=idx).astype({
         "truth_cat"         : np.int8,
         "is_true_signal"    : bool,
@@ -268,6 +338,7 @@ def _build_truth_info(spine_df):
         "passed_fm"         : bool,
         "passed_fv_reco"    : bool,
         "passed_presel"     : bool,
+        "mct_index"         : np.int32,
     })
 
 
@@ -283,12 +354,11 @@ def _get_truth_info(f):
 def make_nuecc_evtdf(f):
     """
     Reco+truth SPINE particle-level df, FM+FV preselected, merged with MC CV.
-    Weights excluded here — handled separately by make_nuecc_wgtdf.
+    Weights excluded here — handled by skim_nue_df.py.
     """
     spine_df   = _get_spine_df(f)
     truth_info = _get_truth_info(f)
 
-    # MC neutrino CV merge (no weights — fast and memory-light)
     try:
         mcdf    = make_mcnudf(f, include_weights=False)
         mcdf.columns = pd.MultiIndex.from_tuples(
@@ -308,7 +378,6 @@ def make_nuecc_evtdf(f):
     except Exception as e:
         warnings.warn(f"make_nuecc_evtdf: MC CV merge skipped — {e}")
 
-    # FM+FV preselection driven by cached truth_info (no re-scan of full df)
     if not truth_info.empty:
         presel_idx = truth_info.index[truth_info["passed_presel"]]
         spine_df   = spine_df[spine_df.index.droplevel(-1).isin(presel_idx)]
@@ -324,7 +393,8 @@ def make_nuecc_truth_info_df(f):
     before any FM/FV cut.  Loaded by nue_selection.ipynb as truth_info_0.
 
     3-level index: [__ntuple, entry, rec.dlp..index]
-    14 columns as documented in the module docstring.
+    15 columns (14 truth/presel flags + mct_index).
+    mct_index is required by skim_nue_df.py for the weights step.
     """
     return _get_truth_info(f)
 
@@ -334,16 +404,17 @@ def make_nuecc_statsdf(f):
     return make_nuecc_truth_info_df(f)
 
 
-# ── Public maker 3: wgtdf ────────────────────────────────────────────────────
+# ── Public maker 3: wgtdf (kept for small pool tests) ────────────────────────
 
 def make_nuecc_wgtdf(f):
     """
     BNB + GENIE universe weights for FM+FV preselected interactions only.
 
-    Prefilters to ~5k (entry, mct_index) pairs before running bnbsyst/geniesyst
-    (vs ~80k total MC nu), matching the numuCC pandora approach.
-    Peak RAM: ~11 GB during GENIE loading; output is ~50 MB.
-    Run as a separate grid pass using nueCC_weights.py config.
+    NOTE: For production use skim_nue_df.py instead — it avoids reloading the
+    SPINE df, saving ~4 GB per file and enforcing sequential processing.
+    This function is kept for small pool-mode tests only (-nfile 5, -ncpu 1).
+
+    Peak RAM here: ~13 GB.  skim_nue_df.py peak: ~9 GB.
     """
     from makedf import bnbsyst, geniesyst
 
