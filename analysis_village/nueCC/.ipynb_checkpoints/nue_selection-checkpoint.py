@@ -3,23 +3,17 @@ nue_selection.py
 ----------------
 nueCC inclusive selection for SPINE DLP.
 
-Truth categories (match make_nueCC_df.py exactly)
---------------------------------------------------
-    0  nueCC FV          <- signal
-    1  nueCC out FV
-    2  numuCC + pi0
-    3  NC pi0
-    4  other numuCC
-    5  other NC
-    6  cosmic / non-neutrino
-    7  neutrino catch-all
+Fiducial volume (fiducial_cut_tmp — matches C++ definition)
+------------------------------------------------------------
+    10 < |x| < 190  cm
+    -190 < y < 190  cm   if  10 < z < 250 cm
+    -190 < y < 100  cm   if 250 < z < 450 cm
+    → 57 m³ FV (out of 80 m³ total active volume)
 
 valid_flashmatch (matches C++ definition)
 -----------------------------------------
-    C++: flash_times.size() > 0 && is_flash_matched == 1 && !isnan(flash_times[0])
-    Proxy used here: is_flash_matched == 1 AND flash_total_pe > 0
-    (flash_total_pe is a scalar branch already in spineint_branches;
-     flash_total_pe > 0 is equivalent to the C++ size/nan check.)
+    is_flash_matched == 1  AND  flash_total_pe > 0
+    proxy for: flash_times.size()>0 && is_flash_matched==1 && !isnan(flash_times[0])
 """
 
 import numpy as np
@@ -78,6 +72,34 @@ CUT_LABELS_MORE = [
     "Conversion gap",
 ]
 
+
+# ── Fiducial volume ───────────────────────────────────────────────────────────
+
+def _fiducial_cut_tmp(x, y, z):
+    """
+    SBND FV: fiducial_cut_tmp from SPINE analysis framework.
+
+    C++ equivalent:
+        (abs(vertex[0]) > 10) && (abs(vertex[0]) < 190) &&
+        (vertex[2] > 10) && (vertex[2] < 450) &&
+        (
+          ((vertex[2] > 250) && (vertex[1] > -190) && (vertex[1] < 100)) ||
+          ((vertex[2] < 250) && (abs(vertex[1]) < 190))
+        )
+
+    x, y, z: pandas Series (vertex coordinates in cm).
+    Returns: boolean Series.
+    """
+    abs_x = x.abs()
+    in_x  = (abs_x > 10) & (abs_x < 190)
+    in_z  = (z > 10) & (z < 450)
+    in_y  = (
+        ((z <= 250) & (y > -190) & (y < 190)) |
+        ((z >  250) & (y > -190) & (y < 100))
+    )
+    return in_x & in_z & in_y
+
+
 # ── Public particle-level masks ───────────────────────────────────────────────
 
 def primary_electron_mask(evtdf):
@@ -105,18 +127,16 @@ def primary_muon_mask(evtdf):
 def classify_truth(evtdf, verbose=True):
     """
     Assign each reconstructed interaction to a truth category.
-    Priority order: first match wins.
 
-    Categories
-    ----------
-    0  neutrino CC  fiducial  single true electron    <- nueCC signal in FV
-    1  neutrino CC !fiducial  single true electron    <- nueCC out of FV
-    2  neutrino CC  single true muon + pi0
-    3  neutrino NC  pi0
-    4  neutrino CC  single true muon (no pi0)
-    5  neutrino NC  (no pi0)
-    6  non-neutrino                                   <- cosmic / dirt
-    7  neutrino catch-all
+    FV uses fiducial_cut_tmp on the true interaction vertex (geometric cut,
+    not is_fiducial). Must match make_nueCC_df.py _build_truth_info exactly.
+
+    Categories (priority order, first match wins)
+    -----------------------------------------------
+    0  nueCC FV (signal)   1  nueCC out FV
+    2  numuCC + pi0         3  NC pi0
+    4  other numuCC         5  other NC
+    6  cosmic               7  neutrino catch-all
     """
     il  = inter_levels(evtdf)
     idx = evtdf.groupby(level=il).size().index
@@ -129,7 +149,13 @@ def classify_truth(evtdf, verbose=True):
 
     is_nu = (ti.nu_id >= 0).groupby(level=il).any().reindex(idx, fill_value=False)
     is_cc = (ti.current_type == 0).groupby(level=il).any().reindex(idx, fill_value=False)
-    is_fv = (ti.is_fiducial == 1).groupby(level=il).any().reindex(idx, fill_value=False)
+
+    # FV: geometric cut on true vertex (fiducial_cut_tmp)
+    is_fv = (
+        _fiducial_cut_tmp(ti.vertex.x, ti.vertex.y, ti.vertex.z)
+        .groupby(level=il).any()
+        .reindex(idx, fill_value=False)
+    )
 
     true_elec = (
         (tp.pid == PID_ELECTRON) &
@@ -184,18 +210,17 @@ def classify_truth(evtdf, verbose=True):
 
 def build_cut_flow(evtdf):
     """
-    Apply the nueCC selection sequentially, starting from the preselected evtdf
-    (FM+FV already applied at the DataFrame-maker level).
+    Apply the nueCC selection sequentially.
 
     Cuts
     ----
     valid_flashmatch  is_flash_matched==1 AND flash_total_pe>0
-    fiducial          is_fiducial==1
+    fiducial          fiducial_cut_tmp geometric cut on reco vertex
     single_electron   >= 1 primary reco electron above threshold
 
     Returns
     -------
-    dict keyed by CUT_NAMES; each value has
+    dict keyed by CUT_NAMES; each value:
         {"inter_index": pd.Index, "particle_mask": pd.Series}
     """
     il        = inter_levels(evtdf)
@@ -219,10 +244,9 @@ def build_cut_flow(evtdf):
 
         elif step == "valid_flashmatch":
             ri = reco_interactions(evtdf)
-            # Proxy for C++ valid_flashmatch:
-            #   flash_times.size()>0 && is_flash_matched==1 && !isnan(flash_times[0])
-            # flash_total_pe>0 is equivalent: a valid matched flash always has PE>0.
-            fm_mask = (ri.is_flash_matched == 1) & (ri.flash_total_pe > 0)
+            # C++ valid_flashmatch: flash_times.size()>0 && is_flash_matched==1 && !isnan
+            # Proxy: flash_total_pe>0 is equivalent for stored branches
+            fm_mask  = (ri.is_flash_matched == 1) & (ri.flash_total_pe > 0)
             fm_inter = fm_mask.groupby(level=il).any()
             current  = current.intersection(fm_inter[fm_inter].index)
             results["valid_flashmatch"] = {
@@ -231,7 +255,9 @@ def build_cut_flow(evtdf):
             }
 
         elif step == "fiducial":
-            fv_mask  = reco_interactions(evtdf).is_fiducial == 1
+            ri = reco_interactions(evtdf)
+            # fiducial_cut_tmp: geometric cut on reco vertex (not is_fiducial)
+            fv_mask  = _fiducial_cut_tmp(ri.vertex.x, ri.vertex.y, ri.vertex.z)
             fv_inter = fv_mask.groupby(level=il).any()
             current  = current.intersection(fv_inter[fv_inter].index)
             results["fiducial"] = {
@@ -256,7 +282,7 @@ def build_cut_flow(evtdf):
 def shower_qual_cuts(evtdf):
     """
     Full cut-flow including shower-quality cuts after single_electron.
-    The leading reco electron is computed once and reused for all extra cuts.
+    Leading reco electron computed once and reused for all extra cuts.
     """
     cut_flow = build_cut_flow(evtdf)
     il       = inter_levels(evtdf)
@@ -268,14 +294,12 @@ def shower_qual_cuts(evtdf):
     if not additional_cuts:
         return cut_flow
 
-    # Compute leading electron once
     rp    = reco_particles(evtdf)
     rp_df = rp._df
     KE_COL = ('ke', '')
     ele_mask = rp.pid == PID_ELECTRON
-    ele      = rp_df[ele_mask]
     leading_electron = rp_df.loc[
-        ele[KE_COL].groupby(level=il).idxmax()
+        rp_df[ele_mask][KE_COL].groupby(level=il).idxmax()
     ]
 
     steps   = tqdm(additional_cuts, desc="Shower quality cuts", leave=True)
@@ -286,13 +310,10 @@ def shower_qual_cuts(evtdf):
 
         if step == "electron_primary_score":
             soft_inter = leading_electron[('primary_scores', 'I1')] > 0.99
-
         elif step == "electron_pid_score":
             soft_inter = leading_electron[('pid_scores', 'I1')] > 0.915
-
         elif step == "vertex_distance":
             soft_inter = leading_electron[('vertex_distance', '')] < 3.9
-
         else:
             raise ValueError(f"Unknown shower quality cut: {step}")
 
@@ -309,14 +330,20 @@ def shower_qual_cuts(evtdf):
 # ── True-signal denominator ───────────────────────────────────────────────────
 
 def true_signal_index(evtdf):
-    """Return interaction index of all true nueCC-in-FV signal interactions."""
+    """Return interaction index of all true nueCC-in-FV signal interactions.
+    FV uses fiducial_cut_tmp on true vertex (matches classify_truth and
+    make_nueCC_df.py _build_truth_info).
+    """
     il = inter_levels(evtdf)
     ti = true_interactions(evtdf)
     tp = true_particles(evtdf)
 
     is_nu = (ti.nu_id >= 0).groupby(level=il).any()
     is_cc = (ti.current_type == 0).groupby(level=il).any()
-    is_fv = (ti.is_fiducial == 1).groupby(level=il).any()
+    is_fv = (
+        _fiducial_cut_tmp(ti.vertex.x, ti.vertex.y, ti.vertex.z)
+        .groupby(level=il).any()
+    )
 
     prim_elec = (
         (tp.pid == PID_ELECTRON) &
@@ -351,8 +378,8 @@ def true_leading_electron_ke(evtdf):
 
 def leading_electron_p(evtdf, particle_mask=None):
     """Momentum magnitude [MeV/c] of the leading primary reco electron."""
-    il  = inter_levels(evtdf)
-    m   = primary_electron_mask(evtdf)
+    il      = inter_levels(evtdf)
+    m       = primary_electron_mask(evtdf)
     if particle_mask is not None:
         m = m & particle_mask
     rp      = reco_particles(evtdf)
@@ -362,9 +389,9 @@ def leading_electron_p(evtdf, particle_mask=None):
 
 def true_leading_electron_p(evtdf):
     """Momentum magnitude [MeV/c] of the leading primary true electron."""
-    il  = inter_levels(evtdf)
-    tp  = true_particles(evtdf)
-    m   = (tp.pid == PID_ELECTRON) & (tp.is_primary == 1)
+    il      = inter_levels(evtdf)
+    tp      = true_particles(evtdf)
+    m       = (tp.pid == PID_ELECTRON) & (tp.is_primary == 1)
     if m.sum() == 0:
         return pd.Series(dtype=float)
     idx_max = tp.energy_init[m].groupby(level=il).idxmax().dropna()
@@ -373,30 +400,27 @@ def true_leading_electron_p(evtdf):
 
 def leading_electron_costheta(evtdf, particle_mask=None):
     """cos(theta) of the leading primary reco electron w.r.t. the beam axis."""
-    il  = inter_levels(evtdf)
-    m   = primary_electron_mask(evtdf)
+    il      = inter_levels(evtdf)
+    m       = primary_electron_mask(evtdf)
     if particle_mask is not None:
         m = m & particle_mask
     rp      = reco_particles(evtdf)
     idx_max = rp.ke[m].groupby(level=il).idxmax().dropna()
     mom     = rp.momentum
-    px = mom.x.loc[idx_max]
-    py = mom.y.loc[idx_max]
-    pz = mom.z.loc[idx_max]
-    pmag = np.sqrt(px**2 + py**2 + pz**2)
+    px, py, pz = mom.x.loc[idx_max], mom.y.loc[idx_max], mom.z.loc[idx_max]
+    pmag    = np.sqrt(px**2 + py**2 + pz**2)
     return pd.Series((pz / pmag).values, index=idx_max.index)
 
 
 def true_leading_electron_costheta(evtdf):
     """cos(theta) of the leading primary true electron w.r.t. the beam axis."""
-    il  = inter_levels(evtdf)
-    tp  = true_particles(evtdf)
-    m   = (tp.pid == PID_ELECTRON) & (tp.is_primary == 1)
+    il      = inter_levels(evtdf)
+    tp      = true_particles(evtdf)
+    m       = (tp.pid == PID_ELECTRON) & (tp.is_primary == 1)
     if m.sum() == 0:
         return pd.Series(dtype=float)
     mom     = tp.momentum
     gpx, gpy, gpz = mom.x[m], mom.y[m], mom.z[m]
-    gp      = np.sqrt(gpx**2 + gpy**2 + gpz**2)
-    cos     = gpz / gp
+    cos     = gpz / np.sqrt(gpx**2 + gpy**2 + gpz**2)
     idx_max = tp.energy_init[m].groupby(level=il).idxmax().dropna()
     return cos.loc[idx_max].set_axis(idx_max.index)
