@@ -90,34 +90,41 @@ PID_MUON               = 2
 _spine_cache      = {}   # fname -> raw SPINE DataFrame
 _truth_info_cache = {}   # fname -> per-interaction truth_info DataFrame
 
+# Add _flash_time_cache alongside the existing caches
+_spine_cache      = {}
+_truth_info_cache = {}
+_flash_time_cache = {}   # ← NEW: (entry, rec.dlp..index) → first flash time
+
 def _get_spine_df(f):
     fname = str(f)
     if fname not in _spine_cache:
         _spine_cache.clear()
         _truth_info_cache.clear()
+        _flash_time_cache.clear()        # ← clear together
         gc.collect()
-        spine_df = make_all_spine_df(f)
+        _spine_cache[fname] = make_all_spine_df(f)
 
-        # Synthesize scalar flash_time_first from the flash_times vector
-        # (rec.dlp.flash_time is not a stored CAF branch; flash_times is)
+        # Load flash_times vector; cache first flash time per interaction
+        # (rec.dlp.flash_time scalar is not stored in CAF; only the vector is)
         try:
-            ft_df   = loadbranches(f["recTree"], spineint_flashtimes_branches)
+            ft_df = loadbranches(f["recTree"], spineint_flashtimes_branches)
             # ft_df: 3-level index (entry, rec.dlp..index, flash..index)
-            # first() gives the first flash time per interaction (2-level index)
-            ft_first = ft_df.groupby(level=[0, 1]).first()
-            ft_col   = ft_first.columns[0]   # MultiIndex col from loadbranches
-            ft_series = ft_first[ft_col]
-
-            # Broadcast interaction-level value to all particle rows in spine_df
-            # by aligning on the two interaction levels (drop particle level)
-            spine_il = spine_df.index.droplevel(-1)   # (entry, rec.dlp..index)
-            new_col  = ("rec", "dlp", "flash_time_first", "")
-            spine_df[new_col] = ft_series.reindex(spine_il).values
+            ft_first = ft_df.groupby(level=[0, 1]).first()   # 2-level
+            _flash_time_cache[fname] = ft_first.iloc[:, 0]   # Series
         except Exception as e:
             warnings.warn(f"_get_spine_df: flash_times load failed — {e}")
+            _flash_time_cache[fname] = None
 
-        _spine_cache[fname] = spine_df
     return _spine_cache[fname]
+
+
+def _get_truth_info(f):
+    fname = str(f)
+    if fname not in _truth_info_cache:
+        spine_df  = _get_spine_df(f)
+        ft_series = _flash_time_cache.get(fname)             # may be None
+        _truth_info_cache[fname] = _build_truth_info(spine_df, ft_series=ft_series)
+    return _truth_info_cache[fname]
 
 # =============================================================================
 # Column helpers
@@ -165,7 +172,7 @@ def _safe(fn, *args, **kwargs):
 # and efficiency denominators agree between the two workflows.
 # =============================================================================
 
-def _build_truth_info(spine_df):
+def _build_truth_info(spine_df, ft_series=None):
     """
     One row per interaction, covering ALL interactions (pre-FM/FV cut).
 
@@ -250,16 +257,19 @@ def _build_truth_info(spine_df):
     # cat 7 = neutrino catch-all (nu interactions not matched by any rule above)
 
     # ── Reco preselection flags (stored so the notebook can stage-count) ──
-    ft_col = _safe(_find_col, spine_df, "flash_time", branch_must_not_contain=BRANCH_TRUE)
-
-    if fm_col is not None and ft_col is not None:
-        valid_fm = (spine_df[fm_col] == 1) & spine_df[ft_col].notna()
-        passed_fm = valid_fm.groupby(level=il).any().reindex(idx, fill_value=False)
-    elif fm_col is not None:
-        warnings.warn("_build_truth_info: flash_time column missing — using is_flash_matched only")
-        passed_fm = (
-            (spine_df[fm_col] == 1).groupby(level=il).any().reindex(idx, fill_value=False)
+    if fm_col is not None:
+        fm_pass = (
+            (spine_df[fm_col] == 1)
+            .groupby(level=il).any()
+            .reindex(idx, fill_value=False)
         )
+        if ft_series is not None:
+            # valid_flashmatch: is_flash_matched==1 AND flash_times[0] not NaN
+            ft_valid = ft_series.notna().reindex(idx, fill_value=False)
+            passed_fm = fm_pass & ft_valid
+        else:
+            warnings.warn("_build_truth_info: flash_time missing — using is_flash_matched only")
+            passed_fm = fm_pass
     else:
         warnings.warn("_build_truth_info: FM column missing — passed_fm=False everywhere")
         passed_fm = pd.Series(False, index=idx)
