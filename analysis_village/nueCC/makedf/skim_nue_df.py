@@ -181,9 +181,11 @@ def _compute_weights(caf_path, presel_pairs, multisim_nuniv):
         del f
         return pd.DataFrame(), time.time() - t0
 
-    # The last index level is the row-selector used by bnbsyst / geniesyst
-    sel_ind          = mcdf_sel.index.get_level_values(-1)
-    mcdf_sel["ind"]  = sel_ind          # keep for downstream compatibility
+    # The last index level is the row-selector used by bnbsyst / geniesyst.
+    # Must be a Series (not a bare Index): bnbsyst/geniesyst call .index on it
+    # to align results back to the DataFrame's MultiIndex.
+    mcdf_sel["ind"]  = mcdf_sel.index.get_level_values(-1)
+    sel_ind          = mcdf_sel["ind"]   # Series — has .index, matches original full_ind
     wgtdf            = mcdf_sel
 
     # ── BNB systematics ───────────────────────────────────────────────────────
