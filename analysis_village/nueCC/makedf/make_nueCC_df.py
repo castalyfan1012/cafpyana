@@ -10,7 +10,6 @@ make_nuecc_evtdf(f)          — reco+truth particle df, FM+FV preselected
 make_nuecc_truth_info_df(f)  — per-interaction truth+presel metadata (ALL interactions)
 make_nuecc_statsdf(f)        — alias for make_nuecc_truth_info_df
 make_nuecc_wgtdf(f)          — BNB+GENIE universe weights (preselected only)
-                               NOTE: prefer skim_nue_df.py for production weights
 
 Output HDF5 keys (via nueCC_mc.py config)
 ------------------------------------------
@@ -76,6 +75,14 @@ def _get_spine_df(f):
         gc.collect()
         _spine_cache[fname] = make_all_spine_df(f)
     return _spine_cache[fname]
+
+
+def _drop_spine_cache():
+    """Free the cached SPINE df. Used by the weights path to reclaim ~4 GB
+    before the GENIE/BNB universe pulls allocate."""
+    _spine_cache.clear()
+    _truth_info_cache.clear()
+    gc.collect()
 
 
 # ── Fiducial volume ───────────────────────────────────────────────────────────
@@ -354,7 +361,7 @@ def _get_truth_info(f):
 def make_nuecc_evtdf(f):
     """
     Reco+truth SPINE particle-level df, FM+FV preselected, merged with MC CV.
-    Weights excluded here — handled by skim_nue_df.py.
+    Weights excluded here — handled by make_nuecc_wgtdf in a separate run.
     """
     spine_df   = _get_spine_df(f)
     truth_info = _get_truth_info(f)
@@ -394,7 +401,7 @@ def make_nuecc_truth_info_df(f):
 
     3-level index: [__ntuple, entry, rec.dlp..index]
     15 columns (14 truth/presel flags + mct_index).
-    mct_index is required by skim_nue_df.py for the weights step.
+    mct_index is the join key for the weights step (mcnu..index on mcdf side).
     """
     return _get_truth_info(f)
 
@@ -404,70 +411,133 @@ def make_nuecc_statsdf(f):
     return make_nuecc_truth_info_df(f)
 
 
-# ── Public maker 3: wgtdf (kept for small pool tests) ────────────────────────
+# ── Public maker 3: wgtdf — memory-efficient grid version ────────────────────
 
 def make_nuecc_wgtdf(f):
     """
     BNB + GENIE universe weights for FM+FV preselected interactions only.
 
-    NOTE: For production use skim_nue_df.py instead — it avoids reloading the
-    SPINE df, saving ~4 GB per file and enforcing sequential processing.
-    This function is kept for small pool-mode tests only (-nfile 5, -ncpu 1).
+    Memory strategy (vs. the previous version which OOM'd at 29 GB):
 
-    Peak RAM here: ~13 GB.  skim_nue_df.py peak: ~9 GB.
+      1. Build the truth_info → harvest the preselected mct_index list →
+         build mcdf for the index column → DROP THE SPINE CACHE before any
+         weight pull. The full SPINE df (~4 GB) and the universe weight
+         frames are never coresident.
+
+      2. Pull BNB universes, immediately filter to preselected rows, write
+         onto an accumulator, drop the unfiltered frame, gc.collect.
+         Then do the same for GENIE. The two universe frames never coexist
+         at full all-MC width.
+
+      3. Use a pandas .loc lookup on a small (entry, mct_index) MultiIndex
+         to filter, instead of the per-row Python `(e,m) in set` loop that
+         the old version used — faster and no extra intermediate.
+
+      4. No final `.copy()` — the filtered slice is already a fresh frame
+         after the .loc call.
+
+    Output is the same shape as before: mcnu-indexed, with the preselected
+    interactions only, columns from bnbsyst + geniesyst. The selection
+    notebook joins this against evt_0 / truth_info_0 via mct_index exactly
+    as it did before.
     """
     from makedf import bnbsyst, geniesyst
 
-    spine_df   = _get_spine_df(f)
-    truth_info = _get_truth_info(f)
-    il         = list(range(spine_df.index.nlevels - 1))
-
+    # ── Step 1: harvest preselected mct indices and the mcdf skeleton ────────
+    truth_info = _get_truth_info(f)        # populates spine cache + truth cache
     if truth_info.empty:
+        _drop_spine_cache()
         return pd.DataFrame()
 
-    presel_idx   = truth_info.index[truth_info["passed_presel"]]
-    mct_col      = _safe(_find_col, spine_df, "mct_index", branch_must_contain=BRANCH_TRUE)
-    if mct_col is None:
-        warnings.warn("make_nuecc_wgtdf: mct_index not found")
+    presel = truth_info.loc[truth_info["passed_presel"], "mct_index"]
+    presel = presel[presel >= 0]            # drop sentinel -1's
+
+    if presel.empty:
+        warnings.warn("make_nuecc_wgtdf: no preselected interactions")
+        _drop_spine_cache()
         return pd.DataFrame()
 
-    inter_df     = spine_df.groupby(level=il).first()
-    inter_presel = inter_df.loc[inter_df.index.isin(presel_idx), mct_col].dropna()
-    entry_vals   = inter_presel.index.get_level_values(0)
-    presel_pairs = set(zip(entry_vals, inter_presel.astype(int).values))
+    # presel_pairs: a tiny MultiIndex of (entry, mct_index) we will use to
+    # filter the mcnu weight frames after each pull. Far cheaper than the
+    # old Python-loop tuple-set membership test.
+    entry_vals       = presel.index.get_level_values("entry") \
+                       if "entry" in (presel.index.names or []) \
+                       else presel.index.get_level_values(0)
+    mct_vals         = presel.astype(int).values
+    presel_pair_idx  = pd.MultiIndex.from_arrays(
+        [entry_vals, mct_vals], names=["entry", "mct"]
+    ).unique()
 
-    mcdf        = make_mcnudf(f, include_weights=False)
-    mcdf["ind"] = mcdf.index.get_level_values(-1)
-    full_ind    = mcdf["ind"]
+    n_presel = len(presel_pair_idx)
+    print(f"  wgtdf: {n_presel} preselected interactions")
 
-    print(f"  wgtdf: {len(presel_pairs)} preselected / {len(mcdf)} total MC nu")
+    # mcdf is needed only for its index — we don't carry its columns into the
+    # output. Build it, harvest the `ind` series, drop the rest.
+    mcdf = make_mcnudf(f, include_weights=False)
+    mcdf_ind = mcdf.index.get_level_values(-1)
+    mcdf_entry = mcdf.index.get_level_values(0)
+    # full_ind: the per-mcnu interaction index that bnbsyst/geniesyst want
+    full_ind = pd.Series(mcdf_ind, index=mcdf.index)
 
-    wgtdf = mcdf.copy()
+    # Build a lookup MultiIndex on (entry, mct) over the FULL mcdf so we can
+    # quickly mask each weight family to preselected rows.
+    mcdf_pair_idx = pd.MultiIndex.from_arrays(
+        [mcdf_entry, np.asarray(mcdf_ind, dtype=int)], names=["entry", "mct"]
+    )
+    keep_mask = mcdf_pair_idx.isin(presel_pair_idx)
+
+    # We need to preserve mcdf's true row index when we slice weight frames,
+    # because bnbsyst/geniesyst return frames sharing mcdf's index.
+    presel_mcdf_index = mcdf.index[keep_mask]
+
+    # Free the mcdf body — we only needed its index structure.
+    del mcdf, mcdf_pair_idx, mcdf_ind, mcdf_entry
+    gc.collect()
+
+    # ── Step 2: DROP THE SPINE CACHE before pulling universe weights ─────────
+    # This is the single biggest win vs. the old code: ~4 GB freed before
+    # the BNB/GENIE allocations start.
+    _drop_spine_cache()
+
+    # ── Step 3: stream one weight family at a time ───────────────────────────
+    out = None
 
     try:
         bnb_wgt = bnbsyst.bnbsyst(f, full_ind, multisim_nuniv=100, slim=True)
-        if not bnb_wgt.empty:
-            wgtdf = multicol_concat(wgtdf, bnb_wgt)
-            print(f"  BNB: {bnb_wgt.shape[1]} columns")
-        del bnb_wgt
+        if bnb_wgt is not None and not bnb_wgt.empty:
+            bnb_presel = bnb_wgt.loc[bnb_wgt.index.intersection(presel_mcdf_index)]
+            del bnb_wgt
+            gc.collect()
+            print(f"  BNB: {bnb_presel.shape[1]} columns, {len(bnb_presel)} rows")
+            out = bnb_presel
+        else:
+            del bnb_wgt
     except Exception as e:
         warnings.warn(f"make_nuecc_wgtdf: BNB failed — {e}")
+    gc.collect()
 
     try:
         genie_wgt = geniesyst.geniesyst(f, full_ind, multisim_nuniv=100, slim=True)
-        if not genie_wgt.empty:
-            wgtdf = multicol_concat(wgtdf, genie_wgt)
-            print(f"  GENIE: {genie_wgt.shape[1]} columns")
-        del genie_wgt
+        if genie_wgt is not None and not genie_wgt.empty:
+            genie_presel = genie_wgt.loc[genie_wgt.index.intersection(presel_mcdf_index)]
+            del genie_wgt
+            gc.collect()
+            print(f"  GENIE: {genie_presel.shape[1]} columns, {len(genie_presel)} rows")
+            if out is None:
+                out = genie_presel
+            else:
+                # concat the two narrow filtered frames — much smaller than
+                # concatenating two full-MC frames the way the old code did
+                out = multicol_concat(out, genie_presel)
+                del genie_presel
+        else:
+            del genie_wgt
     except Exception as e:
         warnings.warn(f"make_nuecc_wgtdf: GENIE failed — {e}")
-
-    e_vals = wgtdf.index.get_level_values(0)
-    m_vals = wgtdf.index.get_level_values(-1)
-    mask   = np.array([(e, m) in presel_pairs for e, m in zip(e_vals, m_vals)])
-    out    = wgtdf[mask].copy()
-
-    print(f"  wgtdf output: {len(out)} rows (was {len(wgtdf)} before filter)")
-    del wgtdf, mcdf
     gc.collect()
+
+    if out is None or out.empty:
+        return pd.DataFrame()
+
+    print(f"  wgtdf output: {len(out)} rows × {out.shape[1]} cols")
     return out
