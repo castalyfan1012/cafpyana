@@ -2,7 +2,6 @@
 import os,sys,time
 import datetime
 import pathlib
-import gc
 #from TimeTools import *
 import argparse
 import tables
@@ -42,15 +41,6 @@ parser.add_argument('-split', dest='SplitSize', default=1.0, type=float, help="S
 
 args = parser.parse_args()
 
-# ── Grid resource defaults (config can override via GRID_PARAMS dict) ────────
-DEFAULT_GRID_PARAMS = {
-    "memory":   "29GB",
-    "cpu":      1,
-    "disk":     "100GB",
-    "lifetime": "12h",
-}
-
-
 def run_pool(output, inputs, nproc):
     os.nice(10)
     ntuples = NTupleGlob(inputs, None)
@@ -64,74 +54,72 @@ def run_pool(output, inputs, nproc):
 
     dfss = ntuples.dataframes(nproc=nproc, fs=DFS, preprocess=PREPROCESS)
     output = pathlib.Path(output).with_suffix('.df')
+    k_idx = 0
     split_margin = args.SplitSize
-
     with pd.HDFStore(output) as hdf_pd:
         NAMES.append("histpotdf")
         NAMES.append("histgenevtdf")
-
-        split_idx     = 0
-        split_bytes   = 0.0
-        split_buffers = {k: [] for k in NAMES}
-
-        def _flush_split():
-            """Write each buffer's accumulated frames as a single HDF5 key
-            (suffixed by split_idx), then drop everything and gc."""
-            nonlocal split_idx, split_bytes, split_buffers
-            wrote_any = False
-            for k, buffer in split_buffers.items():
-                if not buffer:
-                    continue
-                concat_df = pd.concat(buffer, ignore_index=False)
-                this_key  = f"{k}_{split_idx}"
-                try:
-                    hdf_pd.put(key=this_key, value=concat_df, format="fixed")
-                    print(f"Saved {this_key}: "
-                          f"{concat_df.memory_usage(deep=True).sum() / (1024**3):.4f} GB")
-                except Exception as e:
-                    print(f"Table {this_key} failed to save, skipping. "
-                          f"Exception: {str(e)}")
-                del concat_df
-                wrote_any = True
-
-            if wrote_any:
-                split_idx += 1
-            split_bytes   = 0.0
-            split_buffers = {k: [] for k in NAMES}
-            gc.collect()
+        size_counters = {k: 0 for k in NAMES}
+        df_buffers = {k: [] for k in NAMES}
 
         for dfs in dfss:
             this_NAMES = NAMES
-            if len(dfs) == 2:    # no or empty recTree
+            if len(dfs) == 2: ## no or empty recTree
                 this_NAMES = ["histpotdf", "histgenevtdf"]
 
             for k, df in zip(reversed(this_NAMES), reversed(dfs)):
-                if df is None:
-                    continue
-                size_gb = df.memory_usage(deep=True).sum() / (1024**3)
-                split_buffers[k].append(df)
-                split_bytes += size_gb
+                this_key = k + "_" + str(k_idx)
+                size_bytes = df.memory_usage(deep=True).sum() if df is not None else 0
+                size_gb = size_bytes / (1024**3)
+                if len(dfs) == 2: ## no or empty recTree
+                    size_counters["histpotdf"] += size_gb
+                    df_buffers["histpotdf"].append(df)
+
+                    size_counters["histgenevtdf"] += size_gb
+                    df_buffers["histgenevtdf"].append(df)
+                else:
+                    size_counters[k] += size_gb
+                    if df is not None:
+                        df_buffers[k].append(df)  # accumulate
+
+                #print(f"{k}_{k_idx}: added {size_gb:.4f} GB (total {size_counters[k]:.4f} GB)")
+
                 del df
 
-            # Flush when the cumulative buffered size crosses the threshold.
-            # This is the *aggregate* size across all df types, matching the
-            # split semantics used downstream.
-            if split_bytes >= split_margin:
-                _flush_split()
+            if any(val > split_margin for val in size_counters.values()):
+                # Concatenate and save accumulated DataFrames
+                for k, buffer in df_buffers.items():
+                    if buffer:  # only if buffer has data
+                        concat_df = pd.concat(buffer, ignore_index=False)
+                        this_key = k + "_" + str(k_idx)
+                        try:
+                            hdf_pd.put(key=this_key, value=concat_df, format="fixed")
+                            print(f"Saved {this_key}: {concat_df.memory_usage(deep=True).sum() / (1024**3):.4f} GB")
+                        except Exception as e:
+                            print(f"Table {this_key} failed to save, skipping. Exception: {str(e)}")
+                        del concat_df
+                # Reset counters and buffers
+                k_idx += 1
+                size_counters = {k: 0 for k in this_NAMES}
+                df_buffers = {k: [] for k in this_NAMES}
 
-        # Final flush for whatever's left in the buffers
-        _flush_split()
+        for k, buffer in df_buffers.items():
+            if buffer:
+                concat_df = pd.concat(buffer, ignore_index=False)
+                this_key = k + "_" + str(k_idx)
+                try:
+                    hdf_pd.put(key=this_key, value=concat_df, format="fixed")
+                    print(f"Saved {this_key}: {concat_df.memory_usage(deep=True).sum() / (1024**3):.4f} GB")
+                except Exception as e:
+                    print(f"Table {this_key} failed to save, skipping. Exception: {str(e)}")
+                del concat_df
 
         # Save the split count metadata
-        split_df = pd.DataFrame({"n_split": [split_idx]})
+        split_df = pd.DataFrame({"n_split": [k_idx + 1]})  # +1 because k_idx is 0-based
         hdf_pd.put(key="split", value=split_df, format="fixed")
         print(f"Saved split info: {split_df.iloc[0]['n_split']} total splits")
 
-
 def run_grid(inputfiles):
-    # Honor per-config GRID_PARAMS (Lynn-style); fall back to defaults
-    grid_params = {**DEFAULT_GRID_PARAMS, **globals().get("GRID_PARAMS", {})}
-
     # 1) dir/file name style
     JobStartTime = datetime.datetime.now()
     timestamp =  JobStartTime.strftime('%Y_%m_%d_%H%M%S')
@@ -149,7 +137,6 @@ def run_grid(inputfiles):
 
     NInputfiles = len(inputfiles)
     print("Number of Grid Jobs: %d, number of input caf files: %d" % (ngrid, NInputfiles))
-    print(f"Grid params: {grid_params}")
 
     # 4) prepare bash scripts for each job and make tarball
     flistForEachJob = []
@@ -206,28 +193,20 @@ def run_grid(inputfiles):
     --append_condor_requirements='(TARGET.HAS_SINGULARITY=?=true)' \\
     --tar_file_name "dropbox://$(pwd)/bin_dir.tar" \\
     -N %d \\
-    --disk %s \\
-    --cpu %d \\
-    --memory %s \\
-    --expected-lifetime %s \\
+    --disk 100GB \\
+    --cpu 1 \\
+    --memory 29GB \\
+    --expected-lifetime 12h \\
     "file://$(pwd)/grid_executable.sh" \\
     "%s" \\
-    "%s"'''%(
-        ngrid,
-        grid_params["disk"],
-        grid_params["cpu"],
-        grid_params["memory"],
-        grid_params["lifetime"],
-        OutputDir,
-        args.output,
-    )
+    "%s"'''%(ngrid, OutputDir, args.output)
 
     print(submitCMD)
     os.system(submitCMD)
     
     # go back to working dir
     os.chdir(CAFPYANA_WD)
-
+    
 if __name__ == "__main__":
     printhelp = ((args.inputfiles == "" and args.inputfilelist == "") or args.config == "" or args.output == "")
     if printhelp:
@@ -258,16 +237,13 @@ if __name__ == "__main__":
                 
         ### check if it is grid mode for pool mode
         if args.NGridJobs == 0:
-            print("Running Pool mode")
+            print("Running Pool mode");
             exec(open(args.config).read())
             run_pool(args.output, InputSamples, "auto" if args.NCPU < 0 else args.NCPU)
 
         elif args.NGridJobs > 0:
-            print("Running Grid mode")
-            # Read GRID_PARAMS from the config (no DFS execution needed here,
-            # but exec() makes GRID_PARAMS visible to globals().get below).
-            exec(open(args.config).read())
+            print("Running Grid mode");
             run_grid(InputSamples)
             
         else:
-            print("-ngrid must be greater than 0.")
+            print("-ngrid must be greater than 0.");
