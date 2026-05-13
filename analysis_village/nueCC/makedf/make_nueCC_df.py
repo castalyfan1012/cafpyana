@@ -10,11 +10,7 @@ make_nuecc_evtdf(f)          — reco+truth particle df, FM+FV preselected
 make_nuecc_truth_info_df(f)  — per-interaction truth+presel metadata (ALL interactions)
 make_nuecc_statsdf(f)        — alias for make_nuecc_truth_info_df
 make_nuecc_wgtdf(f)          — BNB + GENIE universe weights for preselected
-                               interactions. Uses a minimal branch-load path
-                               that avoids loading the full particle-level
-                               spine_df (the dominant memory user), falling
-                               back to the spine_df-based path if the
-                               minimal branches are not available.
+                               interactions, computed memory-efficiently.
 
 Output HDF5 keys (via nueCC_mc.py config)
 ------------------------------------------
@@ -56,7 +52,7 @@ import warnings
 import numpy as np
 import pandas as pd
 
-from makedf.makedf import make_all_spine_df, make_mcnudf, loadbranches
+from makedf.makedf import make_all_spine_df, make_mcnudf
 from pyanalib.pandas_helpers import multicol_merge, multicol_concat
 
 # ── Constants — must match nue_selection.py exactly ──────────────────────────
@@ -65,22 +61,6 @@ ELECTRON_THRESHOLD_MEV = 75.0
 MUON_THRESHOLD_MEV     = 50.0
 PID_ELECTRON           = 1
 PID_MUON               = 2
-
-# Per-interaction branches needed for the *minimal* (spine-bypass) presel
-# path used by make_nuecc_wgtdf. These names follow the same path conventions
-# as the spine_df columns; if your flatcaf uses different paths, the minimal
-# load will fail and the code will fall back transparently to the full
-# spine_df path. The fallback is logged on stderr.
-_MINIMAL_RECO_BRANCHES = [
-    "rec.dlp.is_flash_matched",
-    "rec.dlp.flash_total_pe",
-    "rec.dlp.vertex.x",
-    "rec.dlp.vertex.y",
-    "rec.dlp.vertex.z",
-]
-_MINIMAL_TRUE_BRANCHES = [
-    "rec.dlp_true.mct_index",
-]
 
 # ── Module-level caches (one SPINE load shared across all DFS makers per file)
 _spine_cache      = {}
@@ -352,82 +332,6 @@ def _get_truth_info(f):
     return _truth_info_cache[fname]
 
 
-# ── Minimal presel builder for wgtdf — bypasses spine_df entirely ────────────
-#
-# Loads ONLY the six per-interaction branches needed to compute
-# (passed_presel, mct_index): three reco vertex coords, flash_match flag,
-# flash total PE, and the truth-matched mct_index. Total memory cost is a
-# few MB instead of the 10-25 GB that make_all_spine_df allocates for the
-# full particle-level df. Returns None on failure so the caller can fall
-# back to the full spine_df path safely.
-
-def _build_presel_minimal(f):
-    """
-    Build per-interaction (passed_presel, mct_index) using direct branch
-    loads, avoiding the full particle-level spine_df load.
-
-    Returns
-    -------
-    pd.DataFrame
-        Two-column DataFrame ['passed_presel', 'mct_index'] indexed at
-        interaction level (matches the row structure of make_nuecc_truth_info_df).
-    None
-        If branch loading fails or any required column is missing.
-        Caller should fall back to _get_truth_info(f).
-    """
-    try:
-        df = loadbranches(
-            f["recTree"],
-            _MINIMAL_RECO_BRANCHES + _MINIMAL_TRUE_BRANCHES,
-        )
-    except Exception as e:
-        warnings.warn(
-            f"_build_presel_minimal: loadbranches failed "
-            f"({type(e).__name__}: {e}); falling back to spine_df path."
-        )
-        return None
-
-    if df is None or df.empty:
-        warnings.warn(
-            "_build_presel_minimal: empty branch load; "
-            "falling back to spine_df path."
-        )
-        return None
-
-    fm_col  = _safe(_find_col,      df, "is_flash_matched", branch_must_not_contain=BRANCH_TRUE)
-    pe_col  = _safe(_find_col,      df, "flash_total_pe",   branch_must_not_contain=BRANCH_TRUE)
-    vx_col  = _safe(_find_col_ends, df, "vertex", "x",      branch_must_not_contain=BRANCH_TRUE)
-    vy_col  = _safe(_find_col_ends, df, "vertex", "y",      branch_must_not_contain=BRANCH_TRUE)
-    vz_col  = _safe(_find_col_ends, df, "vertex", "z",      branch_must_not_contain=BRANCH_TRUE)
-    mct_col = _safe(_find_col,      df, "mct_index",        branch_must_contain=BRANCH_TRUE)
-
-    missing = [
-        name for name, col in zip(
-            ["is_flash_matched", "flash_total_pe",
-             "vertex.x", "vertex.y", "vertex.z", "mct_index"],
-            [fm_col, pe_col, vx_col, vy_col, vz_col, mct_col],
-        ) if col is None
-    ]
-    if missing:
-        warnings.warn(
-            f"_build_presel_minimal: missing columns after load: {missing}; "
-            "falling back to spine_df path."
-        )
-        return None
-
-    fm_pass = (df[fm_col] == 1) & (df[pe_col] > 0)
-    fv_pass = _fiducial_cut_tmp(df[vx_col], df[vy_col], df[vz_col])
-
-    out = pd.DataFrame({
-        "passed_presel": (fm_pass & fv_pass).astype(bool),
-        "mct_index":     df[mct_col].fillna(-1).astype(np.int32),
-    }, index=df.index)
-
-    del df, fm_pass, fv_pass
-    gc.collect()
-    return out
-
-
 # ── Public maker 1: evtdf ────────────────────────────────────────────────────
 
 def make_nuecc_evtdf(f):
@@ -470,6 +374,9 @@ def make_nuecc_truth_info_df(f):
     """
     Per-interaction truth + reco-preselection metadata covering ALL interactions
     before any FM/FV cut.  Loaded by nue_selection.ipynb as truth_info_0.
+
+    3-level index: [__ntuple, entry, rec.dlp..index]
+    15 columns (14 truth/presel flags + mct_index).
     """
     return _get_truth_info(f)
 
@@ -481,62 +388,62 @@ def make_nuecc_statsdf(f):
 
 # ── Public maker 3: wgtdf — memory-efficient weight processing ───────────────
 #
-# Pipeline:
-#   1. Try _build_presel_minimal — direct loadbranches of 6 per-interaction
-#      branches, costs a few MB. Avoids loading make_all_spine_df entirely,
-#      which is the 10-25 GB allocation that was previously dominating peak
-#      memory in the wgtdf-only config.
-#   2. If minimal load fails (e.g., branch path mismatch), fall back to the
-#      full spine_df path used elsewhere in the file. The fallback emits a
-#      warning so you can patch the branch names in _MINIMAL_*_BRANCHES.
-#   3. Pass full_ind to bnbsyst/geniesyst (mandatory — this fork of those
-#      modules broadcast-errors on subset inputs), slice each result to
-#      preselected rows IMMEDIATELY, free the wide frame before pulling
-#      the next syst. BNB and GENIE wide frames never coexist.
-#   4. Concat two narrow (presel-only) frames into the final output.
+# === Why this looks the way it does ===
 #
-# Output format unchanged vs. previous version — no notebook changes needed.
+# Lynn's cafpyana_pandora code (analysis_village/nuecc/makedf/make_nueccdf.py)
+# passes a SUBSET of nu indices straight into geniesyst()/bnbsyst() and it
+# Just Works — her version of those modules supports preselected input.
+#
+# This SPINE branch has DIFFERENT versions of bnbsyst/geniesyst that internally
+# load full-file weight arrays (shape = total MC nu in file) and align them
+# positionally with the input Series. If we pass a subset, we get:
+#
+#     operands could not be broadcast together with shapes (3696,) (13297,)
+#                                                          ↑       ↑
+#                                                          presel  full file
+#
+# So Lynn's exact "filter upstream of bnbsyst" trick is not available here
+# without modifying the syst modules. Instead, we get most of Lynn's memory
+# win through a different route:
+#
+#   1.  truth_info is already built and cached → we know which (entry, mct)
+#       pairs survive presel without re-touching spine_df.
+#   2.  spine_df cache is DROPPED before any weight call. spine_df is the
+#       single biggest user of memory in this pipeline (~10-25 GB depending
+#       on file size), so freeing it before weights is the largest single
+#       memory win.
+#   3.  Pass full_ind to bnbsyst (mandatory — see broadcast bug above), then
+#       slice the output down to preselected rows IMMEDIATELY and delete the
+#       full frame BEFORE pulling geniesyst. The two full syst frames never
+#       coexist; only one is alive at any moment, and only for a moment.
+#   4.  Final concat is between two NARROW (preselected-only) frames.
+#
+# Output format is byte-identical to the previous implementation:
+#   - index: subset of make_mcnudf's MultiIndex restricted to preselected rows
+#   - columns: BNB universes + GENIE universes (multisim_nuniv=100 each)
 
 def make_nuecc_wgtdf(f):
     """
     BNB + GENIE universe weights for FM+FV preselected interactions only.
 
-    Memory profile (per file):
-        peak ≈ max(bnb_full_frame, genie_full_frame) + small constants
-             ≈ 0.5 - 2 GB for typical SBND MC files
-    (compared to ~18-30 GB in earlier implementations that loaded the
-     full particle-level spine_df)
+    Memory profile (per file, with this pipeline):
+        peak  ≈  max( bnb_full_frame , genie_full_frame )  +  small constants
+              ≈  ~3-6 GB for typical SBND MC files
+    (compare to ~25-30 GB in the previous full-pipeline implementation)
 
     Output format UNCHANGED vs. previous version — no notebook changes needed.
     """
     from makedf import bnbsyst, geniesyst
 
-    # ── Step 1: minimal presel via direct branch load (no spine_df) ─────────
-    presel_info = _build_presel_minimal(f)
-    used_minimal = presel_info is not None and not presel_info.empty
+    truth_info = _get_truth_info(f)
+    if truth_info.empty:
+        return pd.DataFrame()
 
-    if not used_minimal:
-        # Fallback: full spine_df path.
-        truth_info = _get_truth_info(f)
-        if truth_info.empty:
-            return pd.DataFrame()
-        presel_info = truth_info[["passed_presel", "mct_index"]].copy()
-        # Free spine_df + truth_info caches before weight calls — these are
-        # the same ~10-25 GB savings as the previous version of this fn.
-        _spine_cache.clear()
-        _truth_info_cache.clear()
-        del truth_info
-        gc.collect()
-
-    print(f"  wgtdf path: {'MINIMAL (no spine_df)' if used_minimal else 'fallback (spine_df)'}")
-
-    # ── Step 2: presel (entry, mct_index) pairs ─────────────────────────────
-    presel_mct = presel_info.loc[presel_info["passed_presel"], "mct_index"]
+    # ── Step 1: presel (entry, mct_index) pairs from truth_info ─────────────
+    presel_mct = truth_info.loc[truth_info["passed_presel"], "mct_index"]
     presel_mct = presel_mct[presel_mct >= 0]
     if presel_mct.empty:
         warnings.warn("make_nuecc_wgtdf: no preselected interactions in this file")
-        del presel_info
-        gc.collect()
         return pd.DataFrame()
 
     pair_df = pd.DataFrame({
@@ -544,13 +451,21 @@ def make_nuecc_wgtdf(f):
         "mct":   presel_mct.astype(np.int64).values,
     }).drop_duplicates().reset_index(drop=True)
 
-    del presel_info, presel_mct
+    # ── Step 2: free spine_df cache BEFORE weight pulls ─────────────────────
+    # spine_df is the single biggest memory user (~10-25 GB). Dropping it
+    # here is the dominant memory win. Safe ONLY when this maker runs in a
+    # DFS list without make_nuecc_evtdf / make_nuecc_truth_info_df (since
+    # those would reuse the cache). The shipped nueCC_mc_weights.py config
+    # satisfies this. If you combine wgtdf with evtdf in a single config,
+    # comment out the next two lines.
+    _spine_cache.clear()
     gc.collect()
 
     # ── Step 3: load mcdf (CV only — cheap) to build full_ind ───────────────
-    # full_ind MUST cover every nu in the file because this fork of
-    # bnbsyst/geniesyst broadcasts internally against the full file-length
-    # weight arrays. Passing a subset triggers a shape-mismatch error.
+    # full_ind MUST cover every nu in the file for this fork of
+    # bnbsyst/geniesyst (see the broadcast bug discussion above). We also
+    # use mcdf.index to identify the preselected sub-index used for slicing
+    # weights down after each syst call.
     mcdf = make_mcnudf(f, include_weights=False)
 
     full_ind = pd.Series(
@@ -584,6 +499,9 @@ def make_nuecc_wgtdf(f):
         return pd.DataFrame()
 
     # ── Step 4: BNB → slice → free, then GENIE → slice → free ───────────────
+    # Each full frame is short-lived. The .copy() on the sliced result forces
+    # a real allocation so the underlying full-frame buffer is truly released
+    # by del (no view holding the parent array alive).
     out = None
 
     try:
