@@ -61,6 +61,24 @@ def _iter_filtered_wgts(rec_tree, nuniv, isyst_map, needed_syst_indices, step_si
             yield wgts
 
 
+def _slim_mul(systs_slim, col, wgt_series):
+    """
+    Multiply systs_slim[col] by wgt_series in-place, safely handling the case
+    where wgt_series.index is a SUPERSET of systs_slim.index (i.e. wgt_series
+    has rows for non-preselected nus that don't exist in systs_slim).
+
+    Lynn's original code used `systs_slim.loc[wgt_series.index, col]` directly,
+    which raises a KeyError when any label in wgt_series.index is absent from
+    systs_slim.index.  This helper intersects first to avoid that error.
+    """
+    shared = wgt_series.index.intersection(systs_slim.index)
+    if len(shared) == 0:
+        return
+    systs_slim.loc[shared, col] = (
+        systs_slim.loc[shared, col].values * wgt_series.loc[shared].values
+    )
+
+
 def getsyst(f, systematics, nuind, multisim_nuniv=100, slim=False, slimname="slim"):
     """
     Compute systematic weight universes for the given nu indices.
@@ -82,6 +100,12 @@ def getsyst(f, systematics, nuind, multisim_nuniv=100, slim=False, slimname="sli
     from the weight branch is bounded regardless of file size.
     The slim systs_slim DataFrame scales with len(nuind), not with the full
     file size.
+
+    Subset safety
+    -------------
+    nuind may contain only a subset of all nus in the file (e.g. preselected
+    interactions only).  All internal updates use _slim_mul() which intersects
+    indices before multiplying, so non-preselected nus are cleanly skipped.
     """
     if "globalTree" not in f:
         return pd.DataFrame(index=nuind.index)
@@ -104,7 +128,7 @@ def getsyst(f, systematics, nuind, multisim_nuniv=100, slim=False, slimname="sli
             [[slimname], [f"univ_{i}" for i in range(multisim_nuniv)]]
         )
         # Initialized to 1.0; rows will be multiplied in-place during iteration.
-        # Size: len(nuind) × multisim_nuniv × 8 bytes — negligible for presel subsets.
+        # Size: len(nuind) × multisim_nuniv × 8 bytes — negligible for subsets.
         systs_slim = pd.DataFrame(1.0, index=nuidx, columns=cols)
     else:
         systs_slim = None
@@ -133,10 +157,7 @@ def getsyst(f, systematics, nuind, multisim_nuniv=100, slim=False, slimname="sli
                         wgt = 1 + (s_morph - 1) * 2 * np.abs(np.random.normal(0, 1))
                         wgt = np.maximum(wgt, 0)
                         col = (slimname, f"univ_{i}")
-                        # .loc ensures only matching rows are updated — safe for subset nuind
-                        systs_slim.loc[wgt.index, col] = (
-                            systs_slim.loc[wgt.index, col].values * wgt.values
-                        )
+                        _slim_mul(systs_slim, col, wgt)   # ← safe subset multiply
                 else:
                     this_systs.append(s_morph)
 
@@ -161,9 +182,7 @@ def getsyst(f, systematics, nuind, multisim_nuniv=100, slim=False, slimname="sli
                             wgt = 1 + (s_ps - 1) * np.random.normal(0, 1)
                             wgt = np.maximum(wgt, 0)
                             col = (slimname, f"univ_{i}")
-                            systs_slim.loc[wgt.index, col] = (
-                                systs_slim.loc[wgt.index, col].values * wgt.values
-                            )
+                            _slim_mul(systs_slim, col, wgt)   # ← safe subset multiply
                     else:
                         this_systs.append(s_ps)
                         this_systs.append(s_ms)
@@ -189,10 +208,7 @@ def getsyst(f, systematics, nuind, multisim_nuniv=100, slim=False, slimname="sli
                         col = (slimname, f"univ_{i}")
                         src = (s, f"univ_{i}")
                         if src in this_wgts.columns:
-                            systs_slim.loc[this_wgts.index, col] = (
-                                systs_slim.loc[this_wgts.index, col].values
-                                * this_wgts[src].values
-                            )
+                            _slim_mul(systs_slim, col, this_wgts[src])   # ← safe subset multiply
 
                 for c in this_wgts.columns:
                     this_systs.append(this_wgts[c])
