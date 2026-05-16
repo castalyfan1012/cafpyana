@@ -725,7 +725,7 @@ def plot_stacked_topology(
         frac_labels.append(data_label)
 
     ax.legend(frac_labels[::-1] if data_vals is not None else frac_labels,
-              loc="upper left", fontsize=9, frameon=False, ncol=2)
+              loc="upper left", fontsize=12, frameon=False, ncol=2)
     ax.set_xlim(bins[0], bins[-1])
     ax.set_xlabel(var_cfg.var_labels[1], fontsize=12)
     ax.set_ylabel("Events", fontsize=12)

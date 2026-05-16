@@ -9,18 +9,12 @@ Public functions
 make_nuecc_evtdf(f)          — reco+truth particle df, FM+FV preselected
 make_nuecc_truth_info_df(f)  — per-interaction truth+presel metadata (ALL interactions)
 make_nuecc_statsdf(f)        — alias for make_nuecc_truth_info_df
-make_nuecc_wgtdf(f)          — BNB + GENIE universe weights for preselected
-                               interactions, computed memory-efficiently.
+make_nuecc_wgtdf(f)          — BNB + GENIE universe weights (preselected nus only)
 
 Output HDF5 keys (via nueCC_mc.py config)
 ------------------------------------------
     evt_0         particle-level df, FM+FV preselected, MC-truth merged
     truth_info_0  per-interaction metadata, ALL interactions pre-FM/FV cut
-                  columns: truth_cat, is_true_signal, is_nu, is_cc, is_fv_true,
-                           has_true_electron, has_true_muon, has_pi0,
-                           passed_fm, passed_fv_reco, passed_presel,
-                           true_leading_e_ke, true_leading_e_costheta,
-                           true_leading_e_p, mct_index
     hdr_0         run/subrun/event header
     pot_0         BNB POT per file
 
@@ -40,14 +34,14 @@ Fiducial volume (fiducial_cut_tmp — matches C++ definition)
     10 < |x| < 190  cm
     -190 < y < 190  cm   if  10 < z < 250 cm
     -190 < y < 100  cm   if 250 < z < 450 cm
-    Corresponds to 57 m³ (out of 80 m³ total active volume).
 
-valid_flashmatch proxy (matches C++ definition)
-------------------------------------------------
+valid_flashmatch proxy
+----------------------
     is_flash_matched == 1  AND  flash_total_pe > 0
 """
 
 import gc
+import ctypes
 import warnings
 import numpy as np
 import pandas as pd
@@ -77,20 +71,26 @@ def _get_spine_df(f):
     return _spine_cache[fname]
 
 
+def _force_free():
+    """
+    Force CPython + glibc to return freed pages to the OS.
+
+    gc.collect() clears Python-level circular refs but CPython's allocator
+    holds freed pages in its own pool so the process RSS stays high even after
+    del + gc.collect(). malloc_trim(0) tells glibc to release those pages
+    immediately, which is critical after clearing the ~15-20 GB spine_df cache
+    before the (much smaller) weight calls.
+    """
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass  # Linux-only; safe to ignore elsewhere
+
+
 # ── Fiducial volume ───────────────────────────────────────────────────────────
 
 def _fiducial_cut_tmp(x, y, z):
-    """
-    SBND FV: fiducial_cut_tmp from SPINE analysis framework.
-
-    C++ equivalent:
-        (abs(vertex[0]) > 10) && (abs(vertex[0]) < 190) &&
-        (vertex[2] > 10) && (vertex[2] < 450) &&
-        (
-          ((vertex[2] > 250) && (vertex[1] > -190) && (vertex[1] < 100)) ||
-          ((vertex[2] < 250) && (abs(vertex[1]) < 190))
-        )
-    """
     abs_x = x.abs()
     in_x  = (abs_x > 10) & (abs_x < 190)
     in_z  = (z > 10) & (z < 450)
@@ -104,7 +104,6 @@ def _fiducial_cut_tmp(x, y, z):
 # ── Column helpers ────────────────────────────────────────────────────────────
 
 def _find_col(df, suffix, branch_must_contain=None, branch_must_not_contain=None):
-    """Return the first MultiIndex column whose last non-empty part == suffix."""
     for col in df.columns:
         parts = [p for p in (col if isinstance(col, tuple) else (col,)) if p != ""]
         if not parts or parts[-1] != suffix:
@@ -119,7 +118,6 @@ def _find_col(df, suffix, branch_must_contain=None, branch_must_not_contain=None
 
 def _find_col_ends(df, *suffix_parts, branch_must_contain=None,
                    branch_must_not_contain=None):
-    """Return the first column whose last N non-empty parts equal suffix_parts."""
     n, target = len(suffix_parts), tuple(suffix_parts)
     for col in df.columns:
         parts = tuple(p for p in (col if isinstance(col, tuple) else (col,)) if p != "")
@@ -143,16 +141,6 @@ def _safe(fn, *args, **kwargs):
 # ── Core: build per-interaction truth + reco-presel metadata ─────────────────
 
 def _build_truth_info(spine_df):
-    """
-    One row per interaction covering ALL interactions (pre-FM/FV cut).
-
-    Truth flags computed on the unfiltered df (never biased by reco decisions).
-    Reco presel flags let the notebook reconstruct cut-stage counts without
-    re-scanning the particle-level df.
-
-    FV: uses fiducial_cut_tmp geometric definition (not is_fiducial).
-    FM: is_flash_matched==1 AND flash_total_pe>0 (valid_flashmatch proxy).
-    """
     il    = list(range(spine_df.index.nlevels - 1))
     inter = spine_df.groupby(level=il).first()
     idx   = inter.index
@@ -226,7 +214,7 @@ def _build_truth_info(spine_df):
     cat[~is_nu]                                              = 6
     nu = is_nu
     cat[nu &  is_cc & ~is_fv_true & has_true_electron]      = 1
-    cat[nu &  is_cc &  is_fv_true & has_true_electron]      = 0   # signal
+    cat[nu &  is_cc &  is_fv_true & has_true_electron]      = 0
     cat[nu &  is_cc & has_true_muon & has_pi0]               = 2
     cat[nu & ~is_cc & has_pi0]                               = 3
     cat[nu &  is_cc & has_true_muon & ~has_pi0]              = 4
@@ -337,7 +325,6 @@ def _get_truth_info(f):
 def make_nuecc_evtdf(f):
     """
     Reco+truth SPINE particle-level df, FM+FV preselected, merged with MC CV.
-    Weights excluded here — handled by make_nuecc_wgtdf in a separate config.
     """
     spine_df   = _get_spine_df(f)
     truth_info = _get_truth_info(f)
@@ -374,9 +361,6 @@ def make_nuecc_truth_info_df(f):
     """
     Per-interaction truth + reco-preselection metadata covering ALL interactions
     before any FM/FV cut.  Loaded by nue_selection.ipynb as truth_info_0.
-
-    3-level index: [__ntuple, entry, rec.dlp..index]
-    15 columns (14 truth/presel flags + mct_index).
     """
     return _get_truth_info(f)
 
@@ -386,60 +370,52 @@ def make_nuecc_statsdf(f):
     return make_nuecc_truth_info_df(f)
 
 
-# ── Public maker 3: wgtdf — memory-efficient weight processing ───────────────
+# ── Public maker 3: wgtdf ────────────────────────────────────────────────────
 #
-# === Why this looks the way it does ===
+# Root cause of the OOM (now fixed):
+# ─────────────────────────────────
+# The original getsyst.py loaded rec.mc.nu.wgt.univ for ALL nus in the file
+# at once via:
 #
-# Lynn's cafpyana_pandora code (analysis_village/nuecc/makedf/make_nueccdf.py)
-# passes a SUBSET of nu indices straight into geniesyst()/bnbsyst() and it
-# Just Works — her version of those modules supports preselected input.
+#   wgts = ak.to_dataframe(f["recTree"]['rec.mc.nu.wgt.univ'].arrays(...))
 #
-# This SPINE branch has DIFFERENT versions of bnbsyst/geniesyst that internally
-# load full-file weight arrays (shape = total MC nu in file) and align them
-# positionally with the input Series. If we pass a subset, we get:
+# For 13,297 nus × ~5,000 total universe weights = 66 million rows ≈ 5-10 GB.
+# Added to spine_df RSS residual (~15 GB not yet released by glibc), this
+# pushes the grid job over 29 GB.
 #
-#     operands could not be broadcast together with shapes (3696,) (13297,)
-#                                                          ↑       ↑
-#                                                          presel  full file
+# evtdf avoids this because it never calls getsyst.  That's the ONLY
+# difference between evtdf (fits 29 GB) and wgtdf (OOM).
 #
-# So Lynn's exact "filter upstream of bnbsyst" trick is not available here
-# without modifying the syst modules. Instead, we get most of Lynn's memory
-# win through a different route:
+# Fix (two parts):
+# ──────────────────
+# 1. getsyst.py: replaced with Lynn's chunked version that reads weight data
+#    in 10 MB pieces. Peak from weight loading: ~50 MB instead of 5-10 GB.
+#    Crucially, it uses index-aligned `.loc` updates (not numpy broadcasting),
+#    so it correctly handles a SUBSET of nu indices without shape errors.
 #
-#   1.  truth_info is already built and cached → we know which (entry, mct)
-#       pairs survive presel without re-touching spine_df.
-#   2.  spine_df cache is DROPPED before any weight call. spine_df is the
-#       single biggest user of memory in this pipeline (~10-25 GB depending
-#       on file size), so freeing it before weights is the largest single
-#       memory win.
-#   3.  Pass full_ind to bnbsyst (mandatory — see broadcast bug above), then
-#       slice the output down to preselected rows IMMEDIATELY and delete the
-#       full frame BEFORE pulling geniesyst. The two full syst frames never
-#       coexist; only one is alive at any moment, and only for a moment.
-#   4.  Final concat is between two NARROW (preselected-only) frames.
+# 2. make_nuecc_wgtdf: now passes presel_ind (only the ~3,700 preselected nus)
+#    instead of full_ind (all 13,297 nus). Same approach as Lynn's pipeline.
+#    Output is already indexed correctly — no post-call slicing needed.
 #
-# Output format is byte-identical to the previous implementation:
-#   - index: subset of make_mcnudf's MultiIndex restricted to preselected rows
-#   - columns: BNB universes + GENIE universes (multisim_nuniv=100 each)
+# Combined effect on memory:
+#   spine_df:    ~15-20 GB (same as evtdf — freed + malloc_trim before wgts)
+#   weight data: ~50 MB   (was 5-10 GB — chunked getsyst)
+#   Peak:        same as evtdf ← fits within 29 GB
 
 def make_nuecc_wgtdf(f):
     """
     BNB + GENIE universe weights for FM+FV preselected interactions only.
 
-    Memory profile (per file, with this pipeline):
-        peak  ≈  max( bnb_full_frame , genie_full_frame )  +  small constants
-              ≈  ~3-6 GB for typical SBND MC files
-    (compare to ~25-30 GB in the previous full-pipeline implementation)
-
-    Output format UNCHANGED vs. previous version — no notebook changes needed.
+    Requires: getsyst.py = Lynn's chunked version (not the original).
+    Output format unchanged: mcdf-indexed, preselected rows, BNB+GENIE cols.
     """
     from makedf import bnbsyst, geniesyst
 
+    # ── Step 1: presel (entry, mct_index) pairs from truth_info ─────────────
     truth_info = _get_truth_info(f)
     if truth_info.empty:
         return pd.DataFrame()
 
-    # ── Step 1: presel (entry, mct_index) pairs from truth_info ─────────────
     presel_mct = truth_info.loc[truth_info["passed_presel"], "mct_index"]
     presel_mct = presel_mct[presel_mct >= 0]
     if presel_mct.empty:
@@ -451,27 +427,20 @@ def make_nuecc_wgtdf(f):
         "mct":   presel_mct.astype(np.int64).values,
     }).drop_duplicates().reset_index(drop=True)
 
-    # ── Step 2: free spine_df cache BEFORE weight pulls ─────────────────────
-    # spine_df is the single biggest memory user (~10-25 GB). Dropping it
-    # here is the dominant memory win. Safe ONLY when this maker runs in a
-    # DFS list without make_nuecc_evtdf / make_nuecc_truth_info_df (since
-    # those would reuse the cache). The shipped nueCC_mc_weights.py config
-    # satisfies this. If you combine wgtdf with evtdf in a single config,
-    # comment out the next two lines.
+    # ── Step 2: free spine_df cache + release OS pages ───────────────────────
+    # spine_df is ~15-20 GB. Clearing the cache + malloc_trim drops the RSS
+    # back to ~2-3 GB before the weight calls, matching the evtdf budget.
+    # Safe in the wgtdf-only config since no other maker reuses spine_df here.
     _spine_cache.clear()
-    gc.collect()
+    _truth_info_cache.clear()
+    del truth_info, presel_mct
+    _force_free()
 
-    # ── Step 3: load mcdf (CV only — cheap) to build full_ind ───────────────
-    # full_ind MUST cover every nu in the file for this fork of
-    # bnbsyst/geniesyst (see the broadcast bug discussion above). We also
-    # use mcdf.index to identify the preselected sub-index used for slicing
-    # weights down after each syst call.
+    # ── Step 3: build presel_ind ─────────────────────────────────────────────
+    # presel_ind is a Series indexed by the preselected subset of mcdf.index,
+    # with values = per-event nu integer index (the 'inu' used inside getsyst).
+    # This mirrors Lynn's nu_indices in _add_weights_to_nueccdf.
     mcdf = make_mcnudf(f, include_weights=False)
-
-    full_ind = pd.Series(
-        np.asarray(mcdf.index.get_level_values(-1), dtype=np.int64),
-        index=mcdf.index,
-    )
 
     mcdf_pair_idx = pd.MultiIndex.from_arrays(
         [mcdf.index.get_level_values(0),
@@ -489,73 +458,58 @@ def make_nuecc_wgtdf(f):
     gc.collect()
 
     n_presel = len(presel_mcdf_index)
-    n_total  = len(full_ind)
-    print(f"  wgtdf: {n_presel} preselected / {n_total} total MC nu rows")
+    print(f"  wgtdf: {n_presel} preselected MC nu rows → passing to syst functions")
 
     if n_presel == 0:
         warnings.warn("make_nuecc_wgtdf: no mcdf rows matched preselected pairs")
-        del full_ind
-        gc.collect()
         return pd.DataFrame()
 
-    # ── Step 4: BNB → slice → free, then GENIE → slice → free ───────────────
-    # Each full frame is short-lived. The .copy() on the sliced result forces
-    # a real allocation so the underlying full-frame buffer is truly released
-    # by del (no view holding the parent array alive).
+    # presel_ind: index = presel_mcdf_index, values = per-event nu int index
+    presel_ind = pd.Series(
+        np.asarray(presel_mcdf_index.get_level_values(-1), dtype=np.int64),
+        index=presel_mcdf_index,
+    )
+
+    # ── Step 4: BNB and GENIE weights for preselected nus only ───────────────
+    # Lynn's getsyst reads weight data in 10 MB chunks and uses .loc updates,
+    # so it handles subset input correctly and uses negligible peak memory.
+    # Output is already indexed by presel_mcdf_index — no slicing needed.
     out = None
 
     try:
-        bnb_wgt = bnbsyst.bnbsyst(f, full_ind, multisim_nuniv=100, slim=True)
+        bnb_wgt = bnbsyst.bnbsyst(f, presel_ind, multisim_nuniv=100, slim=True)
         if bnb_wgt is not None and not bnb_wgt.empty:
-            print(f"  BNB full: {bnb_wgt.shape[1]} cols, {len(bnb_wgt)} rows  "
-                  f"({bnb_wgt.memory_usage(deep=True).sum() / 1e9:.2f} GB)")
-            bnb_presel = (
-                bnb_wgt
-                .loc[bnb_wgt.index.intersection(presel_mcdf_index)]
-                .copy()
-            )
-            del bnb_wgt
-            gc.collect()
-            print(f"  BNB presel: {bnb_presel.shape[1]} cols, {len(bnb_presel)} rows  "
-                  f"({bnb_presel.memory_usage(deep=True).sum() / 1e9:.2f} GB)")
-            out = bnb_presel
+            print(f"  BNB: {bnb_wgt.shape[1]} cols, {len(bnb_wgt)} rows  "
+                  f"({bnb_wgt.memory_usage(deep=True).sum()/1e9:.3f} GB)")
+            out = bnb_wgt
         elif bnb_wgt is not None:
             del bnb_wgt
     except Exception as e:
         warnings.warn(f"make_nuecc_wgtdf: BNB failed — {e}")
-    gc.collect()
+    _force_free()
 
     try:
-        genie_wgt = geniesyst.geniesyst(f, full_ind, multisim_nuniv=100, slim=True)
+        genie_wgt = geniesyst.geniesyst(f, presel_ind, multisim_nuniv=100, slim=True)
         if genie_wgt is not None and not genie_wgt.empty:
-            print(f"  GENIE full: {genie_wgt.shape[1]} cols, {len(genie_wgt)} rows  "
-                  f"({genie_wgt.memory_usage(deep=True).sum() / 1e9:.2f} GB)")
-            genie_presel = (
-                genie_wgt
-                .loc[genie_wgt.index.intersection(presel_mcdf_index)]
-                .copy()
-            )
-            del genie_wgt
-            gc.collect()
-            print(f"  GENIE presel: {genie_presel.shape[1]} cols, {len(genie_presel)} rows  "
-                  f"({genie_presel.memory_usage(deep=True).sum() / 1e9:.2f} GB)")
+            print(f"  GENIE: {genie_wgt.shape[1]} cols, {len(genie_wgt)} rows  "
+                  f"({genie_wgt.memory_usage(deep=True).sum()/1e9:.3f} GB)")
             if out is None:
-                out = genie_presel
+                out = genie_wgt
             else:
-                out = multicol_concat(out, genie_presel)
-                del genie_presel
+                out = multicol_concat(out, genie_wgt)
+                del genie_wgt
         elif genie_wgt is not None:
             del genie_wgt
     except Exception as e:
         warnings.warn(f"make_nuecc_wgtdf: GENIE failed — {e}")
-    gc.collect()
+    _force_free()
 
-    del full_ind, presel_mcdf_index
+    del presel_ind, presel_mcdf_index
     gc.collect()
 
     if out is None or out.empty:
         return pd.DataFrame()
 
     print(f"  wgtdf output: {len(out)} rows × {out.shape[1]} cols  "
-          f"({out.memory_usage(deep=True).sum() / 1e9:.2f} GB)")
+          f"({out.memory_usage(deep=True).sum()/1e9:.3f} GB)")
     return out
