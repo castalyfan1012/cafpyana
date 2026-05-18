@@ -31,13 +31,16 @@ Truth categories (match nue_selection.py exactly)
 
 Fiducial volume (fiducial_cut_tmp — matches C++ definition)
 ------------------------------------------------------------
-    10 < |x| < 190  cm
-    -190 < y < 190  cm   if  10 < z < 250 cm
-    -190 < y < 100  cm   if 250 < z < 450 cm
+    |x| ∈ (5, 190) cm
+    z_region1 = (10 < z < 250) & (-190 < y < 190)
+    z_region2 = (250 < z < 450) & (-190 < y < 100) & (x < 0)   [TPC 0]
+    z_region3 = (250 < z < 450) & (-190 < y < 190) & (x > 0)   [TPC 1]
 
-valid_flashmatch proxy
-----------------------
-    is_flash_matched == 1  AND  flash_total_pe > 0
+valid_flashmatch (matches C++ definition)
+-----------------------------------------
+    flash_times.size() > 0  AND  is_flash_matched == 1  AND  NOT isnan(flash_times[0])
+    Falls back to  is_flash_matched == 1  AND  flash_total_pe > 0
+    if flash_times cannot be loaded from the file.
 """
 
 import gc
@@ -48,6 +51,23 @@ import pandas as pd
 
 from makedf.makedf import make_all_spine_df, make_mcnudf
 from pyanalib.pandas_helpers import multicol_merge, multicol_concat
+
+# ── Optional imports for flash_times (ragged branch, loaded separately) ──────
+# flash_times is a vector branch (rec.dlp.flash_times) that is NOT part of the
+# flat spine_df returned by make_all_spine_df.  We load it independently in
+# _get_truth_info and pass it into _build_truth_info for the full FM cut.
+try:
+    from makedf.makedf import loadbranches as _loadbranches
+except ImportError:
+    try:
+        from makedf.util import loadbranches as _loadbranches
+    except ImportError:
+        _loadbranches = None
+
+try:
+    from makedf.branches import spineint_flashtimes_branches as _SPINE_FT_BRANCHES
+except ImportError:
+    _SPINE_FT_BRANCHES = None
 
 # ── Constants — must match nue_selection.py exactly ──────────────────────────
 BRANCH_TRUE            = "dlp_true"
@@ -91,14 +111,12 @@ def _force_free():
 # ── Fiducial volume ───────────────────────────────────────────────────────────
 
 def _fiducial_cut_tmp(x, y, z):
-    abs_x = x.abs()
-    in_x  = (abs_x > 10) & (abs_x < 190)
-    in_z  = (z > 10) & (z < 450)
-    in_y  = (
-        ((z <= 250) & (y > -190) & (y < 190)) |
-        ((z >  250) & (y > -190) & (y < 100))
-    )
-    return in_x & in_z & in_y
+    abs_x     = x.abs()
+    x_region  = (abs_x > 5) & (abs_x < 190)
+    z_region1 = (z > 10)  & (z < 250) & (y > -190) & (y < 190)
+    z_region2 = (z > 250) & (z < 450) & (y > -190) & (y < 100) & (x < 0)
+    z_region3 = (z > 250) & (z < 450) & (y > -190) & (y < 190) & (x > 0)
+    return x_region & (z_region1 | z_region2 | z_region3)
 
 
 # ── Column helpers ────────────────────────────────────────────────────────────
@@ -140,7 +158,20 @@ def _safe(fn, *args, **kwargs):
 
 # ── Core: build per-interaction truth + reco-presel metadata ─────────────────
 
-def _build_truth_info(spine_df):
+def _build_truth_info(spine_df, flash_times_s=None):
+    """
+    Parameters
+    ----------
+    spine_df      : merged SPINE reco+truth particle-level DataFrame
+    flash_times_s : optional Series with 3-level MultiIndex
+                    (entry, dlp_inter_idx, flash_entry_idx) containing
+                    rec.dlp.flash_times values.  When supplied the full C++
+                    flash-match condition is applied:
+                        flash_times.size()>0 && is_flash_matched==1
+                        && !isnan(flash_times[0])
+                    When None, falls back to is_flash_matched==1 &&
+                    flash_total_pe>0.
+    """
     il    = list(range(spine_df.index.nlevels - 1))
     inter = spine_df.groupby(level=il).first()
     idx   = inter.index
@@ -220,11 +251,32 @@ def _build_truth_info(spine_df):
     cat[nu &  is_cc & has_true_muon & ~has_pi0]              = 4
     cat[nu & ~is_cc & ~has_pi0]                              = 5
 
+    # ── Flash-match cut ───────────────────────────────────────────────────────
     if fm_col is not None:
         fm_pass = (spine_df[fm_col] == 1)
-        if pe_col is not None:
-            fm_pass = fm_pass & (spine_df[pe_col] > 0)
-        passed_fm = fm_pass.groupby(level=il).any().reindex(idx, fill_value=False)
+
+        if flash_times_s is not None:
+            # Full C++ condition:
+            #   flash_times.size()>0 && is_flash_matched==1 && !isnan(flash_times[0])
+            #
+            # flash_times_s has a 3-level MultiIndex:
+            #   (entry, dlp_inter_idx, flash_entry_idx)
+            # Grouping by the first (nlevels-1) levels collapses to interaction
+            # level.  .first() returns NaN for any interaction absent from the
+            # Series (i.e. empty flash_times vector), so notna() correctly
+            # captures both size()>0 and !isnan(flash_times[0]) in one step.
+            ft_il        = list(range(flash_times_s.index.nlevels - 1))
+            first_ft     = flash_times_s.groupby(level=ft_il).first()
+            has_valid_ft = first_ft.notna().reindex(idx, fill_value=False).astype(bool)
+
+            fm_inter  = fm_pass.groupby(level=il).any().reindex(idx, fill_value=False)
+            passed_fm = fm_inter & has_valid_ft
+        else:
+            # Fallback proxy: is_flash_matched==1 AND flash_total_pe>0
+            # (used when flash_times branch could not be loaded)
+            if pe_col is not None:
+                fm_pass = fm_pass & (spine_df[pe_col] > 0)
+            passed_fm = fm_pass.groupby(level=il).any().reindex(idx, fill_value=False)
     else:
         passed_fm = pd.Series(False, index=idx)
 
@@ -316,7 +368,27 @@ def _build_truth_info(spine_df):
 def _get_truth_info(f):
     fname = str(f)
     if fname not in _truth_info_cache:
-        _truth_info_cache[fname] = _build_truth_info(_get_spine_df(f))
+        # ── Load flash_times (ragged branch, not in spine_df) ────────────────
+        # rec.dlp.flash_times is a vector branch that make_all_spine_df does
+        # not include.  We load it here and pass into _build_truth_info so the
+        # full C++ valid_flashmatch condition can be applied.
+        flash_times_s = None
+        if _loadbranches is not None and _SPINE_FT_BRANCHES is not None:
+            try:
+                raw_ft = _loadbranches(f["recTree"], _SPINE_FT_BRANCHES)
+                # raw_ft has a 3-level MultiIndex:
+                #   (entry, dlp_interaction_idx, flash_entry_idx)
+                # Extract as a plain Series; the first two index levels align
+                # with the interaction-level index inside _build_truth_info.
+                ft_col        = raw_ft.columns[0]
+                flash_times_s = raw_ft[ft_col]
+            except Exception as e:
+                warnings.warn(
+                    f"_get_truth_info: flash_times load failed, "
+                    f"falling back to flash_total_pe proxy — {e}"
+                )
+
+        _truth_info_cache[fname] = _build_truth_info(_get_spine_df(f), flash_times_s)
     return _truth_info_cache[fname]
 
 

@@ -3,13 +3,6 @@ nue_selection.py
 ----------------
 nueCC inclusive selection for SPINE DLP.
 
-Fiducial volume (fiducial_cut_tmp — matches C++ definition)
-------------------------------------------------------------
-    10 < |x| < 190  cm
-    -190 < y < 190  cm   if  10 < z < 250 cm
-    -190 < y < 100  cm   if 250 < z < 450 cm
-    → 57 m³ FV (out of 80 m³ total active volume)
-
 valid_flashmatch (matches C++ definition)
 -----------------------------------------
     is_flash_matched == 1  AND  flash_total_pe > 0
@@ -77,27 +70,23 @@ CUT_LABELS_MORE = [
 
 def _fiducial_cut_tmp(x, y, z):
     """
-    SBND FV: fiducial_cut_tmp from SPINE analysis framework.
+    SBND FV: fiducial_cut_tmp from SPINE analysis framework (updated based on SBND DENT force May 2026).
 
-    C++ equivalent:
-        (abs(vertex[0]) > 10) && (abs(vertex[0]) < 190) &&
-        (vertex[2] > 10) && (vertex[2] < 450) &&
-        (
-          ((vertex[2] > 250) && (vertex[1] > -190) && (vertex[1] < 100)) ||
-          ((vertex[2] < 250) && (abs(vertex[1]) < 190))
-        )
+    x_region  = (|x| > 5) & (|x| < 190)
+    z_region1 = (10 < z < 250) & (-190 < y < 190)
+    z_region2 = (250 < z < 450) & (-190 < y < 100) & (x < 0)
+    z_region3 = (250 < z < 450) & (-190 < y < 190) & (x > 0)
+    contained = x_region & (z_region1 | z_region2 | z_region3)
 
     x, y, z: pandas Series (vertex coordinates in cm).
     Returns: boolean Series.
     """
-    abs_x = x.abs()
-    in_x  = (abs_x > 10) & (abs_x < 190)
-    in_z  = (z > 10) & (z < 450)
-    in_y  = (
-        ((z <= 250) & (y > -190) & (y < 190)) |
-        ((z >  250) & (y > -190) & (y < 100))
-    )
-    return in_x & in_z & in_y
+    abs_x     = x.abs()
+    x_region  = (abs_x > 5) & (abs_x < 190)
+    z_region1 = (z > 10)  & (z < 250) & (y > -190) & (y < 190)
+    z_region2 = (z > 250) & (z < 450) & (y > -190) & (y < 100) & (x < 0)
+    z_region3 = (z > 250) & (z < 450) & (y > -190) & (y < 190) & (x > 0)
+    return x_region & (z_region1 | z_region2 | z_region3)
 
 
 # ── Public particle-level masks ───────────────────────────────────────────────
