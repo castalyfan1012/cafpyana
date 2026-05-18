@@ -3,10 +3,21 @@ nue_selection.py
 ----------------
 nueCC inclusive selection for SPINE DLP.
 
+Fiducial volume (fiducial_cut_tmp — matches C++ definition)
+------------------------------------------------------------
+    x_region  = (|x| > 5) & (|x| < 190)
+    z_region1 = (10 < z < 250) & (-190 < y < 190)
+    z_region2 = (250 < z < 450) & (-190 < y < 100) & (x < 0)   [TPC 0]
+    z_region3 = (250 < z < 450) & (-190 < y < 190) & (x > 0)   [TPC 1]
+
 valid_flashmatch (matches C++ definition)
 -----------------------------------------
-    is_flash_matched == 1  AND  flash_total_pe > 0
-    proxy for: flash_times.size()>0 && is_flash_matched==1 && !isnan(flash_times[0])
+    flash_times.size() > 0  AND  is_flash_matched == 1  AND  NOT isnan(flash_times[0])
+
+    build_cut_flow accepts an optional flash_times_df (3-level MultiIndex Series:
+    entry / dlp_inter_idx / flash_entry_idx, from rec.dlp.flash_times).
+    When supplied the full condition above is applied.
+    When None, falls back to the proxy:  is_flash_matched == 1  AND  flash_total_pe > 0
 """
 
 import numpy as np
@@ -19,7 +30,7 @@ from nue_helpers import (
 )
 
 # ── Thresholds (MeV) — must match make_nueCC_df.py ───────────────────────────
-ELECTRON_THRESHOLD_MEV = 75.0
+ELECTRON_THRESHOLD_MEV = 0.0
 MUON_THRESHOLD_MEV     = 50.0
 PHOTON_THRESHOLD_MEV   = 25.0
 PION_THRESHOLD_MEV     = 25.0
@@ -197,13 +208,25 @@ def classify_truth(evtdf, verbose=True):
 
 # ── Full cut flow ─────────────────────────────────────────────────────────────
 
-def build_cut_flow(evtdf):
+def build_cut_flow(evtdf, flash_times_df=None):
     """
     Apply the nueCC selection sequentially.
 
+    Parameters
+    ----------
+    evtdf          : merged SPINE reco+truth particle-level DataFrame.
+    flash_times_df : optional Series with 3-level MultiIndex
+                     (entry, dlp_inter_idx, flash_entry_idx) containing
+                     rec.dlp.flash_times values.  When supplied the full C++
+                     valid_flashmatch condition is applied:
+                         flash_times.size()>0 && is_flash_matched==1
+                         && !isnan(flash_times[0])
+                     When None, falls back to the proxy:
+                         is_flash_matched==1 AND flash_total_pe>0
+
     Cuts
     ----
-    valid_flashmatch  is_flash_matched==1 AND flash_total_pe>0
+    valid_flashmatch  see above
     fiducial          fiducial_cut_tmp geometric cut on reco vertex
     single_electron   >= 1 primary reco electron above threshold
 
@@ -233,11 +256,30 @@ def build_cut_flow(evtdf):
 
         elif step == "valid_flashmatch":
             ri = reco_interactions(evtdf)
-            # C++ valid_flashmatch: flash_times.size()>0 && is_flash_matched==1 && !isnan
-            # Proxy: flash_total_pe>0 is equivalent for stored branches
-            fm_mask  = (ri.is_flash_matched == 1) & (ri.flash_total_pe > 0)
-            fm_inter = fm_mask.groupby(level=il).any()
-            current  = current.intersection(fm_inter[fm_inter].index)
+
+            if flash_times_df is not None:
+                # Full C++ condition:
+                #   flash_times.size()>0 && is_flash_matched==1 && !isnan(flash_times[0])
+                #
+                # flash_times_df has a 3-level MultiIndex:
+                #   (entry, dlp_inter_idx, flash_entry_idx)
+                # groupby on the first (nlevels-1) levels collapses to
+                # interaction level. .first().notna() captures both size()>0
+                # and !isnan(flash_times[0]) in one step; interactions absent
+                # from flash_times_df (empty vector) are filled False.
+                ft_il        = list(range(flash_times_df.index.nlevels - 1))
+                first_ft     = flash_times_df.groupby(level=ft_il).first()
+                has_valid_ft = first_ft.notna()
+
+                fm_matched   = (ri.is_flash_matched == 1).groupby(level=il).any()
+                has_valid_ft = has_valid_ft.reindex(fm_matched.index, fill_value=False)
+                fm_inter     = fm_matched & has_valid_ft
+            else:
+                # Proxy fallback: is_flash_matched==1 AND flash_total_pe>0
+                fm_mask  = (ri.is_flash_matched == 1) & (ri.flash_total_pe > 0)
+                fm_inter = fm_mask.groupby(level=il).any()
+
+            current = current.intersection(fm_inter[fm_inter].index)
             results["valid_flashmatch"] = {
                 "inter_index":   current,
                 "particle_mask": _pmask(current),
@@ -268,12 +310,18 @@ def build_cut_flow(evtdf):
 
 # ── Extended cut flow (shower quality) ───────────────────────────────────────
 
-def shower_qual_cuts(evtdf):
+def shower_qual_cuts(evtdf, flash_times_df=None):
     """
     Full cut-flow including shower-quality cuts after single_electron.
     Leading reco electron computed once and reused for all extra cuts.
+
+    Parameters
+    ----------
+    evtdf          : merged SPINE reco+truth particle-level DataFrame.
+    flash_times_df : passed through to build_cut_flow for the FM cut.
+                     See build_cut_flow docstring for details.
     """
-    cut_flow = build_cut_flow(evtdf)
+    cut_flow = build_cut_flow(evtdf, flash_times_df=flash_times_df)
     il       = inter_levels(evtdf)
 
     def _pmask(idx):
