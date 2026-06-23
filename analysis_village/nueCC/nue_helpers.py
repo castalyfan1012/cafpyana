@@ -553,7 +553,7 @@ def plot_hist2d_frac_err(x, y, xlabel='x', ylabel='y', title=None,
                      fmt='o', color='black', markersize=5)
     else:
         ax2.scatter(bin_centers, bias, color='black', s=25,
-                    label='Fractional error', zorder=4)
+                    label='Fractional bias', zorder=4)
         ax2.scatter(bin_centers, err, color='green', s=40,
                     label='Resolution (Crystal-Ball fit σ)', marker='*', zorder=4)
         ax2.legend(fontsize=11, ncol=1, loc='upper right', framealpha=0.35)
@@ -1180,7 +1180,127 @@ def plot_matrix_binned(
     fig.tight_layout()
     return fig, ax
 
+# ============================================================
+# PID fraction vs true KE  (mirrors SpineSpectra1D style)
+# ============================================================
+PID_NAMES   = {0: "Photon", 1: "Electron", 2: "Muon", 3: "Pion", 4: "Proton"}
+PID_COLORS  = {0: "#CC79A7", 1: "#9B8EC4", 2: "#56C8C8", 3: "#88CCAA", 4: "#AADDAA"}
+PID_LS      = {0: "--",      1: "-",       2: "--",      3: "--",      4: "--"}
 
+def plot_pid_fraction_vs_ke(
+    true_ke,
+    reco_pid,
+    ke_bins=None,
+    true_pid_target_name="True Electron (Primaries)",
+    watermark="SBND Work in Progress",
+    wip_label="SBND Work in Progress",
+    highlight_pid=None,
+    title_fontsize=12,        # ← NEW: controllable title font size
+    figsize=(6, 7),
+    ax1=None, ax2=None,
+):
+    _own_figure = (ax1 is None) or (ax2 is None)   # ← track before creation
+
+    if _own_figure:
+        fig, (ax1, ax2) = plt.subplots(
+            2, 1, figsize=figsize,
+            gridspec_kw={"height_ratios": [3, 1.2], "hspace": 0.06},
+            sharex=True,
+        )
+    else:
+        fig = ax1.get_figure()
+    """
+    Step-histogram of predicted-PID fraction vs true KE, with a counts panel.
+
+    Parameters
+    ----------
+    true_ke            : array-like  — true KE of the *true* particle [MeV]
+    reco_pid           : array-like  — corresponding reconstructed PID (int 0-4)
+    ke_bins            : array-like  — bin edges; default 0-200 MeV in 20 steps
+    true_pid_target_name : str       — appears as plot title / top-right label
+    watermark          : str         — top-right annotation line 1
+    wip_label          : str         — top-right annotation line 2
+    """
+    if ke_bins is None:
+        ke_bins = np.linspace(0, 200, 21)
+    ke_bins = np.asarray(ke_bins, dtype=float)
+
+    true_ke  = np.asarray(true_ke,  dtype=float)
+    reco_pid = np.asarray(reco_pid, dtype=int)
+
+    valid = ~np.isnan(true_ke) & (reco_pid >= 0)
+    true_ke  = true_ke[valid]
+    reco_pid = reco_pid[valid]
+
+    n_bins   = len(ke_bins) - 1
+    pid_ids  = sorted(PID_NAMES.keys())
+
+    # ── Count matrix: bins × pids ────────────────────────────────────────────
+    counts = np.zeros((n_bins, len(pid_ids)), dtype=float)
+    for j, pid in enumerate(pid_ids):
+        counts[:, j], _ = np.histogram(true_ke[reco_pid == pid], bins=ke_bins)
+    total_per_bin = counts.sum(axis=1, keepdims=True)
+    fracs = np.where(total_per_bin > 0, counts / total_per_bin, 0.0)
+
+    if ax1 is None or ax2 is None:
+        fig, (ax1, ax2) = plt.subplots(
+            2, 1, figsize=figsize,
+            gridspec_kw={"height_ratios": [3, 1.2], "hspace": 0.06},
+            sharex=True,
+        )
+    else:
+        fig = ax1.get_figure()
+
+    # ── Upper panel: fraction ─────────────────────────────────────────────────
+    for j, pid in enumerate(pid_ids):
+        ls = "-" if (highlight_pid is not None and pid == highlight_pid) else "--"
+        ax1.step(ke_bins, np.append(fracs[:, j], fracs[-1, j]),
+                 where="post",
+                 color=PID_COLORS[pid],
+                 ls=ls,
+                 lw=1.8,
+                 label=PID_NAMES[pid],
+                 alpha=0.85)
+
+    ax1.set_ylabel("Fraction predicted", fontsize=12)
+    ax1.set_ylim(0, 1.05)
+    ax1.set_xlim(ke_bins[0], ke_bins[-1])
+    ax1.legend(fontsize=12, loc="best", framealpha=0.3,
+               handlelength=2.2, labelspacing=0.3)
+
+    # watermark + title annotations  (top-right, matching the reference style)
+    ax1.set_title(true_pid_target_name, fontsize=title_fontsize, fontweight="bold", pad=4)
+    ax1.text(0.98, 0.98, watermark,
+             transform=ax1.transAxes, ha="right", va="top",
+             fontsize=12, color="gray", linespacing=1.5)
+    # ax1.text(0.98, 0.78, wip_label,
+    #          transform=ax1.transAxes, ha="right", va="top",
+    #          fontsize=12, color="gray", style="italic")
+
+    ax1.tick_params(labelbottom=False)
+    # ax1.grid(True, which="major", ls="-", lw=0.4, alpha=0.35)
+
+    # ── Lower panel ───────────────────────────────────────────────────────────
+    for j, pid in enumerate(pid_ids):
+        ls = "-" if (highlight_pid is not None and pid == highlight_pid) else "--"
+        ax2.step(ke_bins, np.append(counts[:, j], counts[-1, j]),
+                 where="post",
+                 color=PID_COLORS[pid],
+                 ls=ls,
+                 lw=1.8,
+                 alpha=0.85)
+
+    ax2.set_yscale("log")
+    ax2.set_ylabel("True particles", fontsize=12)
+    ax2.set_xlabel("True KE [MeV]", fontsize=12)
+    ax2.set_xlim(ke_bins[0], ke_bins[-1])
+    # ax2.grid(True, which="major", ls="-", lw=0.4, alpha=0.35)
+    ax2.tick_params(which="both", direction="in", top=True, right=True)
+
+    if _own_figure:          # ← only tight_layout when we own the figure
+        fig.tight_layout()
+    return fig, (ax1, ax2)
+    
 def save_plot(name, fig=None, folder_name="plots", dpi=150):
     import os
     os.makedirs(folder_name, exist_ok=True)

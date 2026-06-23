@@ -8,3 +8,5 @@ envs/
 #*
 .#
 *~.ipynb_checkpoints/
+*.pkl
+*.npy

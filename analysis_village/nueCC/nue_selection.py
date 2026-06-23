@@ -30,7 +30,7 @@ from nue_helpers import (
 )
 
 # ── Thresholds (MeV) — must match make_nueCC_df.py ───────────────────────────
-ELECTRON_THRESHOLD_MEV = 0.0
+ELECTRON_THRESHOLD_MEV = 75.0
 MUON_THRESHOLD_MEV     = 50.0
 PHOTON_THRESHOLD_MEV   = 25.0
 PION_THRESHOLD_MEV     = 25.0
