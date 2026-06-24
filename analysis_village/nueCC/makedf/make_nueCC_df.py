@@ -576,6 +576,67 @@ def make_nuecc_wgtdf(f):
         warnings.warn(f"make_nuecc_wgtdf: GENIE failed — {e}")
     _force_free()
 
+    from makedf.getsyst import getsyst
+
+    EXTRA_XSEC_SYSTS = [
+        # MINERvA 2p2h (indices 82-86)
+        "MINERvAE2p2h_SBN_v1_E2p2h_A_nu",
+        "MINERvAE2p2h_SBN_v1_E2p2h_B_nu",
+        "MINERvAE2p2h_SBN_v1_E2p2h_A_nubar",
+        "MINERvAE2p2h_SBN_v1_E2p2h_B_nubar",
+        "MINERvAq0q3Weighting_SBN_v1_Mnv2p2hGaussEnhancement",
+        # MiscInteractionSysts (indices 87-91)
+        "MiscInteractionSysts_SBN_v1_C12ToAr40_2p2hScaling_nu",
+        "MiscInteractionSysts_SBN_v1_C12ToAr40_2p2hScaling_nubar",
+        "MiscInteractionSysts_SBN_v1_nuenuebar_xsec_ratio",
+        "MiscInteractionSysts_SBN_v1_nuenumu_xsec_ratio",
+        "MiscInteractionSysts_SBN_v1_SPPLowQ2Suppression",
+        # NOvAStyleNonResPionNorm (indices 92-114)
+        "NOvAStyleNonResPionNorm_SBN_v1_NR_nu_n_CC_2Pi",
+        "NOvAStyleNonResPionNorm_SBN_v1_NR_nu_n_CC_3Pi",
+        "NOvAStyleNonResPionNorm_SBN_v1_NR_nu_p_CC_2Pi",
+        "NOvAStyleNonResPionNorm_SBN_v1_NR_nu_p_CC_3Pi",
+        "NOvAStyleNonResPionNorm_SBN_v1_NR_nu_np_CC_1Pi",
+        "NOvAStyleNonResPionNorm_SBN_v1_NR_nu_n_NC_1Pi",
+        "NOvAStyleNonResPionNorm_SBN_v1_NR_nu_n_NC_2Pi",
+        "NOvAStyleNonResPionNorm_SBN_v1_NR_nu_n_NC_3Pi",
+        "NOvAStyleNonResPionNorm_SBN_v1_NR_nu_p_NC_1Pi",
+        "NOvAStyleNonResPionNorm_SBN_v1_NR_nu_p_NC_2Pi",
+        "NOvAStyleNonResPionNorm_SBN_v1_NR_nu_p_NC_3Pi",
+        "NOvAStyleNonResPionNorm_SBN_v1_NR_nubar_n_CC_1Pi",
+        "NOvAStyleNonResPionNorm_SBN_v1_NR_nubar_n_CC_2Pi",
+        "NOvAStyleNonResPionNorm_SBN_v1_NR_nubar_n_CC_3Pi",
+        "NOvAStyleNonResPionNorm_SBN_v1_NR_nubar_p_CC_1Pi",
+        "NOvAStyleNonResPionNorm_SBN_v1_NR_nubar_p_CC_2Pi",
+        "NOvAStyleNonResPionNorm_SBN_v1_NR_nubar_p_CC_3Pi",
+        "NOvAStyleNonResPionNorm_SBN_v1_NR_nubar_n_NC_1Pi",
+        "NOvAStyleNonResPionNorm_SBN_v1_NR_nubar_n_NC_2Pi",
+        "NOvAStyleNonResPionNorm_SBN_v1_NR_nubar_n_NC_3Pi",
+        "NOvAStyleNonResPionNorm_SBN_v1_NR_nubar_p_NC_1Pi",
+        "NOvAStyleNonResPionNorm_SBN_v1_NR_nubar_p_NC_2Pi",
+        "NOvAStyleNonResPionNorm_SBN_v1_NR_nubar_p_NC_3Pi",
+    ]
+
+    try:
+        extra_wgt = getsyst(
+            f, EXTRA_XSEC_SYSTS, presel_ind,
+            multisim_nuniv=100, slim=True, slimname="extra_xsec"
+        )
+        if extra_wgt is not None and not extra_wgt.empty:
+            print(f"  Extra xsec: {extra_wgt.shape[1]} cols, {len(extra_wgt)} rows  "
+                  f"({extra_wgt.memory_usage(deep=True).sum()/1e9:.3f} GB)")
+            if out is None:
+                out = extra_wgt
+            else:
+                out = multicol_concat(out, extra_wgt)
+                del extra_wgt
+        elif extra_wgt is not None:
+            del extra_wgt
+    except Exception as e:
+        warnings.warn(f"make_nuecc_wgtdf: extra xsec failed — {e}")
+    _force_free()
+
+
     del presel_ind, presel_mcdf_index
     gc.collect()
 

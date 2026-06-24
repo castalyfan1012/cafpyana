@@ -1,9 +1,13 @@
 """
-nue_helpers.py (UPDATED)
+nue_helpers.py (UPDATED — chi2/ndof support)
 --------------
 Plotting and utility helpers for the nueCC inclusive SPINE analysis.
 
 Key changes in this version:
+- Added chi2_pvalue() and chi2_text() utility functions for computing and
+  displaying chi2/ndof and p-values on plots (Afro request #4).
+- plot_stacked_hist() now accepts optional chi2_info dict for automatic
+  chi2/ndof annotation on stacked histogram plots.
 - Fixed `plot_stacked_hist` bug that caused "weights should have the same shape as x"
   when some categories have zero events (common after final selection).
   Now correctly passes `weights=None` (single None) when no weights are supplied.
@@ -21,6 +25,113 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
+
+# ============================================================
+# chi2 / p-value utilities  (NEW)
+# ============================================================
+def chi2_pvalue(observed, expected, cov_matrix=None, stat_errors=None):
+    """
+    Compute chi2, ndof, and p-value for a binned comparison.
+
+    Parameters
+    ----------
+    observed    : array-like — observed (or data) bin counts
+    expected    : array-like — expected (MC) bin counts
+    cov_matrix  : 2D array, optional — full covariance matrix.
+                  If provided, used for the chi2 computation.
+    stat_errors : array-like, optional — per-bin statistical errors.
+                  Used only if cov_matrix is None.
+                  If neither is provided, sqrt(expected) is used.
+
+    Returns
+    -------
+    chi2  : float
+    ndof  : int   (= number of bins)
+    pval  : float
+    """
+    from scipy.stats import chi2 as chi2_dist
+
+    obs = np.asarray(observed, dtype=float)
+    exp = np.asarray(expected, dtype=float)
+    diff = obs - exp
+    n = len(diff)
+
+    if cov_matrix is not None:
+        cov = np.asarray(cov_matrix, dtype=float)
+        # Regularise: add tiny diagonal to avoid singular matrix
+        reg = np.eye(n) * max(1e-10, 1e-6 * np.abs(np.diag(cov)).max())
+        try:
+            cov_inv = np.linalg.inv(cov + reg)
+        except np.linalg.LinAlgError:
+            cov_inv = np.linalg.pinv(cov + reg)
+        chi2_val = float(diff @ cov_inv @ diff)
+    else:
+        if stat_errors is not None:
+            sigma2 = np.asarray(stat_errors, dtype=float) ** 2
+        else:
+            sigma2 = np.where(exp > 0, exp, 1.0)  # Pearson chi2
+        chi2_val = float(np.sum(diff**2 / np.where(sigma2 > 0, sigma2, 1.0)))
+
+    ndof = n
+    pval = float(1.0 - chi2_dist.cdf(chi2_val, ndof))
+    return chi2_val, ndof, pval
+
+
+def chi2_text(observed, expected, cov_matrix=None, stat_errors=None, label=""):
+    """
+    Return a formatted string for plot annotation:
+      'χ²/ndof = X.X/N (p = 0.XX)'
+
+    Parameters: same as chi2_pvalue().
+    label : str — optional prefix (e.g. 'Flux: ').
+    """
+    chi2_val, ndof, pval = chi2_pvalue(observed, expected,
+                                        cov_matrix=cov_matrix,
+                                        stat_errors=stat_errors)
+    prefix = f"{label}" if label else ""
+    return f"{prefix}$\\chi^2$/ndof = {chi2_val:.1f}/{ndof} (p = {pval:.2f})"
+
+
+def annotate_chi2(ax, observed, expected, cov_matrix=None, stat_errors=None,
+                  label="", loc="upper right", fontsize=10):
+    """
+    Add a chi2/ndof text box to a matplotlib axes.
+
+    Parameters
+    ----------
+    ax          : matplotlib Axes
+    observed    : array-like — observed bin counts
+    expected    : array-like — expected (MC) bin counts
+    cov_matrix  : optional covariance matrix
+    stat_errors : optional per-bin errors (used if cov_matrix is None)
+    label       : str — text prefix
+    loc         : str — 'upper right', 'upper left', 'lower right', 'lower left'
+    fontsize    : int
+
+    Returns
+    -------
+    chi2_val, ndof, pval
+    """
+    chi2_val, ndof, pval = chi2_pvalue(observed, expected,
+                                        cov_matrix=cov_matrix,
+                                        stat_errors=stat_errors)
+    text = chi2_text(observed, expected, cov_matrix=cov_matrix,
+                     stat_errors=stat_errors, label=label)
+
+    # Position mapping
+    ha_map = {"upper right": ("right", 0.97), "upper left": ("left", 0.03),
+              "lower right": ("right", 0.97), "lower left": ("left", 0.03)}
+    va_map = {"upper right": ("top", 0.88), "upper left": ("top", 0.88),
+              "lower right": ("bottom", 0.05), "lower left": ("bottom", 0.05)}
+    ha, x = ha_map.get(loc, ("right", 0.97))
+    va, y = va_map.get(loc, ("top", 0.88))
+
+    ax.text(x, y, text, transform=ax.transAxes, ha=ha, va=va,
+            fontsize=fontsize,
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="white",
+                      edgecolor="gray", alpha=0.85))
+    return chi2_val, ndof, pval
+
 
 # ============================================================
 # Colour / style palette (unchanged)
@@ -255,7 +366,7 @@ def pur_eff_binned(values, bins, sel_mask, sig_mask, weights=None):
     return centers, purs, effs, counts
 
 # ============================================================
-# Plotting helpers (FIXED)
+# Plotting helpers (FIXED + chi2 support)
 # ============================================================
 def plot_stacked_hist(series_list, labels, colors, bins, weights=None,
                       xlabel="", ylabel="Events / bin", title="",
@@ -264,16 +375,28 @@ def plot_stacked_hist(series_list, labels, colors, bins, weights=None,
                       invert_stack_order=False,
                       show_counts=True,
                       show_percentage=True,
+                      chi2_info=None,
                       **hist_kw):
     """
     Stacked MC histogram with optional data overlay.
 
-    New parameters vs old version
-    ------------------------------
+    Parameters (new)
+    ----------------
+    chi2_info : dict, optional
+        If provided, annotates the plot with chi2/ndof and p-value.
+        Keys:
+          'observed'    : array — data bin counts
+          'expected'    : array — total MC bin counts
+          'cov_matrix'  : 2D array, optional — covariance matrix
+          'stat_errors' : array, optional — per-bin errors (if no cov)
+          'label'       : str, optional — prefix text
+          'loc'         : str, optional — position ('upper right', etc.)
+          'fontsize'    : int, optional — annotation fontsize
+
+    Parameters (existing, unchanged)
+    ---------------------------------
     invert_stack_order : bool
-        If True, reverses both the stack draw order and the legend order,
-        so the largest category sits at the bottom and is listed first —
-        matching the SpineSpectra1D draw() style.
+        If True, reverses both the stack draw order and the legend order.
     show_counts : bool
         Append the weighted event count for each category to its legend label.
     show_percentage : bool
@@ -362,14 +485,6 @@ def plot_stacked_hist(series_list, labels, colors, bins, weights=None,
     # ── Legend: invert handle order so top of stack = top of legend ─────────
     handles, legend_labels = ax.get_legend_handles_labels()
     if invert_stack_order:
-        # Already reversed above — just display as-is so signal is first
-        ax.legend(handles, legend_labels, fontsize=10, ncol=1, loc="best")
-    else:
-        # Reverse so the top-stacked (last drawn) category appears first
-        ax.legend(handles[::-1], legend_labels[::-1], fontsize=10, ncol=1, loc="best")
-    # ── Legend: invert handle order so top of stack = top of legend ─────────
-    handles, legend_labels = ax.get_legend_handles_labels()
-    if invert_stack_order:
         ax.legend(handles, legend_labels, fontsize=9, ncol=1,
                   loc="upper right", frameon=True,
                   framealpha=0.85, edgecolor="none")
@@ -391,6 +506,20 @@ def plot_stacked_hist(series_list, labels, colors, bins, weights=None,
         ax.text(0.02, 0.98, f"Total MC events: {grand_total:.0f}",
                 transform=ax.transAxes, va="top", ha="left",
                 fontsize=10, color="gray")
+
+    # ── Optional chi2/ndof annotation (NEW) ──────────────────────────────────
+    if chi2_info is not None:
+        annotate_chi2(
+            ax,
+            observed    = chi2_info['observed'],
+            expected    = chi2_info['expected'],
+            cov_matrix  = chi2_info.get('cov_matrix'),
+            stat_errors = chi2_info.get('stat_errors'),
+            label       = chi2_info.get('label', ''),
+            loc         = chi2_info.get('loc', 'upper left'),
+            fontsize    = chi2_info.get('fontsize', 10),
+        )
+
     return ax.get_figure(), ax
 
 
@@ -479,7 +608,6 @@ def plot_hist2d_frac_err(x, y, xlabel='x', ylabel='y', title=None,
                 plt.figure()
                 plt.hist(stat, bins=_fbins, label=f'Raw (n={len(stat):,})',
                          density=True, alpha=0.6)
-                # normalise CB curve for overlay
                 # inside the show_fit block — update index references
                 _cb  = _crystal_ball(_t, *popt)
                 _cb /= (_cb.sum() * (_t[1] - _t[0]))
@@ -1273,12 +1401,8 @@ def plot_pid_fraction_vs_ke(
     ax1.text(0.98, 0.98, watermark,
              transform=ax1.transAxes, ha="right", va="top",
              fontsize=12, color="gray", linespacing=1.5)
-    # ax1.text(0.98, 0.78, wip_label,
-    #          transform=ax1.transAxes, ha="right", va="top",
-    #          fontsize=12, color="gray", style="italic")
 
     ax1.tick_params(labelbottom=False)
-    # ax1.grid(True, which="major", ls="-", lw=0.4, alpha=0.35)
 
     # ── Lower panel ───────────────────────────────────────────────────────────
     for j, pid in enumerate(pid_ids):
@@ -1294,7 +1418,6 @@ def plot_pid_fraction_vs_ke(
     ax2.set_ylabel("True particles", fontsize=12)
     ax2.set_xlabel("True KE [MeV]", fontsize=12)
     ax2.set_xlim(ke_bins[0], ke_bins[-1])
-    # ax2.grid(True, which="major", ls="-", lw=0.4, alpha=0.35)
     ax2.tick_params(which="both", direction="in", top=True, right=True)
 
     if _own_figure:          # ← only tight_layout when we own the figure
