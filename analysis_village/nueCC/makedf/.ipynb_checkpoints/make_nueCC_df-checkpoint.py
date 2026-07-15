@@ -71,7 +71,7 @@ except ImportError:
 
 # ── Constants — must match nue_selection.py exactly ──────────────────────────
 BRANCH_TRUE            = "dlp_true"
-ELECTRON_THRESHOLD_MEV = 0.0
+ELECTRON_THRESHOLD_MEV = 75.0
 MUON_THRESHOLD_MEV     = 50.0
 PID_ELECTRON           = 1
 PID_MUON               = 2
