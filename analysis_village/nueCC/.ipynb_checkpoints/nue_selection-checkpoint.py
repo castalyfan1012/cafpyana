@@ -287,8 +287,37 @@ def build_cut_flow(evtdf, flash_times_df=None):
 
         elif step == "fiducial":
             ri = reco_interactions(evtdf)
-            # fiducial_cut_tmp: geometric cut on reco vertex (not is_fiducial)
-            fv_mask  = _fiducial_cut_tmp(ri.vertex.x, ri.vertex.y, ri.vertex.z)
+            ri_df = ri._df
+        
+            # Try standard x/y/z columns (MC path: vertex.x/y/z)
+            # Fall back to I0/I1/I2 columns (data path: vertex.I0/I1/I2)
+            def _get_vertex_coord(ri_df, coord):
+                """Get vertex coordinate Series, handling both MC and data column naming."""
+                # MC: attribute access ri.vertex.x works → ('vertex', 'x', '') or similar
+                # Data: columns are ('vertex', 'I0', ''), ('vertex', 'I1', ''), ('vertex', 'I2', '')
+                coord_to_idx = {'x': 'I0', 'y': 'I1', 'z': 'I2'}
+                # Try direct MultiIndex lookup for data naming
+                fallback_key = (coord_to_idx[coord], '')
+                for c in ri_df.columns:
+                    if isinstance(c, tuple):
+                        if 'vertex' in c and coord in c:
+                            return ri_df[c]
+                        if 'vertex' in c and coord_to_idx[coord] in c:
+                            return ri_df[c]
+                raise KeyError(f"vertex {coord} not found in reco_interactions columns")
+        
+            try:
+                # MC path: ri.vertex.x/y/z via attribute chaining
+                vx = ri.vertex.x
+                vy = ri.vertex.y
+                vz = ri.vertex.z
+            except AttributeError:
+                # Data path: vertex columns named I0/I1/I2
+                vx = _get_vertex_coord(ri_df, 'x')
+                vy = _get_vertex_coord(ri_df, 'y')
+                vz = _get_vertex_coord(ri_df, 'z')
+        
+            fv_mask  = _fiducial_cut_tmp(vx, vy, vz)
             fv_inter = fv_mask.groupby(level=il).any()
             current  = current.intersection(fv_inter[fv_inter].index)
             results["fiducial"] = {

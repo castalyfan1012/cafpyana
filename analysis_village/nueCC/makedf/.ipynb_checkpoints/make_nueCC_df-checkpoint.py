@@ -6,7 +6,8 @@ SPINE DLP-based nueCC inclusive MC DataFrame makers for cafpyana.
 
 Public functions
 ----------------
-make_nuecc_evtdf(f)          — reco+truth particle df, FM+FV preselected
+make_nuecc_evtdf(f)          — reco+truth particle df, FM+FV preselected  (MC)
+make_nuecc_evtdf_data(f)     — reco-only particle df, FM+FV preselected   (DATA)
 make_nuecc_truth_info_df(f)  — per-interaction truth+presel metadata (ALL interactions)
 make_nuecc_statsdf(f)        — alias for make_nuecc_truth_info_df
 make_nuecc_wgtdf(f)          — BNB + GENIE universe weights (preselected nus only)
@@ -17,6 +18,12 @@ Output HDF5 keys (via nueCC_mc.py config)
     truth_info_0  per-interaction metadata, ALL interactions pre-FM/FV cut
     hdr_0         run/subrun/event header
     pot_0         BNB POT per file
+
+Output HDF5 keys (via nueCC_data.py config)
+--------------------------------------------
+    evt_0         reco-only particle-level df, FM+FV preselected
+    hdr_0         run/subrun/event header
+    pot_0         EXT POT per file (or BNB depending on run type)
 
 Truth categories (match nue_selection.py exactly)
 --------------------------------------------------
@@ -31,7 +38,7 @@ Truth categories (match nue_selection.py exactly)
 
 Fiducial volume (fiducial_cut_tmp — matches C++ definition)
 ------------------------------------------------------------
-    |x| ∈ (5, 190) cm
+    |x| in (5, 190) cm
     z_region1 = (10 < z < 250) & (-190 < y < 190)
     z_region2 = (250 < z < 450) & (-190 < y < 100) & (x < 0)   [TPC 0]
     z_region3 = (250 < z < 450) & (-190 < y < 190) & (x > 0)   [TPC 1]
@@ -53,9 +60,6 @@ from makedf.makedf import make_all_spine_df, make_mcnudf
 from pyanalib.pandas_helpers import multicol_merge, multicol_concat
 
 # ── Optional imports for flash_times (ragged branch, loaded separately) ──────
-# flash_times is a vector branch (rec.dlp.flash_times) that is NOT part of the
-# flat spine_df returned by make_all_spine_df.  We load it independently in
-# _get_truth_info and pass it into _build_truth_info for the full FM cut.
 try:
     from makedf.makedf import loadbranches as _loadbranches
 except ImportError:
@@ -69,6 +73,25 @@ try:
 except ImportError:
     _SPINE_FT_BRANCHES = None
 
+# ── Reco-only branch lists (for data mode) ────────────────────────────────────
+try:
+    from makedf.makedf import (
+        spineint_branches          as _SPINEINT_BRANCHES,
+        spinepart_branches         as _SPINEPART_BRANCHES,
+        spineint_flashids_branches     as _SPINEINT_FLASHIDS,
+        spineint_flashscores_branches  as _SPINEINT_FLASHSCORES,
+        spineint_flashtimes_branches   as _SPINEINT_FLASHTIMES,
+        spineint_matched_branches      as _SPINEINT_MATCHED,
+        spinepart_matched_branches     as _SPINEPART_MATCHED,
+    )
+    _DATA_BRANCHES_AVAILABLE = True
+except ImportError:
+    _DATA_BRANCHES_AVAILABLE = False
+    warnings.warn(
+        "make_nueCC_df: could not import reco-only branch lists from makedf.makedf; "
+        "make_nuecc_evtdf_data will not be available."
+    )
+
 # ── Constants — must match nue_selection.py exactly ──────────────────────────
 BRANCH_TRUE            = "dlp_true"
 ELECTRON_THRESHOLD_MEV = 75.0
@@ -78,8 +101,11 @@ PID_MUON               = 2
 
 # ── Module-level caches (one SPINE load shared across all DFS makers per file)
 _spine_cache      = {}
+_spine_data_cache = {}
 _truth_info_cache = {}
 
+
+# ── MC spine loader (reco + truth merged) ─────────────────────────────────────
 
 def _get_spine_df(f):
     fname = str(f)
@@ -89,6 +115,103 @@ def _get_spine_df(f):
         gc.collect()
         _spine_cache[fname] = make_all_spine_df(f)
     return _spine_cache[fname]
+
+
+# ── Data spine loader (reco-only, no dlp_true branches) ───────────────────────
+
+def _get_spine_df_data(f):
+    """
+    Reco-only SPINE df for data CAFs.
+    """
+    fname = str(f)
+    if fname not in _spine_data_cache:
+        _spine_data_cache.clear()
+        gc.collect()
+
+        if not _DATA_BRANCHES_AVAILABLE:
+            raise RuntimeError(
+                "_get_spine_df_data: reco-only branch lists could not be "
+                "imported from makedf.makedf"
+            )
+
+        rec = f["recTree"]
+
+        # ── Interaction-level (2-level row index, 4-level col MultiIndex) ─────
+        int_df = _loadbranches(rec, _SPINEINT_BRANCHES)
+        inter_idx_names = list(int_df.index.names)  # ['entry', 'rec.dlp..index']
+
+        for extra_branches in [_SPINEINT_FLASHIDS, _SPINEINT_FLASHSCORES,
+                               _SPINEINT_MATCHED]:
+            if extra_branches is None:
+                continue
+            try:
+                extra_df = _loadbranches(rec, extra_branches)
+                if extra_df.index.nlevels == int_df.index.nlevels:
+                    # flatten both to same depth before joining
+                    int_df = int_df.join(extra_df, how="left")
+            except Exception:
+                pass
+
+        # ── Particle-level (3-level row index, 5-level col MultiIndex) ────────
+        part_df = _loadbranches(rec, _SPINEPART_BRANCHES)
+        part_idx_names = list(part_df.index.names)
+
+        if _SPINEPART_MATCHED is not None:
+            try:
+                pm = _loadbranches(rec, _SPINEPART_MATCHED)
+                if pm.index.nlevels == part_df.index.nlevels:
+                    part_df = part_df.join(pm, how="left")
+            except Exception:
+                pass
+
+        # ── Flatten column MultiIndex to strings for both dfs ─────────────────
+        def _flatten_cols(df):
+            return [
+                ".".join(p for p in c if p) if isinstance(c, tuple) else c
+                for c in df.columns
+            ]
+
+        int_flat  = int_df.copy()
+        part_flat = part_df.copy()
+        int_flat.columns  = _flatten_cols(int_df)
+        part_flat.columns = _flatten_cols(part_df)
+
+        # ── Merge on shared interaction index levels ───────────────────────────
+        part_reset = part_flat.reset_index()   # 3 idx levels → columns
+        int_reset  = int_flat.reset_index()    # 2 idx levels → columns
+
+        # inter_idx_names are plain strings — they now exist as columns in both
+        merged = part_reset.merge(int_reset, on=inter_idx_names, how="left")
+        merged = merged.set_index(part_idx_names)
+
+        # ── Restore column MultiIndex ──────────────────────────────────────────
+        # Build a unified MultiIndex using the deeper (5-level) depth.
+        # int cols get padded with trailing '' to match part depth.
+        max_depth = max(
+            max(len(c) for c in int_df.columns  if isinstance(c, tuple)),
+            max(len(c) for c in part_df.columns if isinstance(c, tuple)),
+        )
+
+        orig_cols = {}
+        for orig, flat in zip(int_df.columns,  _flatten_cols(int_df)):
+            orig_cols[flat] = orig
+        for orig, flat in zip(part_df.columns, _flatten_cols(part_df)):
+            orig_cols[flat] = orig
+
+        def _pad(t, depth):
+            return tuple(t) + ('',) * (depth - len(t)) if isinstance(t, tuple) else (t,) + ('',) * (depth - 1)
+
+        new_cols = []
+        for c in merged.columns:
+            if c in orig_cols:
+                new_cols.append(_pad(orig_cols[c], max_depth))
+            else:
+                new_cols.append(_pad((c,), max_depth))
+
+        merged.columns = pd.MultiIndex.from_tuples(new_cols)
+        _spine_data_cache[fname] = merged
+
+    return _spine_data_cache[fname]
 
 
 def _force_free():
@@ -154,6 +277,77 @@ def _safe(fn, *args, **kwargs):
         return fn(*args, **kwargs)
     except (KeyError, StopIteration):
         return None
+
+
+# ── Shared FM + FV preselection logic ─────────────────────────────────────────
+
+def _apply_presel(spine_df, flash_times_s=None):
+    """
+    Apply FM + reco-FV preselection to spine_df (works for both MC and data).
+
+    Parameters
+    ----------
+    spine_df      : SPINE particle-level DataFrame (2- or 3-level MultiIndex)
+    flash_times_s : optional flash_times Series (see _build_truth_info for details)
+
+    Returns
+    -------
+    passed_fm      : bool Series, interaction-level index
+    passed_fv_reco : bool Series, interaction-level index
+    inter_idx      : MultiIndex of unique interactions
+    il             : list of groupby levels (all but last)
+    """
+    il    = list(range(spine_df.index.nlevels - 1))
+    inter = spine_df.groupby(level=il).first()
+    idx   = inter.index
+
+    # ── Flash-match ────────────────────────────────────────────────────────
+    fm_col = _safe(_find_col, spine_df, "is_flash_matched",
+                   branch_must_not_contain=BRANCH_TRUE)
+    pe_col = _safe(_find_col, spine_df, "flash_total_pe",
+                   branch_must_not_contain=BRANCH_TRUE)
+
+    if fm_col is not None:
+        fm_pass = (spine_df[fm_col] == 1)
+
+        if flash_times_s is not None:
+            ft_il        = list(range(flash_times_s.index.nlevels - 1))
+            first_ft     = flash_times_s.groupby(level=ft_il).first()
+            has_valid_ft = first_ft.notna().reindex(idx, fill_value=False).astype(bool)
+            fm_inter     = fm_pass.groupby(level=il).any().reindex(idx, fill_value=False)
+            passed_fm    = fm_inter & has_valid_ft
+        else:
+            if pe_col is not None:
+                fm_pass = fm_pass & (spine_df[pe_col] > 0)
+            passed_fm = fm_pass.groupby(level=il).any().reindex(idx, fill_value=False)
+    else:
+        passed_fm = pd.Series(False, index=idx)
+
+    # ── Reco FV ────────────────────────────────────────────────────────────
+    rvx_col  = _safe(_find_col_ends, spine_df, "vertex", "x",
+                     branch_must_not_contain=BRANCH_TRUE)
+    rvy_col  = _safe(_find_col_ends, spine_df, "vertex", "y",
+                     branch_must_not_contain=BRANCH_TRUE)
+    rvz_col  = _safe(_find_col_ends, spine_df, "vertex", "z",
+                     branch_must_not_contain=BRANCH_TRUE)
+    fv_r_col = _safe(_find_col, spine_df, "is_fiducial",
+                     branch_must_not_contain=BRANCH_TRUE)
+
+    if rvx_col and rvy_col and rvz_col:
+        passed_fv_reco = _fiducial_cut_tmp(
+            inter[rvx_col], inter[rvy_col], inter[rvz_col]
+        ).reindex(idx, fill_value=False).astype(bool)
+    elif fv_r_col:
+        warnings.warn("_apply_presel: reco vertex coords missing, using is_fiducial")
+        passed_fv_reco = (
+            (spine_df[fv_r_col] == 1)
+            .groupby(level=il).any()
+            .reindex(idx, fill_value=False)
+        )
+    else:
+        passed_fv_reco = pd.Series(False, index=idx)
+
+    return passed_fm, passed_fv_reco, idx, il
 
 
 # ── Core: build per-interaction truth + reco-presel metadata ─────────────────
@@ -256,24 +450,12 @@ def _build_truth_info(spine_df, flash_times_s=None):
         fm_pass = (spine_df[fm_col] == 1)
 
         if flash_times_s is not None:
-            # Full C++ condition:
-            #   flash_times.size()>0 && is_flash_matched==1 && !isnan(flash_times[0])
-            #
-            # flash_times_s has a 3-level MultiIndex:
-            #   (entry, dlp_inter_idx, flash_entry_idx)
-            # Grouping by the first (nlevels-1) levels collapses to interaction
-            # level.  .first() returns NaN for any interaction absent from the
-            # Series (i.e. empty flash_times vector), so notna() correctly
-            # captures both size()>0 and !isnan(flash_times[0]) in one step.
             ft_il        = list(range(flash_times_s.index.nlevels - 1))
             first_ft     = flash_times_s.groupby(level=ft_il).first()
             has_valid_ft = first_ft.notna().reindex(idx, fill_value=False).astype(bool)
-
             fm_inter  = fm_pass.groupby(level=il).any().reindex(idx, fill_value=False)
             passed_fm = fm_inter & has_valid_ft
         else:
-            # Fallback proxy: is_flash_matched==1 AND flash_total_pe>0
-            # (used when flash_times branch could not be loaded)
             if pe_col is not None:
                 fm_pass = fm_pass & (spine_df[pe_col] > 0)
             passed_fm = fm_pass.groupby(level=il).any().reindex(idx, fill_value=False)
@@ -369,17 +551,10 @@ def _get_truth_info(f):
     fname = str(f)
     if fname not in _truth_info_cache:
         # ── Load flash_times (ragged branch, not in spine_df) ────────────────
-        # rec.dlp.flash_times is a vector branch that make_all_spine_df does
-        # not include.  We load it here and pass into _build_truth_info so the
-        # full C++ valid_flashmatch condition can be applied.
         flash_times_s = None
         if _loadbranches is not None and _SPINE_FT_BRANCHES is not None:
             try:
                 raw_ft = _loadbranches(f["recTree"], _SPINE_FT_BRANCHES)
-                # raw_ft has a 3-level MultiIndex:
-                #   (entry, dlp_interaction_idx, flash_entry_idx)
-                # Extract as a plain Series; the first two index levels align
-                # with the interaction-level index inside _build_truth_info.
                 ft_col        = raw_ft.columns[0]
                 flash_times_s = raw_ft[ft_col]
             except Exception as e:
@@ -392,7 +567,7 @@ def _get_truth_info(f):
     return _truth_info_cache[fname]
 
 
-# ── Public maker 1: evtdf ────────────────────────────────────────────────────
+# ── Public maker 1: MC evtdf ─────────────────────────────────────────────────
 
 def make_nuecc_evtdf(f):
     """
@@ -427,7 +602,50 @@ def make_nuecc_evtdf(f):
     return spine_df
 
 
-# ── Public maker 2: truth_info_df ────────────────────────────────────────────
+# ── Public maker 2: data evtdf (reco-only) ───────────────────────────────────
+
+def make_nuecc_evtdf_data(f):
+    """
+    Reco-only SPINE particle-level df, FM+FV preselected.
+
+    No MC truth merge, no truth categorization.  Intended for data CAFs where
+    rec.dlp_true branches are absent.  Uses _get_spine_df_data which builds
+    the spine df from reco-only branch lists (spineint + spinepart), avoiding
+    the inner join on truth branches that make_all_spine_df performs.
+
+    The FM + reco-FV preselection is identical to the MC path.
+    """
+    spine_df = _get_spine_df_data(f)
+
+    if spine_df.empty:
+        warnings.warn("make_nuecc_evtdf_data: spine_df is empty after reco-only load")
+        return spine_df
+
+    # ── Load flash_times for full C++ FM condition ────────────────────────────
+    flash_times_s = None
+    if _loadbranches is not None and _SPINEINT_FLASHTIMES is not None:
+        try:
+            raw_ft        = _loadbranches(f["recTree"], _SPINEINT_FLASHTIMES)
+            ft_col        = raw_ft.columns[0]
+            flash_times_s = raw_ft[ft_col]
+        except Exception as e:
+            warnings.warn(
+                f"make_nuecc_evtdf_data: flash_times load failed, "
+                f"falling back to flash_total_pe proxy — {e}"
+            )
+
+    passed_fm, passed_fv_reco, idx, il = _apply_presel(spine_df, flash_times_s)
+
+    presel_idx = idx[passed_fm & passed_fv_reco]
+    n_total  = len(idx)
+    n_presel = len(presel_idx)
+    print(f"  data evtdf: {n_presel} / {n_total} interactions pass FM+FV presel")
+
+    spine_df = spine_df[spine_df.index.droplevel(-1).isin(presel_idx)]
+    return spine_df
+
+
+# ── Public maker 3: truth_info_df ────────────────────────────────────────────
 
 def make_nuecc_truth_info_df(f):
     """
@@ -442,7 +660,7 @@ def make_nuecc_statsdf(f):
     return make_nuecc_truth_info_df(f)
 
 
-# ── Public maker 3: wgtdf ────────────────────────────────────────────────────
+# ── Public maker 4: wgtdf ────────────────────────────────────────────────────
 #
 # Root cause of the OOM (now fixed):
 # ─────────────────────────────────
@@ -451,7 +669,7 @@ def make_nuecc_statsdf(f):
 #
 #   wgts = ak.to_dataframe(f["recTree"]['rec.mc.nu.wgt.univ'].arrays(...))
 #
-# For 13,297 nus × ~5,000 total universe weights = 66 million rows ≈ 5-10 GB.
+# For 13,297 nus x ~5,000 total universe weights = 66 million rows ~ 5-10 GB.
 # Added to spine_df RSS residual (~15 GB not yet released by glibc), this
 # pushes the grid job over 29 GB.
 #
@@ -462,7 +680,7 @@ def make_nuecc_statsdf(f):
 # ──────────────────
 # 1. getsyst.py: replaced with Lynn's chunked version that reads weight data
 #    in 10 MB pieces. Peak from weight loading: ~50 MB instead of 5-10 GB.
-#    Crucially, it uses index-aligned `.loc` updates (not numpy broadcasting),
+#    Crucially, it uses index-aligned .loc updates (not numpy broadcasting),
 #    so it correctly handles a SUBSET of nu indices without shape errors.
 #
 # 2. make_nuecc_wgtdf: now passes presel_ind (only the ~3,700 preselected nus)
@@ -472,7 +690,7 @@ def make_nuecc_statsdf(f):
 # Combined effect on memory:
 #   spine_df:    ~15-20 GB (same as evtdf — freed + malloc_trim before wgts)
 #   weight data: ~50 MB   (was 5-10 GB — chunked getsyst)
-#   Peak:        same as evtdf ← fits within 29 GB
+#   Peak:        same as evtdf <- fits within 29 GB
 
 def make_nuecc_wgtdf(f):
     """
@@ -500,18 +718,12 @@ def make_nuecc_wgtdf(f):
     }).drop_duplicates().reset_index(drop=True)
 
     # ── Step 2: free spine_df cache + release OS pages ───────────────────────
-    # spine_df is ~15-20 GB. Clearing the cache + malloc_trim drops the RSS
-    # back to ~2-3 GB before the weight calls, matching the evtdf budget.
-    # Safe in the wgtdf-only config since no other maker reuses spine_df here.
     _spine_cache.clear()
     _truth_info_cache.clear()
     del truth_info, presel_mct
     _force_free()
 
     # ── Step 3: build presel_ind ─────────────────────────────────────────────
-    # presel_ind is a Series indexed by the preselected subset of mcdf.index,
-    # with values = per-event nu integer index (the 'inu' used inside getsyst).
-    # This mirrors Lynn's nu_indices in _add_weights_to_nueccdf.
     mcdf = make_mcnudf(f, include_weights=False)
 
     mcdf_pair_idx = pd.MultiIndex.from_arrays(
@@ -530,22 +742,18 @@ def make_nuecc_wgtdf(f):
     gc.collect()
 
     n_presel = len(presel_mcdf_index)
-    print(f"  wgtdf: {n_presel} preselected MC nu rows → passing to syst functions")
+    print(f"  wgtdf: {n_presel} preselected MC nu rows -> passing to syst functions")
 
     if n_presel == 0:
         warnings.warn("make_nuecc_wgtdf: no mcdf rows matched preselected pairs")
         return pd.DataFrame()
 
-    # presel_ind: index = presel_mcdf_index, values = per-event nu int index
     presel_ind = pd.Series(
         np.asarray(presel_mcdf_index.get_level_values(-1), dtype=np.int64),
         index=presel_mcdf_index,
     )
 
     # ── Step 4: BNB and GENIE weights for preselected nus only ───────────────
-    # Lynn's getsyst reads weight data in 10 MB chunks and uses .loc updates,
-    # so it handles subset input correctly and uses negligible peak memory.
-    # Output is already indexed by presel_mcdf_index — no slicing needed.
     out = None
 
     try:
@@ -636,13 +844,12 @@ def make_nuecc_wgtdf(f):
         warnings.warn(f"make_nuecc_wgtdf: extra xsec failed — {e}")
     _force_free()
 
-
     del presel_ind, presel_mcdf_index
     gc.collect()
 
     if out is None or out.empty:
         return pd.DataFrame()
 
-    print(f"  wgtdf output: {len(out)} rows × {out.shape[1]} cols  "
+    print(f"  wgtdf output: {len(out)} rows x {out.shape[1]} cols  "
           f"({out.memory_usage(deep=True).sum()/1e9:.3f} GB)")
     return out
