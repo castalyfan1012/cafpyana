@@ -1023,7 +1023,10 @@ def plot_nuecc_differential_stacked(
     frac_unc_ke=None, reco_ke_bins=None,
     title='', pot_label='', plot_dir=None,
     filename='nuecc_differential_stacked',
-    plot_stacked_hist_fn=None,   # pass nh.plot_stacked_hist
+    plot_stacked_hist_fn=None,
+    data_ke=None,       # ← NEW: 1-D array of data reco KE values
+    data_cos=None,      # ← NEW: 1-D array of data reco costheta values
+    data_label='Data',  # ← NEW
 ):
     """
     Grid of stacked KE histograms sliced by costheta_e.
@@ -1098,6 +1101,19 @@ def plot_nuecc_differential_stacked(
             ax.bar(ke_bins[:-1], 2 * unc_s, bottom=total_s - unc_s,
                    width=bw, align='edge', alpha=0.3, color='gray',
                    hatch='///', linewidth=0, label='Syst.')
+
+        # ── Data overlay per costheta slice ──────────────────────────────────
+        if data_ke is not None and data_cos is not None:
+            data_cos_arr = np.asarray(data_cos)
+            data_ke_arr  = np.asarray(data_ke)
+            data_mask    = (data_cos_arr >= cos_lo) & (data_cos_arr < cos_hi)
+            d_ke_slice   = data_ke_arr[data_mask]
+            if len(d_ke_slice) > 0:
+                d_counts, _ = np.histogram(d_ke_slice, bins=ke_bins)
+                d_centers   = 0.5 * (ke_bins[:-1] + ke_bins[1:])
+                ax.errorbar(d_centers, d_counts, yerr=np.sqrt(d_counts),
+                            fmt='ko', markersize=3, linewidth=1,
+                            label=data_label, zorder=10)
 
         ax.set_title(binning2d.costheta_labels[ci], fontsize=8)
         ax.set_xlim(ke_bins[0], ke_bins[-1])

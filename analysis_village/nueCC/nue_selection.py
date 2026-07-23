@@ -65,6 +65,9 @@ CUT_NAMES_MORE = [
     "electron_primary_score",
     "electron_pid_score",
     "vertex_distance",
+    # "start_dedx",
+    # "axial_spread",
+    # "directional_spread"
 ]
 CUT_LABELS_MORE = [
     "No cut",
@@ -74,7 +77,18 @@ CUT_LABELS_MORE = [
     "Electron primary score",
     "Electron PID score",
     "Conversion gap",
+    # "Start dE/dx",
+    # "Axial spread",
+    # "Opening angle"
 ]
+
+THRESH_PRIMARY_SCORE = 0.99
+THRESH_PID_SCORE     = 0.91
+THRESH_VERTEX_DIST   = 3.95
+THRESH_DIR_SPREAD    = 0.199
+THRESH_AXIAL_SPREAD  = 0.02
+THRESH_DEDX          = 7.6
+
 
 
 # ── Fiducial volume ───────────────────────────────────────────────────────────
@@ -375,11 +389,17 @@ def shower_qual_cuts(evtdf, flash_times_df=None):
         steps.set_postfix(n=len(current))
 
         if step == "electron_primary_score":
-            soft_inter = leading_electron[('primary_scores', 'I1')] > 0.99
+            soft_inter = leading_electron[('primary_scores', 'I1')] > THRESH_PRIMARY_SCORE
         elif step == "electron_pid_score":
-            soft_inter = leading_electron[('pid_scores', 'I1')] > 0.915
+            soft_inter = leading_electron[('pid_scores', 'I1')] > THRESH_PID_SCORE
         elif step == "vertex_distance":
-            soft_inter = leading_electron[('vertex_distance', '')] < 3.9
+            soft_inter = leading_electron[('vertex_distance', '')] < THRESH_VERTEX_DIST
+        # elif step == "start_dedx":
+        #     soft_inter = leading_electron[('start_dedx', '')] < THRESH_DEDX
+        # elif step == "axial_spread":
+        #     soft_inter = leading_electron[('axial_spread', '')] > THRESH_AXIAL_SPREAD
+        # elif step == "directional_spread":
+        #     soft_inter = leading_electron[('directional_spread', '')] < THRESH_DIR_SPREAD
         else:
             raise ValueError(f"Unknown shower quality cut: {step}")
 

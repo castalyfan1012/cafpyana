@@ -1423,6 +1423,239 @@ def plot_pid_fraction_vs_ke(
     if _own_figure:          # ← only tight_layout when we own the figure
         fig.tight_layout()
     return fig, (ax1, ax2)
+
+# ============================================================
+# Extra variable plots: selection cut variables with syst band + data
+# ============================================================
+
+def plot_extra_selection_vars(
+    mc_evtdf,
+    data_evtdf,
+    sel_topo,
+    mc_se_idx,
+    data_se_idx,
+    mc_il,
+    data_il,
+    truth_cat_at_topo,
+    pot_scale_to_data,
+    data_total_pot,
+    cov_results,
+    cv_results,
+    var_cfgs,
+    chi2_text_fn,
+    savefig_fn,
+    title=r'SBND $\nu_e$ CC Inclusive',
+    display_cats=None,
+    stage_label='After topology cut',
+    data_label='On-beam data',
+    plot_dir='plots_syst',
+):
+    """
+    Plot stacked MC + syst band + data for leading-electron selection variables.
+
+    Variables and their cut thresholds are defined internally here and in
+    nue_selection.py — do not hardcode thresholds in notebooks.
+
+    Parameters
+    ----------
+    mc_evtdf         : MC particle-level df (reco columns needed)
+    data_evtdf       : data particle-level df (patched vertex names)
+    sel_topo         : interaction-level selection df (from syst notebook)
+    mc_se_idx        : MC interaction index at topology stage
+    data_se_idx      : data interaction index at topology stage
+    mc_il            : MC groupby interaction levels
+    data_il          : data groupby interaction levels
+    truth_cat_at_topo: pd.Series — truth category aligned to mc_se_idx
+    pot_scale_to_data: float — MC POT scale to match data POT
+    data_total_pot   : float — data total POT (for plot label)
+    cov_results      : dict from syst notebook (covariance matrices)
+    cv_results       : dict from syst notebook (CV histograms)
+    var_cfgs         : list of VarConfig from syst notebook (for cov bin centers)
+    chi2_text_fn     : chi2_text function (pass chi2_text from syst notebook)
+    savefig_fn       : savefig function (pass savefig from syst notebook)
+    title            : plot title prefix
+    display_cats     : list of truth categories to display (default 0-6)
+    stage_label      : string for plot title suffix
+    data_label       : legend label for data points
+    plot_dir         : output directory (passed to savefig_fn)
+    """
+    import nue_selection as ns
+
+    if display_cats is None:
+        display_cats = [0, 1, 2, 3, 4, 5, 6]
+
+    _labels = [CAT_LABELS[c] for c in display_cats]
+    _colors = [CAT_COLORS[c] for c in display_cats]
+
+    # ── Variable definitions — thresholds pulled from nue_selection.py ───────
+    # Format: name → (col_key, xlabel, bins, cut_value, cut_dir)
+    # cut_dir: '<' means keep below, '>' means keep above
+    # ── _mat helper (local to this function) ─────────────────────────────────
+    def _mat(block):
+        return block.get('cov', block) if isinstance(block, dict) else block
+    
+    # ── Variable definitions ──────────────────────────────────────────────────
+    # Format: name → (col_key, xlabel, bins, cut_val, cut_dir)
+    # cut_val/cut_dir: None means no threshold line
+    EXTRA_VARS = {
+        "pid_score": (
+            ('pid_scores', 'I1'),
+            "Leading electron PID score",
+            np.linspace(0, 1, 41),
+            ns.THRESH_PID_SCORE, '>',
+        ),
+        "primary_score": (
+            ('primary_scores', 'I1'),
+            "Leading electron primary score",
+            np.linspace(0, 1, 41),
+            ns.THRESH_PRIMARY_SCORE, '>',
+        ),
+        "vertex_dist": (
+            ('vertex_distance', ''),
+            "Vertex distance [cm]",
+            np.linspace(0, 20, 41),
+            ns.THRESH_VERTEX_DIST, '<',
+        ),
+        "calo_ke": (
+            ('calo_ke', ''),
+            "Leading electron calo KE [MeV]",
+            np.linspace(0, 2000, 41),
+            None, None,
+        ),
+    }
+
+    # Pull actual threshold values from nue_selection.py source directly
+    # These must stay in sync with shower_qual_cuts() in nue_selection.py
+    _CUT_THRESHOLDS = {
+        "pid_score":     (ns.shower_qual_cuts.__wrapped__  # fallback below
+                          if hasattr(ns.shower_qual_cuts, '__wrapped__') else None,
+                          ns.THRESH_PID_SCORE, '>'),
+        "primary_score": (None, ns.THRESH_PRIMARY_SCORE,  '>'),
+        "vertex_dist":   (None, ns.THRESH_VERTEX_DIST,   '<'),
+    }
+
+    # ── Helper: extract leading-electron variable ─────────────────────────────
+    def _get_var(evtdf_in, col_key, stage_idx, il):
+        rp_df   = reco_particles(evtdf_in)._df
+        ke_col  = ('ke','')  if ('ke','')  in rp_df.columns else 'ke'
+        pid_col = ('pid','') if ('pid','') in rp_df.columns else 'pid'
+        inter_idx = rp_df.index.droplevel(-1)
+        in_stage  = inter_idx.isin(stage_idx)
+        ele = rp_df[in_stage & (rp_df[pid_col] == 1)]
+        if ele.empty:
+            return pd.Series(dtype=float)
+        if col_key not in ele.columns:
+            import warnings
+            warnings.warn(f"plot_extra_selection_vars: {col_key!r} not found")
+            return pd.Series(dtype=float)
+        lead_idx = ele[ke_col].groupby(level=il).idxmax().dropna()
+        if lead_idx.empty:
+            return pd.Series(dtype=float)
+        lead_mi = pd.MultiIndex.from_tuples(lead_idx.values, names=ele.index.names)
+        vals = ele.loc[lead_mi, col_key]
+        vals.index = lead_idx.index
+        return vals
+
+    def _by_cat(var_series, cat):
+        mask   = (truth_cat_at_topo == cat)
+        common = var_series.index.intersection(mask.index)
+        return var_series.loc[common][mask.loc[common]].dropna().values
+
+    # ── Fractional systematic uncertainty (from reco_ke covariance) ───────────
+    covs_ke      = cov_results['reco_ke']
+    total_var_ke = sum(np.diag(_mat(covs_ke[s]['cov_ms_ms'])).clip(0)
+                       for s in covs_ke)
+    cv_ke        = cv_results['reco_ke']
+    frac_cv_ke   = np.where(cv_ke['sig_cv'] > 0,
+                            np.sqrt(total_var_ke.clip(0)) / cv_ke['sig_cv'], 0.0)
+    ke_cov_centers = var_cfgs[0].bin_centers   # reco_ke bin centers
+
+    def _mat_local(block):
+        return block.get('cov', block) if isinstance(block, dict) else block
+
+    # Re-bind _mat to local version in case it's not in scope
+    _mat = _mat_local
+
+    # ── Loop ─────────────────────────────────────────────────────────────────
+    for var_name, var_spec in EXTRA_VARS.items():
+        col_key, xlabel, bins = var_spec[0], var_spec[1], var_spec[2]
+        # threshold info
+        if len(var_spec) == 5:
+            cut_val, cut_dir = var_spec[3], var_spec[4]
+        else:
+            cut_val, cut_dir = None, None
+
+        mc_var   = _get_var(mc_evtdf,   col_key, mc_se_idx,   mc_il)
+        data_var = _get_var(data_evtdf, col_key, data_se_idx, data_il)
+
+        print(f"{var_name}: MC={mc_var.notna().sum():,}  "
+              f"Data={data_var.notna().sum():,}")
+
+        if mc_var.empty and data_var.empty:
+            print(f"  Skipping {var_name} — no events")
+            continue
+
+        bins_arr = np.asarray(bins)
+        centers  = 0.5 * (bins_arr[:-1] + bins_arr[1:])
+
+        # Total MC histogram
+        total_mc = np.zeros(len(centers))
+        for cat in display_cats:
+            cat_vals = _by_cat(mc_var, cat)
+            v, _ = np.histogram(cat_vals, bins=bins_arr,
+                                weights=np.full(len(cat_vals), pot_scale_to_data))
+            total_mc += v
+
+        # Syst band (interpolated from reco_ke covariance)
+        frac_disp = np.interp(centers, ke_cov_centers, frac_cv_ke,
+                              left=frac_cv_ke[0], right=frac_cv_ke[-1])
+        unc_disp  = frac_disp * total_mc
+
+        # Plot
+        fig, ax = plt.subplots(figsize=(8, 6))
+        plot_stacked_hist(
+            series_list=[_by_cat(mc_var, c) for c in display_cats],
+            labels=_labels, colors=_colors,
+            bins=bins_arr,
+            weights=pot_scale_to_data,
+            xlabel=xlabel,
+            title=fr'{title} ({stage_label})',
+            pot_label=f'Data POT: {data_total_pot:.2e}',
+            ax=ax,
+            invert_stack_order=True,
+            show_counts=True,
+            show_percentage=True,
+            data_series=data_var.dropna().values,
+            data_label=data_label,
+        )
+
+        # Syst band
+        bw = np.diff(bins_arr)
+        ax.bar(bins_arr[:-1], 2 * unc_disp, bottom=total_mc - unc_disp,
+               width=bw, align='edge', alpha=0.3, color='gray',
+               hatch='///', label='Syst. unc.', linewidth=0)
+
+        # Cut threshold line
+        if cut_val is not None:
+            ax.axvline(cut_val, color='red', linestyle='--', linewidth=1.5,
+                       label=f'Cut: {">" if cut_dir == ">" else "<"}{cut_val}')
+
+        # Chi2
+        data_arr = data_var.dropna().values
+        if len(data_arr) > 0:
+            data_counts, _ = np.histogram(data_arr, bins=bins_arr)
+            cov_disp = np.diag(total_mc + (frac_disp * total_mc)**2)
+            chi2_str = chi2_text_fn(data_counts.astype(float), total_mc, cov_disp)
+            ax.text(0.02, 0.80, chi2_str,
+                    transform=ax.transAxes, fontsize=9, color='gray')
+
+        handles, lbls = ax.get_legend_handles_labels()
+        ax.legend(handles, lbls, fontsize=7, ncol=2, loc='upper right',
+                  frameon=True, framealpha=0.85, edgecolor='none')
+        fig.tight_layout()
+        savefig_fn(fig, f'{var_name}_topo_syst_data')
+
+    print(f'Extra variable plots -> {plot_dir}/')
     
 def save_plot(name, fig=None, folder_name="plots", dpi=150):
     import os
