@@ -89,7 +89,8 @@ THRESH_DIR_SPREAD    = 0.199
 THRESH_AXIAL_SPREAD  = 0.02
 THRESH_DEDX          = 7.6
 
-
+THRESH_SB_DEDX_LO = 3.0   # MeV/cm — sideband dE/dx lower bound
+THRESH_SB_DEDX_HI = 6.0   # MeV/cm — sideband dE/dx upper bound
 
 # ── Fiducial volume ───────────────────────────────────────────────────────────
 

@@ -844,6 +844,23 @@ def make_nuecc_wgtdf(f):
         warnings.warn(f"make_nuecc_wgtdf: extra xsec failed — {e}")
     _force_free()
 
+    try:
+        from makedf import g4syst as g4syst_mod
+        g4_wgt = g4syst_mod.g4syst(f, presel_ind)
+        if g4_wgt is not None and not g4_wgt.empty:
+            print(f"  G4: {g4_wgt.shape[1]} cols, {len(g4_wgt)} rows  "
+                  f"({g4_wgt.memory_usage(deep=True).sum()/1e9:.3f} GB)")
+            if out is None:
+                out = g4_wgt
+            else:
+                out = multicol_concat(out, g4_wgt)
+                del g4_wgt
+        elif g4_wgt is not None:
+            del g4_wgt
+    except Exception as e:
+        warnings.warn(f"make_nuecc_wgtdf: G4 failed — {e}")
+    _force_free()
+
     del presel_ind, presel_mcdf_index
     gc.collect()
 
