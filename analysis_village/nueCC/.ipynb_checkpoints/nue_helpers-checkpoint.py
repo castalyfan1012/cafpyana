@@ -79,7 +79,8 @@ CAT_COLORS = {
     4:  "#E69F00",   # other numuCC
     5:  "#CC79A7",   # NC other
     6:  "#F0E442",   # cosmic
-    7:  "#BDBDBD",   # offbeam
+    7:  "#BDBDBD",   # offbeam  
+    9:  "#D2691E",   # dirt nu   
    -1:  "#7F7F7F",   # unknown
 }
 CAT_LABELS = {
@@ -90,7 +91,8 @@ CAT_LABELS = {
     4:  r"Other $\nu_\mu$ CC",
     5:  r"Other $\nu$ NC",
     6:  r"Cosmic",
-    7:  r"Offbeam",
+    7:  r"Offbeam",  
+    9:  r"Dirt $\nu$", 
    -1:  r"Unknown",
 }
 
@@ -954,79 +956,97 @@ def plot_extra_selection_vars(mc_evtdf, data_evtdf, sel_topo,
                               data_label='On-beam data',
                               plot_dir='plots_syst',
                               offbeam_shower_vars=None,
-                              offbeam_weight=None):
+                              offbeam_weight=None,
+                              dirt_evtdf=None,
+                              dirt_se_idx=None,
+                              dirt_il=None,
+                              dirt_weight=None):
     import nue_selection as _ns
     if display_cats is None:
-        display_cats = [0, 1, 2, 3, 4, 5, 6]
-
-    _labels = [CAT_LABELS[c] for c in display_cats]
-    _colors = [CAT_COLORS[c] for c in display_cats]
+        display_cats = [0,1,2,3,4,5,6]
 
     def _mat(block):
         return block.get('cov', block) if isinstance(block, dict) else block
 
     EXTRA_VARS = {
-        "pid_score":    (('pid_scores','I1'),     "Leading electron PID score",
-                          np.linspace(0,1,41),    _ns.THRESH_PID_SCORE,     '>'),
+        "pid_score":    (('pid_scores','I1'), "Leading electron PID score",
+                          np.linspace(0,1,41), _ns.THRESH_PID_SCORE, '>'),
         "primary_score":(('primary_scores','I1'), "Leading electron primary score",
-                          np.linspace(0,1,41),    _ns.THRESH_PRIMARY_SCORE, '>'),
-        "vertex_dist":  (('vertex_distance',''),  "Vertex distance [cm]",
-                          np.linspace(0,20,41),   _ns.THRESH_VERTEX_DIST,   '<'),
-        "calo_ke":      (('calo_ke',''),           "Leading electron calo KE [MeV]",
+                          np.linspace(0,1,41), _ns.THRESH_PRIMARY_SCORE, '>'),
+        "vertex_dist":  (('vertex_distance',''), "Vertex distance [cm]",
+                          np.linspace(0,20,41), _ns.THRESH_VERTEX_DIST, '<'),
+        "calo_ke":      (('calo_ke',''), "Leading electron calo KE [MeV]",
                           np.linspace(0,2000,41), None, None),
     }
 
     def _get_var(evtdf_in, col_key, stage_idx, il):
-        rp_df   = reco_particles(evtdf_in)._df
-        ke_col  = ('ke','')  if ('ke','')  in rp_df.columns else 'ke'
+        rp_df = reco_particles(evtdf_in)._df
+        ke_col  = ('ke','') if ('ke','') in rp_df.columns else 'ke'
         pid_col = ('pid','') if ('pid','') in rp_df.columns else 'pid'
-        ele = rp_df[rp_df.index.droplevel(-1).isin(stage_idx) & (rp_df[pid_col] == 1)]
+
+        ele = rp_df[rp_df.index.droplevel(-1).isin(stage_idx) &
+                    (rp_df[pid_col] == 1)]
+
         if ele.empty or col_key not in ele.columns:
             return pd.Series(dtype=float)
+
         lead_idx = ele[ke_col].groupby(level=il).idxmax().dropna()
-        if lead_idx.empty: return pd.Series(dtype=float)
-        lead_mi = pd.MultiIndex.from_tuples(lead_idx.values, names=ele.index.names)
-        vals = ele.loc[lead_mi, col_key]; vals.index = lead_idx.index
+        if lead_idx.empty:
+            return pd.Series(dtype=float)
+
+        lead_mi = pd.MultiIndex.from_tuples(lead_idx.values,
+                                            names=ele.index.names)
+        vals = ele.loc[lead_mi, col_key]
+        vals.index = lead_idx.index
         return vals
 
     def _by_cat(var_series, cat):
-        mask   = (truth_cat_at_topo == cat)
+        mask = (truth_cat_at_topo == cat)
         common = var_series.index.intersection(mask.index)
         return var_series.loc[common][mask.loc[common]].dropna().values
 
-    covs_ke      = cov_results['reco_ke']
-    total_var_ke = sum(np.diag(_mat(covs_ke[s]['cov_ms_ms'])).clip(0) for s in covs_ke)
-    cv_ke        = cv_results['reco_ke']
-    frac_cv_ke   = np.where(cv_ke['sig_cv'] > 0,
-                            np.sqrt(total_var_ke.clip(0)) / cv_ke['sig_cv'], 0.0)
+    covs_ke = cov_results['reco_ke']
+    total_var_ke = sum(np.diag(_mat(covs_ke[s]['cov_ms_ms'])).clip(0)
+                       for s in covs_ke)
+    cv_ke = cv_results['reco_ke']
+    frac_cv_ke = np.where(cv_ke['sig_cv'] > 0,
+                          np.sqrt(total_var_ke.clip(0))/cv_ke['sig_cv'],
+                          0.0)
+
     ke_cov_centers = var_cfgs[0].bin_centers
 
     for var_name, var_spec in EXTRA_VARS.items():
-        col_key, xlabel, bins = var_spec[0], var_spec[1], var_spec[2]
-        cut_val = var_spec[3] if len(var_spec) == 5 else None
-        cut_dir = var_spec[4] if len(var_spec) == 5 else None
+        col_key, xlabel, bins = var_spec[:3]
+        cut_val = var_spec[3]
+        cut_dir = var_spec[4]
 
-        mc_var   = _get_var(mc_evtdf,   col_key, mc_se_idx,   mc_il)
+        mc_var = _get_var(mc_evtdf, col_key, mc_se_idx, mc_il)
         data_var = _get_var(data_evtdf, col_key, data_se_idx, data_il)
-        print(f"{var_name}: MC={mc_var.notna().sum():,}  Data={data_var.notna().sum():,}")
-        if mc_var.empty and data_var.empty:
+
+        dirt_var = pd.Series(dtype=float)
+        if dirt_evtdf is not None and dirt_se_idx is not None:
+            dirt_var = _get_var(dirt_evtdf, col_key, dirt_se_idx, dirt_il)
+
+        print(f"{var_name}: MC={mc_var.notna().sum():,}  "
+              f"Data={data_var.notna().sum():,}  "
+              f"Dirt={dirt_var.notna().sum():,}")
+
+        if mc_var.empty and data_var.empty and dirt_var.empty:
             continue
 
         bins_arr = np.asarray(bins)
-        centers  = 0.5 * (bins_arr[:-1] + bins_arr[1:])
-        total_mc = np.zeros(len(centers))
-        for cat in display_cats:
-            v, _ = np.histogram(_by_cat(mc_var, cat), bins=bins_arr,
-                                weights=np.full(len(_by_cat(mc_var, cat)), pot_scale_to_data))
-            total_mc += v
-        frac_disp = np.interp(centers, ke_cov_centers, frac_cv_ke,
-                              left=frac_cv_ke[0], right=frac_cv_ke[-1])
-        unc_disp  = frac_disp * total_mc
+        centers = 0.5*(bins_arr[:-1]+bins_arr[1:])
+
+        frac_disp = np.interp(centers,
+                              ke_cov_centers,
+                              frac_cv_ke,
+                              left=frac_cv_ke[0],
+                              right=frac_cv_ke[-1])
 
         offbeam_vals = None
         if offbeam_shower_vars is not None:
             offbeam_vals = offbeam_shower_vars.get(var_name, None)
-        
+
         fig = plot_unblinding_var(
             mc_vals=mc_var,
             data_vals=data_var.dropna().values,
@@ -1039,6 +1059,8 @@ def plot_extra_selection_vars(mc_evtdf, data_evtdf, sel_topo,
             frac_unc_per_bin=frac_disp,
             offbeam_vals=offbeam_vals,
             offbeam_weight=offbeam_weight,
+            dirt_vals=dirt_var.dropna().values,
+            dirt_weight=dirt_weight,
             display_cats=display_cats,
             savefig_fn=savefig_fn,
             filename=f'{var_name}_topo_syst_data',
@@ -1087,6 +1109,7 @@ def plot_unblinding_var(mc_vals, data_vals, truth_cat, bins, xlabel,
                         stage_name, pot_scale_data, data_pot,
                         frac_unc_per_bin=None,
                         offbeam_vals=None, offbeam_weight=None,
+                        dirt_vals=None, dirt_weight=None,
                         display_cats=None, savefig_fn=None, filename=None,
                         cut_val=None, cut_dir=None, save_subdir='unblinding'):
     """
@@ -1116,18 +1139,49 @@ def plot_unblinding_var(mc_vals, data_vals, truth_cat, bins, xlabel,
     labels_plot  = [CAT_LABELS[c] for c in mc_cats]
     colors_plot  = [CAT_COLORS[c] for c in mc_cats]
 
-    ob_hist = np.zeros(n_bins)
+    # Histograms for additional components
+    ob_hist   = np.zeros(n_bins)
+    dirt_hist = np.zeros(n_bins)
+
+    # Add offbeam
     if offbeam_vals is not None and offbeam_weight is not None:
         ob_clean = np.asarray(offbeam_vals, dtype=float)
         ob_clean = ob_clean[~np.isnan(ob_clean)]
+
         if len(ob_clean) > 0:
-            ob_hist, _ = np.histogram(ob_clean, bins=bins_arr,
-                                      weights=np.full(len(ob_clean), offbeam_weight))
             series_list.append(ob_clean)
-            weights_list.append(np.full(len(ob_clean), offbeam_weight))
+            weights_list.append(
+                np.full(len(ob_clean), offbeam_weight)
+            )
             labels_plot.append(CAT_LABELS[7])
             colors_plot.append(CAT_COLORS[7])
 
+            ob_hist, _ = np.histogram(
+                ob_clean,
+                bins=bins_arr,
+                weights=np.full(len(ob_clean), offbeam_weight)
+            )
+
+
+    # Add lowE dirt ν
+    if dirt_vals is not None and dirt_weight is not None:
+        dirt_clean = np.asarray(dirt_vals, dtype=float)
+        dirt_clean = dirt_clean[~np.isnan(dirt_clean)]
+
+        if len(dirt_clean) > 0:
+            series_list.append(dirt_clean)
+            weights_list.append(
+                np.full(len(dirt_clean), dirt_weight)
+            )
+            labels_plot.append(CAT_LABELS[9])
+            colors_plot.append(CAT_COLORS[9])
+
+            dirt_hist, _ = np.histogram(
+                dirt_clean,
+                bins=bins_arr,
+                weights=np.full(len(dirt_clean), dirt_weight)
+            )
+            
     plot_stacked_hist(
         series_list=series_list, labels=labels_plot, colors=colors_plot,
         bins=bins_arr, weights=weights_list, xlabel='',
@@ -1145,6 +1199,7 @@ def plot_unblinding_var(mc_vals, data_vals, truth_cat, bins, xlabel,
                                             pot_scale_data))
         total_mc += v
     total_mc += ob_hist
+    total_mc += dirt_hist
 
     # Syst band
     frac = None
@@ -1170,7 +1225,7 @@ def plot_unblinding_var(mc_vals, data_vals, truth_cat, bins, xlabel,
         dc, _ = np.histogram(np.asarray(data_vals, dtype=float), bins=bins_arr)
         dcf   = dc.astype(float)
         cov   = np.diag(np.where(dcf > 0, dcf, 1.0))       # data stat
-        cov  += np.diag(ob_hist)                             # offbeam stat
+        cov  += np.diag(ob_hist + dirt_hist)
         if frac is not None:
             cov += np.diag((frac * total_mc)**2)             # syst
 
