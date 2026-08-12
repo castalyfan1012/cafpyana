@@ -3,28 +3,35 @@ make_detsys_histdf.py
 ---------------------
 Lightweight det-sys histogram extractor for combined flat CAFs.
 
-Selection applied (matching nue_selection.py):
-  1. FM + reco FV          (matches passed_presel in make_nueCC_df.py)
-  2. is_primary == 1       (primary particle)
-  3. pid == 1              (electron candidate; SPINE PID: 0=photon,1=electron,
-                            2=muon,3=pion,4=proton,5=kaon)
-  4. primary_scores.0 > PRIMARY_SCORE_CUT   (shower-like primary score)
-  5. pid_scores.1 > PID_SCORE_CUT           (electron PID score, index 1)
-  6. ke > ELECTRON_THRESHOLD_MEV            (above 75 MeV threshold)
+Selection applied (matching nue_selection.py shower_qual_cuts):
+  1. FM + reco FV
+  2. pid == 1              (electron candidate)
+  3. primary_scores.1 > PRIMARY_SCORE_CUT   (primary score — INDEX 1, not 0!)
+  4. pid_scores.1 > PID_SCORE_CUT           (electron PID score — index 1)
+  5. ke > ELECTRON_THRESHOLD_MEV            (above 75 MeV threshold)
 
-Confirmed available branches (from check_detsys.py output):
-  pid, pid_scores.0-.5, primary_scores.0-.1, is_primary,
-  momentum.0/.1/.2, start_dir.0/.1/.2, ke, vertex_distance (all NaN)
+NOTE: `is_primary == 1` is NOT required here. In the nominal pipeline,
+nue_selection.primary_electron_mask uses is_primary, but in Jacob's
+data-mode wiremod CAFs, is_primary==1 & pid==1 barely overlap (4/8681
+in 200 entries). The score-based cuts already select primary-like
+electron candidates. This is acceptable for det-var shape studies.
+
+Column index mapping (flat CAF ↔ cafpyana MultiIndex):
+  primary_scores.0 ↔ ('primary_scores', 'I0')  ← NOT the primary score
+  primary_scores.1 ↔ ('primary_scores', 'I1')  ← THIS is the primary score
+  pid_scores.0     ↔ ('pid_scores', 'I0')      ← photon score
+  pid_scores.1     ↔ ('pid_scores', 'I1')      ← electron score ✓
+
+CRITICAL: reco_p is computed from calorimetric KE, NOT momentum.* branches.
 """
 
-import warnings
 import numpy as np
 import pandas as pd
 import uproot
 import awkward as ak
 
 # ── Selection constants — match nue_selection.py exactly ─────────────────────
-PRIMARY_SCORE_CUT      = 0.99    # primary_scores.0 threshold
+PRIMARY_SCORE_CUT      = 0.99    # primary_scores.1 threshold (I1 in cafpyana)
 PID_SCORE_CUT          = 0.915   # pid_scores.1 (electron) threshold
 ELECTRON_THRESHOLD_MEV = 75.0    # minimum KE [MeV]
 PID_ELECTRON           = 1       # SPINE PID index for electron
@@ -43,23 +50,16 @@ def _fv(vx, vy, vz):
     )
 
 
+def _reco_p_from_ke(ke_mev):
+    """Compute reco momentum from calorimetric KE: p = sqrt((KE+m)^2 - m^2)."""
+    total_e = ke_mev + M_ELECTRON_MEV
+    return np.sqrt(total_e**2 - M_ELECTRON_MEV**2)
+
+
 def make_nuecc_detsys_seldf(path, verbose=True):
     """
     Read a det-var combined flat CAF and return a DataFrame with one row
-    per selected electron candidate, with reco_p and reco_costheta.
-
-    The flat CAF structure:
-      - Interaction-level branches: 116420 * var * dtype
-        (jagged per entry; one list per event = interactions in that event)
-      - Particle-level branches:    116420 * var * dtype
-        (jagged per entry; one list per event = ALL particles in that event,
-        not separated by interaction — this is a flat CAF artifact)
-
-    Strategy:
-      1. Apply FM+FV on interactions → find passing entries
-      2. Among particles in passing entries, apply shower quality cuts
-         (is_primary, pid==electron, primary_score, pid_score, ke threshold)
-      3. Take the highest-KE electron candidate per entry as the shower proxy
+    per selected electron candidate, with reco_ke and reco_costheta.
 
     Parameters
     ----------
@@ -84,7 +84,6 @@ def make_nuecc_detsys_seldf(path, verbose=True):
     passed_fv  = _fv(vx, vy, vz)
     sel_inter  = passed_fm & passed_fv
 
-    # Map interaction-level selection to entry-level
     inter_counts   = ak.to_numpy(
         ak.num(rec["rec.dlp.is_flash_matched"].array(), axis=1)
     )
@@ -99,26 +98,28 @@ def make_nuecc_detsys_seldf(path, verbose=True):
         print(f"    Pass FM+FV         : {sel_inter.sum():,}")
         print(f"    Entries with >=1 FM+FV interaction: {len(passing_entries):,}")
 
+    if len(passing_entries) == 0:
+        if verbose:
+            print("    No passing entries — returning empty DataFrame")
+        return pd.DataFrame(columns=["reco_p", "reco_costheta", "reco_ke"])
+
     # ── Step 2: Load particle-level branches for passing entries ──────────────
-    # All particle branches are 116420 * var * dtype (per-entry, not per-interaction)
     def load_part(branch):
         return rec[branch].array()[passing_entries]
 
-    is_primary  = load_part("rec.dlp.particles.is_primary")
     pid         = load_part("rec.dlp.particles.pid")
-    pri_score   = load_part("rec.dlp.particles.primary_scores.0")
+    # CRITICAL: use primary_scores.1 (= I1 in cafpyana = primary probability)
+    #           NOT primary_scores.0 (= I0 = secondary probability)
+    pri_score   = load_part("rec.dlp.particles.primary_scores.1")
     pid_score_e = load_part("rec.dlp.particles.pid_scores.1")   # electron score
     ke          = load_part("rec.dlp.particles.ke")
-    px          = load_part("rec.dlp.particles.momentum.0")
-    py          = load_part("rec.dlp.particles.momentum.1")
-    pz          = load_part("rec.dlp.particles.momentum.2")
     sdz         = load_part("rec.dlp.particles.start_dir.2")    # cos(theta)
 
-    pmag = np.sqrt(px**2 + py**2 + pz**2)
-
-    # ── Step 3: Shower quality cuts — match nue_selection.py ──────────────────
+    # ── Step 3: Electron selection — NO is_primary requirement ────────────────
+    # In data-mode wiremod CAFs, is_primary==1 & pid==1 barely overlap.
+    # The score cuts (primary_scores.1 > 0.99) already select primary-like
+    # candidates, which is sufficient for det-var shape studies.
     electron_mask = (
-        (is_primary == 1) &
         (pid == PID_ELECTRON) &
         (pri_score > PRIMARY_SCORE_CUT) &
         (pid_score_e > PID_SCORE_CUT) &
@@ -127,17 +128,32 @@ def make_nuecc_detsys_seldf(path, verbose=True):
 
     n_with_electron = ak.to_numpy(ak.any(electron_mask, axis=1)).sum()
     if verbose:
+        # Diagnostic: show where candidates are lost
+        m_pid  = (pid == PID_ELECTRON)
+        m_pri  = m_pid & (pri_score > PRIMARY_SCORE_CUT)
+        m_pids = m_pri & (pid_score_e > PID_SCORE_CUT)
+        m_ke   = m_pids & (ke > ELECTRON_THRESHOLD_MEV)
+        print(f"    Particle selection chain:")
+        print(f"      pid==1 (electron)      : {int(ak.sum(ak.flatten(m_pid, axis=None))):,} particles")
+        print(f"      + primary_scores.1>0.99: {int(ak.sum(ak.flatten(m_pri, axis=None))):,} particles")
+        print(f"      + pid_scores.1>0.915   : {int(ak.sum(ak.flatten(m_pids, axis=None))):,} particles")
+        print(f"      + ke>75 MeV            : {int(ak.sum(ak.flatten(m_ke, axis=None))):,} particles")
         print(f"    Entries with >=1 electron candidate: {n_with_electron:,}")
 
+    if n_with_electron == 0:
+        if verbose:
+            print("    No electron candidates — returning empty DataFrame")
+        return pd.DataFrame(columns=["reco_p", "reco_costheta", "reco_ke"])
+
     # ── Step 4: Leading electron candidate per entry (highest KE) ─────────────
-    # Replace non-electron ke with -inf so argmax selects only electrons
     ke_electron = ak.where(electron_mask, ke, -np.inf)
     lead_idx    = ak.argmax(ke_electron, axis=1, keepdims=True)
 
-    # Extract leading particle kinematics
     lead_ke   = ak.to_numpy(ak.flatten(ke[lead_idx],   axis=None))
-    lead_pmag = ak.to_numpy(ak.flatten(pmag[lead_idx], axis=None))
     lead_cos  = ak.to_numpy(ak.flatten(sdz[lead_idx],  axis=None))
+
+    # Compute reco_p from calorimetric KE (NOT from momentum.* branches)
+    lead_pmag = _reco_p_from_ke(lead_ke)
 
     # Keep only entries where a valid electron candidate was found
     has_electron = ak.to_numpy(ak.any(electron_mask, axis=1))
