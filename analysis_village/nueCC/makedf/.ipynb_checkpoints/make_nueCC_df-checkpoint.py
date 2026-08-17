@@ -99,6 +99,11 @@ MUON_THRESHOLD_MEV     = 50.0
 PID_ELECTRON           = 1
 PID_MUON               = 2
 
+# ── Vertex coordinate I0/I1/I2 → x/y/z mapping ──────────────────────────────
+# SPINE data-mode CAFs store reco vertex as I0/I1/I2 instead of x/y/z.
+# This mapping ensures both MC and data use the same geometric FV cut.
+_COORD_IDX_MAP = {'x': 'I0', 'y': 'I1', 'z': 'I2'}
+
 # ── Module-level caches (one SPINE load shared across all DFS makers per file)
 _spine_cache      = {}
 _spine_data_cache = {}
@@ -279,6 +284,59 @@ def _safe(fn, *args, **kwargs):
         return None
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# FIX: Vertex column lookup that handles both x/y/z and I0/I1/I2 naming
+# ══════════════════════════════════════════════════════════════════════════════
+# Data-mode SPINE CAFs store reco vertex coordinates as I0/I1/I2 instead of
+# x/y/z. The old code's _find_col_ends(df, "vertex", "x") silently failed for
+# data, causing _apply_presel and _build_truth_info to fall back to the
+# is_fiducial flag — which uses a DIFFERENT FV boundary than the geometric
+# _fiducial_cut_tmp.  This produced an MC/data selection inconsistency visible
+# as missing data events near the FV boundary (|x|≈190, |y|≈190, z≈10).
+#
+# The helper below tries the canonical name first, then the I0/I1/I2 fallback,
+# ensuring the same geometric FV is applied to both MC and data.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _find_vertex_col(df, coord, branch_kw=None):
+    """
+    Find the vertex coordinate column for 'x', 'y', or 'z'.
+
+    Tries ("vertex", "x") first, then ("vertex", "I0") as fallback.
+    Works for both reco (branch_kw=None or branch_must_not_contain)
+    and truth (branch_kw=BRANCH_TRUE via branch_must_contain).
+
+    Parameters
+    ----------
+    df       : DataFrame to search
+    coord    : 'x', 'y', or 'z'
+    branch_kw: None  → no constraint
+               str   → if starts with '!' → branch_must_not_contain (reco)
+                        otherwise          → branch_must_contain (truth)
+
+    Returns
+    -------
+    column key or None
+    """
+    kw = {}
+    if branch_kw is not None:
+        if branch_kw.startswith('!'):
+            kw['branch_must_not_contain'] = branch_kw[1:]
+        else:
+            kw['branch_must_contain'] = branch_kw
+
+    # Try canonical name: ("vertex", "x")
+    col = _safe(_find_col_ends, df, "vertex", coord, **kw)
+    if col is not None:
+        return col
+
+    # Fallback: ("vertex", "I0") for data-mode SPINE columns
+    idx_name = _COORD_IDX_MAP.get(coord)
+    if idx_name is not None:
+        col = _safe(_find_col_ends, df, "vertex", idx_name, **kw)
+    return col
+
+
 # ── Shared FM + FV preselection logic ─────────────────────────────────────────
 
 def _apply_presel(spine_df, flash_times_s=None):
@@ -323,13 +381,10 @@ def _apply_presel(spine_df, flash_times_s=None):
     else:
         passed_fm = pd.Series(False, index=idx)
 
-    # ── Reco FV ────────────────────────────────────────────────────────────
-    rvx_col  = _safe(_find_col_ends, spine_df, "vertex", "x",
-                     branch_must_not_contain=BRANCH_TRUE)
-    rvy_col  = _safe(_find_col_ends, spine_df, "vertex", "y",
-                     branch_must_not_contain=BRANCH_TRUE)
-    rvz_col  = _safe(_find_col_ends, spine_df, "vertex", "z",
-                     branch_must_not_contain=BRANCH_TRUE)
+    # ── Reco FV (fixed: tries x/y/z then I0/I1/I2) ───────────────────────
+    rvx_col = _find_vertex_col(spine_df, 'x', f'!{BRANCH_TRUE}')
+    rvy_col = _find_vertex_col(spine_df, 'y', f'!{BRANCH_TRUE}')
+    rvz_col = _find_vertex_col(spine_df, 'z', f'!{BRANCH_TRUE}')
     fv_r_col = _safe(_find_col, spine_df, "is_fiducial",
                      branch_must_not_contain=BRANCH_TRUE)
 
@@ -380,12 +435,13 @@ def _build_truth_info(spine_df, flash_times_s=None):
     fm_col   = _safe(_find_col, spine_df, "is_flash_matched",branch_must_not_contain=BRANCH_TRUE)
     pe_col   = _safe(_find_col, spine_df, "flash_total_pe",  branch_must_not_contain=BRANCH_TRUE)
 
-    tvx_col  = _safe(_find_col_ends, spine_df, "vertex", "x", branch_must_contain=BRANCH_TRUE)
-    tvy_col  = _safe(_find_col_ends, spine_df, "vertex", "y", branch_must_contain=BRANCH_TRUE)
-    tvz_col  = _safe(_find_col_ends, spine_df, "vertex", "z", branch_must_contain=BRANCH_TRUE)
-    rvx_col  = _safe(_find_col_ends, spine_df, "vertex", "x", branch_must_not_contain=BRANCH_TRUE)
-    rvy_col  = _safe(_find_col_ends, spine_df, "vertex", "y", branch_must_not_contain=BRANCH_TRUE)
-    rvz_col  = _safe(_find_col_ends, spine_df, "vertex", "z", branch_must_not_contain=BRANCH_TRUE)
+    # ── Vertex columns (fixed: tries x/y/z then I0/I1/I2) ────────────────
+    tvx_col = _find_vertex_col(spine_df, 'x', BRANCH_TRUE)
+    tvy_col = _find_vertex_col(spine_df, 'y', BRANCH_TRUE)
+    tvz_col = _find_vertex_col(spine_df, 'z', BRANCH_TRUE)
+    rvx_col = _find_vertex_col(spine_df, 'x', f'!{BRANCH_TRUE}')
+    rvy_col = _find_vertex_col(spine_df, 'y', f'!{BRANCH_TRUE}')
+    rvz_col = _find_vertex_col(spine_df, 'z', f'!{BRANCH_TRUE}')
 
     fv_t_col = _safe(_find_col, spine_df, "is_fiducial", branch_must_contain=BRANCH_TRUE)
     fv_r_col = _safe(_find_col, spine_df, "is_fiducial", branch_must_not_contain=BRANCH_TRUE)
@@ -462,6 +518,7 @@ def _build_truth_info(spine_df, flash_times_s=None):
     else:
         passed_fm = pd.Series(False, index=idx)
 
+    # ── Reco FV (fixed: tries x/y/z then I0/I1/I2) ───────────────────────
     if rvx_col and rvy_col and rvz_col:
         passed_fv_reco = _fiducial_cut_tmp(
             inter[rvx_col], inter[rvy_col], inter[rvz_col]
@@ -661,36 +718,6 @@ def make_nuecc_statsdf(f):
 
 
 # ── Public maker 4: wgtdf ────────────────────────────────────────────────────
-#
-# Root cause of the OOM (now fixed):
-# ─────────────────────────────────
-# The original getsyst.py loaded rec.mc.nu.wgt.univ for ALL nus in the file
-# at once via:
-#
-#   wgts = ak.to_dataframe(f["recTree"]['rec.mc.nu.wgt.univ'].arrays(...))
-#
-# For 13,297 nus x ~5,000 total universe weights = 66 million rows ~ 5-10 GB.
-# Added to spine_df RSS residual (~15 GB not yet released by glibc), this
-# pushes the grid job over 29 GB.
-#
-# evtdf avoids this because it never calls getsyst.  That's the ONLY
-# difference between evtdf (fits 29 GB) and wgtdf (OOM).
-#
-# Fix (two parts):
-# ──────────────────
-# 1. getsyst.py: replaced with Lynn's chunked version that reads weight data
-#    in 10 MB pieces. Peak from weight loading: ~50 MB instead of 5-10 GB.
-#    Crucially, it uses index-aligned .loc updates (not numpy broadcasting),
-#    so it correctly handles a SUBSET of nu indices without shape errors.
-#
-# 2. make_nuecc_wgtdf: now passes presel_ind (only the ~3,700 preselected nus)
-#    instead of full_ind (all 13,297 nus). Same approach as Lynn's pipeline.
-#    Output is already indexed correctly — no post-call slicing needed.
-#
-# Combined effect on memory:
-#   spine_df:    ~15-20 GB (same as evtdf — freed + malloc_trim before wgts)
-#   weight data: ~50 MB   (was 5-10 GB — chunked getsyst)
-#   Peak:        same as evtdf <- fits within 29 GB
 
 def make_nuecc_wgtdf(f):
     """
