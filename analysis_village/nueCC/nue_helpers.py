@@ -252,128 +252,6 @@ def pur_eff_binned(values, bins, sel_mask, sig_mask, weights=None):
     return centers, purs, effs, counts
 
 
-# ============================================================
-# Stacked histogram
-# ============================================================
-
-def plot_stacked_hist(series_list, labels, colors, bins, weights=None,
-                      xlabel="", ylabel="Events / bin", title="",
-                      density=False, ax=None, data_series=None,
-                      data_label="Data", pot_label="",
-                      invert_stack_order=False,
-                      show_counts=True, show_percentage=True,
-                      chi2_info=None, **hist_kw):
-    """
-    Stacked MC histogram with optional data overlay.
-
-    weights : None | scalar | list of arrays
-        None    → unweighted
-        scalar  → same weight for all categories
-        list    → per-category weight arrays (required when categories have
-                  different scales, e.g. MC + offbeam)
-    """
-    if ax is None:
-        fig, ax = plt.subplots(figsize=(8, 6))
-
-    # Normalise weights to a list of arrays
-    if weights is None:
-        _weights = [None] * len(series_list)
-    elif np.isscalar(weights):
-        _weights = [np.full(len(s), float(weights)) for s in series_list]
-    elif isinstance(weights, (list, tuple)):
-        if len(weights) != len(series_list):
-            raise ValueError("Length of weights must match series_list.")
-        _weights = [None if w is None else np.asarray(w, dtype=float)
-                    for w in weights]
-    else:
-        raise TypeError("weights must be None, a scalar, or a list of arrays.")
-
-    # Strip NaN keeping weights aligned
-    clean = []
-    for s, w in zip(series_list, _weights):
-        s    = np.asarray(s, dtype=float)
-        mask = ~np.isnan(s)
-        clean.append((s[mask], w[mask] if w is not None else None))
-
-    bins_arr = np.asarray(bins)
-
-    # Per-category totals for legend
-    cat_totals = []
-    for s, w in clean:
-        h, _ = np.histogram(s, bins=bins_arr, weights=w)
-        cat_totals.append(h.sum())
-    grand_total = sum(cat_totals)
-
-    # Annotated labels
-    annotated_labels = []
-    for lbl, tot in zip(labels, cat_totals):
-        parts = [lbl]
-        if show_counts or show_percentage:
-            inner = []
-            if show_counts:
-                inner.append(f"{tot:.1f}")
-            if show_percentage and grand_total > 0:
-                inner.append(f"{tot/grand_total:.1%}")
-            parts.append(f"({', '.join(inner)})")
-        annotated_labels.append(" ".join(parts))
-
-    if invert_stack_order:
-        x_list   = [c[0] for c in reversed(clean)]
-        w_list   = [c[1] for c in reversed(clean)]
-        ann_lbl  = list(reversed(annotated_labels))
-        col_list = list(reversed(colors))
-    else:
-        x_list   = [c[0] for c in clean]
-        w_list   = [c[1] for c in clean]
-        ann_lbl  = annotated_labels
-        col_list = list(colors)
-
-    weights_arg = None if all(w is None for w in w_list) else w_list
-
-    ax.hist(x_list, bins=bins_arr, weights=weights_arg,
-            label=ann_lbl, color=col_list,
-            stacked=True, histtype="stepfilled", density=density, **hist_kw)
-
-    if data_series is not None:
-        d = np.asarray(data_series, dtype=float)
-        d = d[~np.isnan(d)]
-        counts, _ = np.histogram(d, bins=bins_arr)
-        centers   = 0.5 * (bins_arr[:-1] + bins_arr[1:])
-        ax.errorbar(centers, counts, yerr=np.sqrt(counts),
-                    fmt="ko", markersize=4, label=data_label, zorder=10)
-
-    handles, legend_labels = ax.get_legend_handles_labels()
-    if invert_stack_order:
-        ax.legend(handles, legend_labels, fontsize=9, ncol=1,
-                  loc="upper right", frameon=True, framealpha=0.3, edgecolor="none")
-    else:
-        ax.legend(handles[::-1], legend_labels[::-1], fontsize=9, ncol=1,
-                  loc="upper right", frameon=True, framealpha=0.3, edgecolor="none")
-
-    ax.set_xlabel(xlabel, fontsize=12)
-    ax.set_ylabel(ylabel, fontsize=12)
-    ax.set_title(title)
-    if pot_label:
-        ax.text(0.02, 0.98, pot_label, transform=ax.transAxes,
-                va="top", ha="left", fontsize=10, color="gray")
-        ax.text(0.02, 0.93, f"Total MC events: {grand_total:.0f}",
-                transform=ax.transAxes, va="top", ha="left", fontsize=10, color="gray")
-    else:
-        ax.text(0.02, 0.98, f"Total MC events: {grand_total:.0f}",
-                transform=ax.transAxes, va="top", ha="left", fontsize=10, color="gray")
-
-    if chi2_info is not None:
-        annotate_chi2(ax,
-                      observed    = chi2_info['observed'],
-                      expected    = chi2_info['expected'],
-                      cov_matrix  = chi2_info.get('cov_matrix'),
-                      stat_errors = chi2_info.get('stat_errors'),
-                      label       = chi2_info.get('label', ''),
-                      loc         = chi2_info.get('loc', 'upper left'),
-                      fontsize    = chi2_info.get('fontsize', 10))
-
-    return ax.get_figure(), ax
-
 
 # ============================================================
 # 2D resolution / bias plot
@@ -1105,6 +983,183 @@ def _by_cat_generic(var_series, truth_cat_series, cat):
     return var_series.loc[common][mask.loc[common]].dropna().values
 
 
+# ============================================================
+# Stacked histogram
+# ============================================================
+
+def _best_legend_side(series_list, weights_list, bins_arr):
+    """
+    Return 'left' or 'right' depending on where the stacked histogram
+    has less area, so the legend can sit on the emptier side.
+    """
+    bins_arr = np.asarray(bins_arr, dtype=float)
+    total = np.zeros(len(bins_arr) - 1)
+    for s, w in zip(series_list, weights_list):
+        s = np.asarray(s, dtype=float)
+        mask = ~np.isnan(s)
+        if w is not None:
+            h, _ = np.histogram(s[mask], bins=bins_arr,
+                                weights=np.asarray(w, dtype=float)[mask])
+        else:
+            h, _ = np.histogram(s[mask], bins=bins_arr)
+        total += h
+ 
+    n = len(total)
+    if n == 0:
+        return 'right'
+ 
+    # Compare the peak height in each half
+    mid = n // 2
+    left_max  = total[:mid].max() if mid > 0 else 0
+    right_max = total[mid:].max() if mid < n else 0
+    return 'right' if right_max <= left_max else 'left'
+ 
+ 
+# ============================================================
+# Stacked histogram  (UPDATED)
+# ============================================================
+ 
+def _best_legend_side(series_list, weights_list, bins_arr):
+    bins_arr = np.asarray(bins_arr, dtype=float)
+    total = np.zeros(len(bins_arr) - 1)
+    for s, w in zip(series_list, weights_list):
+        s = np.asarray(s, dtype=float)
+        mask = ~np.isnan(s)
+        if w is not None:
+            h, _ = np.histogram(s[mask], bins=bins_arr,
+                                weights=np.asarray(w, dtype=float)[mask])
+        else:
+            h, _ = np.histogram(s[mask], bins=bins_arr)
+        total += h
+    n = len(total)
+    if n == 0:
+        return 'right'
+    mid = n // 2
+    left_max  = total[:mid].max() if mid > 0 else 0
+    right_max = total[mid:].max() if mid < n else 0
+    return 'right' if right_max <= left_max else 'left'
+ 
+ 
+def plot_stacked_hist(series_list, labels, colors, bins, weights=None,
+                      xlabel="", ylabel="Events / bin", title="",
+                      density=False, ax=None, data_series=None,
+                      data_label="Data", pot_label="",
+                      invert_stack_order=False,
+                      show_counts=True, show_percentage=True,
+                      chi2_info=None, **hist_kw):
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(8, 6))
+ 
+    if weights is None:
+        _weights = [None] * len(series_list)
+    elif np.isscalar(weights):
+        _weights = [np.full(len(s), float(weights)) for s in series_list]
+    elif isinstance(weights, (list, tuple)):
+        _weights = [None if w is None else np.asarray(w, dtype=float)
+                    for w in weights]
+    else:
+        raise TypeError("weights must be None, a scalar, or a list of arrays.")
+ 
+    clean = []
+    for s, w in zip(series_list, _weights):
+        s    = np.asarray(s, dtype=float)
+        mask = ~np.isnan(s)
+        clean.append((s[mask], w[mask] if w is not None else None))
+ 
+    bins_arr = np.asarray(bins)
+ 
+    cat_totals = []
+    for s, w in clean:
+        h, _ = np.histogram(s, bins=bins_arr, weights=w)
+        cat_totals.append(h.sum())
+    grand_total = sum(cat_totals)
+ 
+    annotated_labels = []
+    for lbl, tot in zip(labels, cat_totals):
+        parts = [lbl]
+        if show_counts or show_percentage:
+            inner = []
+            if show_counts:
+                inner.append(f"{tot:.1f}")
+            if show_percentage and grand_total > 0:
+                inner.append(f"{tot/grand_total:.1%}")
+            parts.append(f"({', '.join(inner)})")
+        annotated_labels.append(" ".join(parts))
+ 
+    # ── Stacking order ────────────────────────────────────────────────────
+    # When invert_stack_order=True the series are reversed for plotting
+    # so that the FIRST category in the input list ends up on TOP visually.
+    n_stack = len(clean)
+    if invert_stack_order:
+        x_list   = [c[0] for c in reversed(clean)]
+        w_list   = [c[1] for c in reversed(clean)]
+        plot_lbl = list(reversed(annotated_labels))
+        col_list = list(reversed(colors))
+    else:
+        x_list   = [c[0] for c in clean]
+        w_list   = [c[1] for c in clean]
+        plot_lbl = annotated_labels
+        col_list = list(colors)
+ 
+    weights_arg = None if all(w is None for w in w_list) else w_list
+ 
+    ax.hist(x_list, bins=bins_arr, weights=weights_arg,
+            label=plot_lbl, color=col_list,
+            stacked=True, histtype="stepfilled", density=density, **hist_kw)
+ 
+    if data_series is not None:
+        d = np.asarray(data_series, dtype=float)
+        d = d[~np.isnan(d)]
+        counts, _ = np.histogram(d, bins=bins_arr)
+        centers   = 0.5 * (bins_arr[:-1] + bins_arr[1:])
+        ax.errorbar(centers, counts, yerr=np.sqrt(counts),
+                    fmt="ko", markersize=4, label=data_label, zorder=10)
+ 
+    # ── Legend: always show categories in INPUT order ─────────────────────
+    handles, legend_labels = ax.get_legend_handles_labels()
+ 
+    if invert_stack_order and n_stack > 1:
+        # The first n_stack handles are in reversed order from plotting;
+        # flip them back so the legend reads in the original input order.
+        stack_h = handles[:n_stack][::-1]
+        stack_l = legend_labels[:n_stack][::-1]
+        rest_h  = handles[n_stack:]      # data, syst, etc.
+        rest_l  = legend_labels[n_stack:]
+        handles       = stack_h + rest_h
+        legend_labels = stack_l + rest_l
+ 
+    side = _best_legend_side(
+        [c[0] for c in clean], [c[1] for c in clean], bins_arr)
+    leg_loc = f'upper {side}'
+ 
+    ax.legend(handles, legend_labels, fontsize=9, ncol=1,
+              loc=leg_loc, frameon=True, framealpha=0.3, edgecolor="none")
+ 
+    ax.set_xlabel(xlabel, fontsize=12)
+    ax.set_ylabel(ylabel, fontsize=12)
+    ax.set_title(title)
+ 
+    info_side = 'right' if side == 'left' else 'left'
+    info_ha   = 'right' if info_side == 'right' else 'left'
+    info_x    = 0.98    if info_side == 'right' else 0.02
+ 
+    info_lines = []
+    if pot_label:
+        info_lines.append(pot_label)
+    info_lines.append(f"Total MC events: {grand_total:.0f}")
+    ax.text(info_x, 0.98, "\n".join(info_lines), transform=ax.transAxes,
+            va="top", ha=info_ha, fontsize=10, color="gray", linespacing=1.15)
+ 
+    if chi2_info is not None:
+        annotate_chi2(ax, **chi2_info)
+ 
+    return ax.get_figure(), ax
+ 
+ 
+import matplotlib.patches as mpatches
+import matplotlib.lines as mlines
+ 
+ 
 def plot_unblinding_var(mc_vals, data_vals, truth_cat, bins, xlabel,
                         stage_name, pot_scale_data, data_pot,
                         frac_unc_per_bin=None,
@@ -1112,147 +1167,226 @@ def plot_unblinding_var(mc_vals, data_vals, truth_cat, bins, xlabel,
                         dirt_vals=None, dirt_weight=None,
                         display_cats=None, savefig_fn=None, filename=None,
                         cut_val=None, cut_dir=None, save_subdir='unblinding'):
-    """
-    Stacked MC + offbeam + data + syst band + ratio panel + chi2 annotation.
-
-    Parameters
-    ----------
-    offbeam_vals   : array-like, optional — offbeam reco values at this stage
-    offbeam_weight : float, optional — offbeam scale factor
-    frac_unc_per_bin : array, optional — fractional syst unc per bin
-    """
     if display_cats is None:
         display_cats = [0, 1, 2, 3, 4, 5, 6]
-
+ 
     bins_arr = np.asarray(bins, dtype=float)
     n_bins   = len(bins_arr) - 1
     centers  = 0.5 * (bins_arr[:-1] + bins_arr[1:])
-
-    fig, (ax_main, ax_ratio) = plt.subplots(
-        2, 1, figsize=(8, 7), gridspec_kw={'height_ratios': [3, 1]}, sharex=True)
-    plt.subplots_adjust(hspace=0.05)
-
-    # Build series/weights including offbeam
-    mc_cats = display_cats
-    series_list  = [_by_cat_generic(mc_vals, truth_cat, c) for c in mc_cats]
-    weights_list = [np.full(len(s), pot_scale_data) for s in series_list]
-    labels_plot  = [CAT_LABELS[c] for c in mc_cats]
-    colors_plot  = [CAT_COLORS[c] for c in mc_cats]
-
-    # Histograms for additional components
+ 
+    # ── Histogram each component ──────────────────────────────────────────
     ob_hist   = np.zeros(n_bins)
     dirt_hist = np.zeros(n_bins)
-
-    # Add offbeam
-    if offbeam_vals is not None and offbeam_weight is not None:
-        ob_clean = np.asarray(offbeam_vals, dtype=float)
-        ob_clean = ob_clean[~np.isnan(ob_clean)]
-
-        if len(ob_clean) > 0:
-            series_list.append(ob_clean)
-            weights_list.append(
-                np.full(len(ob_clean), offbeam_weight)
-            )
-            labels_plot.append(CAT_LABELS[7])
-            colors_plot.append(CAT_COLORS[7])
-
-            ob_hist, _ = np.histogram(
-                ob_clean,
-                bins=bins_arr,
-                weights=np.full(len(ob_clean), offbeam_weight)
-            )
-
-
-    # Add lowE dirt ν
-    if dirt_vals is not None and dirt_weight is not None:
-        dirt_clean = np.asarray(dirt_vals, dtype=float)
-        dirt_clean = dirt_clean[~np.isnan(dirt_clean)]
-
-        if len(dirt_clean) > 0:
-            series_list.append(dirt_clean)
-            weights_list.append(
-                np.full(len(dirt_clean), dirt_weight)
-            )
-            labels_plot.append(CAT_LABELS[9])
-            colors_plot.append(CAT_COLORS[9])
-
-            dirt_hist, _ = np.histogram(
-                dirt_clean,
-                bins=bins_arr,
-                weights=np.full(len(dirt_clean), dirt_weight)
-            )
-            
-    plot_stacked_hist(
-        series_list=series_list, labels=labels_plot, colors=colors_plot,
-        bins=bins_arr, weights=weights_list, xlabel='',
-        title=fr'SBND $\nu_e$ CC Inclusive — {stage_name}',
-        pot_label=f'Data POT: {data_pot:.2e}',
-        ax=ax_main, invert_stack_order=True,
-        show_counts=True, show_percentage=True,
-        data_series=data_vals, data_label='On-beam data')
-
-    # Total MC (MC + offbeam) per bin
-    total_mc = np.zeros(n_bins)
+ 
+    mc_hists   = []
+    mc_labels  = []
+    mc_colors  = []
+    mc_totals  = []
     for cat in display_cats:
-        v, _ = np.histogram(_by_cat_generic(mc_vals, truth_cat, cat), bins=bins_arr,
-                            weights=np.full(len(_by_cat_generic(mc_vals, truth_cat, cat)),
-                                            pot_scale_data))
-        total_mc += v
-    total_mc += ob_hist
-    total_mc += dirt_hist
-
-    # Syst band
+        vals = _by_cat_generic(mc_vals, truth_cat, cat)
+        h, _ = np.histogram(vals, bins=bins_arr,
+                            weights=np.full(len(vals), pot_scale_data))
+        mc_hists.append(h)
+        mc_labels.append(CAT_LABELS[cat])
+        mc_colors.append(CAT_COLORS[cat])
+        mc_totals.append(h.sum())
+ 
+    dirt_total, ob_total = 0.0, 0.0
+    has_dirt, has_ob = False, False
+ 
+    if dirt_vals is not None and dirt_weight is not None:
+        dc = np.asarray(dirt_vals, dtype=float)
+        dc = dc[~np.isnan(dc)]
+        if len(dc) > 0:
+            dirt_hist, _ = np.histogram(dc, bins=bins_arr,
+                                        weights=np.full(len(dc), dirt_weight))
+            dirt_total = dirt_hist.sum()
+            has_dirt = True
+ 
+    if offbeam_vals is not None and offbeam_weight is not None:
+        oc = np.asarray(offbeam_vals, dtype=float)
+        oc = oc[~np.isnan(oc)]
+        if len(oc) > 0:
+            ob_hist, _ = np.histogram(oc, bins=bins_arr,
+                                      weights=np.full(len(oc), offbeam_weight))
+            ob_total = ob_hist.sum()
+            has_ob = True
+ 
+    total_mc    = sum(mc_hists) + dirt_hist + ob_hist
+    grand_total = total_mc.sum()
+ 
+    # ── Layout side ───────────────────────────────────────────────────────
+    mid = n_bins // 2
+    left_max  = total_mc[:mid].max() if mid > 0 else 0
+    right_max = total_mc[mid:].max() if mid < n_bins else 0
+    side = 'right' if right_max <= left_max else 'left'
+ 
+    # ── Figure ────────────────────────────────────────────────────────────
+    fig, (ax_main, ax_ratio) = plt.subplots(
+        2, 1, figsize=(8, 7.5),
+        gridspec_kw={'height_ratios': [3.2, 1]}, sharex=True)
+    plt.subplots_adjust(hspace=0.05)
+ 
+    # ── Stack histograms bottom→top using bar ─────────────────────────────
+    # Order: cosmic(bottom) → ... → signal → dirt → offbeam(top)
+    bw = np.diff(bins_arr)
+    bottoms = np.zeros(n_bins)
+ 
+    # MC categories in reverse (cosmic at bottom, signal on top)
+    for h, col in zip(reversed(mc_hists), reversed(mc_colors)):
+        ax_main.bar(bins_arr[:-1], h, width=bw, bottom=bottoms,
+                    align='edge', color=col, edgecolor='none', linewidth=0)
+        bottoms += h
+ 
+    # Dirt above MC
+    if has_dirt:
+        ax_main.bar(bins_arr[:-1], dirt_hist, width=bw, bottom=bottoms,
+                    align='edge', color=CAT_COLORS[9], edgecolor='none',
+                    linewidth=0)
+        bottoms += dirt_hist
+ 
+    # Offbeam on top (closest to data)
+    if has_ob:
+        ax_main.bar(bins_arr[:-1], ob_hist, width=bw, bottom=bottoms,
+                    align='edge', color=CAT_COLORS[7], edgecolor='none',
+                    linewidth=0)
+        bottoms += ob_hist
+ 
+    # ── Syst band ─────────────────────────────────────────────────────────
     frac = None
     if frac_unc_per_bin is not None:
         frac = np.asarray(frac_unc_per_bin, dtype=float)
         if len(frac) != n_bins:
-            frac = np.interp(centers, np.linspace(bins_arr[0], bins_arr[-1], len(frac)), frac)
+            frac = np.interp(centers,
+                             np.linspace(bins_arr[0], bins_arr[-1], len(frac)),
+                             frac)
         unc = frac * total_mc
-        ax_main.bar(bins_arr[:-1], 2*unc, bottom=total_mc-unc,
-                    width=np.diff(bins_arr), align='edge',
-                    alpha=0.25, color='gray', hatch='///', label='Syst. unc.', linewidth=0)
-
+        ax_main.bar(bins_arr[:-1], 2*unc, bottom=total_mc - unc,
+                    width=bw, align='edge', alpha=0.25, color='gray',
+                     hatch='///', linewidth=0,
+                    zorder=5)
+ 
+    # ── Cut line ──────────────────────────────────────────────────────────
     if cut_val is not None:
         sym = '>' if cut_dir == '>' else '<'
-        ax_main.axvline(cut_val, color='red', ls='--', lw=1.5, label=f'Cut: {sym}{cut_val}')
-
-    handles, lbls = ax_main.get_legend_handles_labels()
-    ax_main.legend(handles, lbls, fontsize=7, ncol=2, loc='upper right',
-                   frameon=True, framealpha=0.3, edgecolor='none')
-
+        ax_main.axvline(cut_val, color='red', ls='--', lw=1.5)
+ 
+    # ── Data ──────────────────────────────────────────────────────────────
     has_data = data_vals is not None and len(data_vals) > 0
+    dc = None
     if has_data:
-        dc, _ = np.histogram(np.asarray(data_vals, dtype=float), bins=bins_arr)
-        dcf   = dc.astype(float)
-        cov   = np.diag(np.where(dcf > 0, dcf, 1.0))       # data stat
-        cov  += np.diag(ob_hist + dirt_hist)
+        d = np.asarray(data_vals, dtype=float)
+        d = d[~np.isnan(d)]
+        dc, _ = np.histogram(d, bins=bins_arr)
+        ax_main.errorbar(centers, dc, yerr=np.sqrt(dc.clip(1)),
+                         fmt="ko", markersize=4, zorder=10)
+ 
+    # ── BUILD LEGEND MANUALLY in exact desired order ──────────────────────
+    legend_handles = []
+    legend_labels  = []
+ 
+    # 1. MC categories: signal first → cosmic last
+    for lbl, col, tot in zip(mc_labels, mc_colors, mc_totals):
+        pct = f"{tot/grand_total:.1%}" if grand_total > 0 else "0%"
+        legend_handles.append(mpatches.Patch(facecolor=col, edgecolor='none'))
+        legend_labels.append(f"{lbl} ({tot:.1f}, {pct})")
+ 
+    # 2. Dirt
+    if has_dirt:
+        pct = f"{dirt_total/grand_total:.1%}" if grand_total > 0 else "0%"
+        legend_handles.append(mpatches.Patch(facecolor=CAT_COLORS[9],
+                                             edgecolor='none'))
+        legend_labels.append(f"{CAT_LABELS[9]} ({dirt_total:.1f}, {pct})")
+ 
+    # 3. Offbeam
+    if has_ob:
+        pct = f"{ob_total/grand_total:.1%}" if grand_total > 0 else "0%"
+        legend_handles.append(mpatches.Patch(facecolor=CAT_COLORS[7],
+                                             edgecolor='none'))
+        legend_labels.append(f"{CAT_LABELS[7]} ({ob_total:.1f}, {pct})")
+ 
+    # 4. Data
+    if has_data:
+        legend_handles.append(mlines.Line2D([], [], color='black', marker='o',
+                                            linestyle='None', markersize=4))
+        legend_labels.append('On-beam data')
+ 
+    # 5. Syst band
+    if frac is not None:
+        legend_handles.append(mpatches.Patch(facecolor='gray', edgecolor='black', alpha=0.25,
+                                             hatch='///', linewidth=0))
+        legend_labels.append('Syst. unc.')
+ 
+    # 6. Cut line
+    if cut_val is not None:
+        legend_handles.append(mlines.Line2D([], [], color='red', ls='--', lw=1.5))
+        legend_labels.append(f'Cut: {sym}{cut_val}')
+ 
+    leg_loc = f'upper {side}'
+    ax_main.legend(legend_handles, legend_labels, fontsize=7, ncol=2,
+                   loc=leg_loc, frameon=True, framealpha=0.85,
+                   edgecolor='none')
+ 
+    # ── Y-limit ───────────────────────────────────────────────────────────
+    ymax = max(total_mc.max(), dc.max() if dc is not None else 0)
+    ax_main.set_ylim(bottom=0, top=ymax * 1.55)
+    ax_main.set_ylabel('Events / bin', fontsize=12)
+    ax_main.set_title(fr'SBND $\nu_e$ CC Inclusive — {stage_name}', fontsize=12)
+ 
+    # ── Info text on opposite side ────────────────────────────────────────
+    info_side = 'right' if side == 'left' else 'left'
+    info_ha   = 'right' if info_side == 'right' else 'left'
+    info_x    = 0.98    if info_side == 'right' else 0.02
+ 
+    info_lines = [f'Data POT: {data_pot:.2e}',
+                  f'Total MC events: {grand_total:.0f}']
+ 
+    if has_data:
+        dcf = dc.astype(float)
+        cov = np.diag(np.where(dcf > 0, dcf, 1.0))
+        cov += np.diag(ob_hist + dirt_hist)
         if frac is not None:
-            cov += np.diag((frac * total_mc)**2)             # syst
-
+            cov += np.diag((frac * total_mc)**2)
+ 
         c2, nd, pv = chi2_pvalue(dcf, total_mc, cov_matrix=cov)
         ds, ms = float(dcf.sum()), float(total_mc.sum())
-        dp  = ds/ms if ms > 0 else 0
-        se  = np.sqrt(ds)/ms if ms > 0 else 0
-        sye = (np.sqrt(np.sum((frac*total_mc)**2))/ms
+        dp  = ds / ms if ms > 0 else 0
+        se  = np.sqrt(ds) / ms if ms > 0 else 0
+        sye = (np.sqrt(np.sum((frac * total_mc)**2)) / ms
                if frac is not None and ms > 0 else 0)
-
-        ax_main.text(0.02, 0.75,
-                     f'$\\Sigma$ Data/Pred = {dp:.2f} $\\pm$ {se:.2f} (stat.) '
-                     f'$\\pm$ {sye:.2f} (syst.)\n'
-                     f'$\\chi^2$/ndf = {c2:.1f}/{nd}, p = {pv:.2f}',
-                     transform=ax_main.transAxes, fontsize=9, color='gray', va='top')
-
+ 
+        info_lines.append(
+            f'$\\Sigma$ Data/Pred = {dp:.2f} $\\pm$ {se:.2f} (stat.) '
+            f'$\\pm$ {sye:.2f} (syst.)')
+        info_lines.append(
+            f'$\\chi^2$/ndf = {c2:.1f}/{nd}, p = {pv:.2f}')
+ 
         print(f"  {stage_name} / {xlabel}:")
         print(f"    Data/Pred = {dp:.3f} ± {se:.3f} (stat.) ± {sye:.3f} (syst.)")
         print(f"    chi2/ndf = {c2:.1f}/{nd}  p = {pv:.3f}")
+ 
+    header = [f'Data POT: {data_pot:.2e}',
+              f'Total MC events: {grand_total:.0f}']
+    ax_main.text(info_x, 0.98, "\n".join(header),
+                 transform=ax_main.transAxes, fontsize=9, color='gray',
+                 va='top', ha=info_ha, linespacing=1.15)
 
+    if has_data and len(info_lines) > 2:
+        stats_text = "\n".join(info_lines[2:])    # Data/Pred + chi2
+        ax_ratio.text(info_x, 0.98, stats_text,
+                      transform=ax_ratio.transAxes, fontsize=9, color='gray',
+                      va='top', ha=info_ha, linespacing=1.15)
+ 
+    # ── Ratio panel ───────────────────────────────────────────────────────
+    if has_data:
+        dcf = dc.astype(float)
         with np.errstate(divide='ignore', invalid='ignore'):
-            ratio = np.where(total_mc > 0, dcf/total_mc, np.nan)
-            rerr  = np.where(total_mc > 0, np.sqrt(dcf)/total_mc, np.nan)
+            ratio = np.where(total_mc > 0, dcf / total_mc, np.nan)
+            rerr  = np.where(total_mc > 0, np.sqrt(dcf) / total_mc, np.nan)
         ax_ratio.errorbar(centers, ratio, yerr=rerr, fmt='ko', ms=3, zorder=5)
         ax_ratio.axhline(1.0, color='gray', ls='--', lw=1)
         if frac is not None:
-            ax_ratio.fill_between(centers, 1-frac, 1+frac,
+            ax_ratio.fill_between(centers, 1 - frac, 1 + frac,
                                   alpha=0.2, color='gray', step='mid')
         ax_ratio.set_ylim(0, 2)
         ax_ratio.set_ylabel('Data/MC', fontsize=11)
@@ -1260,15 +1394,169 @@ def plot_unblinding_var(mc_vals, data_vals, truth_cat, bins, xlabel,
         ax_ratio.set_ylabel('Data/MC', fontsize=11)
         ax_ratio.text(0.5, 0.5, 'No data', transform=ax_ratio.transAxes,
                       ha='center', va='center', fontsize=12, color='gray')
-
+ 
     ax_ratio.set_xlabel(xlabel, fontsize=12)
     fig.tight_layout()
     if savefig_fn and filename:
         savefig_fn(fig, filename, save_subdir)
     return fig
 
+ 
+ 
+def plot_differential_slices(
+        sel_df, stage_col,
+        slice_var, plot_var,
+        slice_edges, plot_bins,
+        pot_scale,
+        data_reco_dict,
+        offbeam_reco_dict, offbeam_weight,
+        dirt_reco_dict, dirt_weight,
+        frac_unc_fn,
+        title, xlabel,
+        display_cats=None,
+        savefig_fn=None, filename=None,
+        ncols=3):
+    """
+    Differential stacked histogram in slices. Reusable for both
+    KE-sliced cosθ plots and cosθ-sliced KE plots.
+    """
+    if display_cats is None:
+        display_cats = [0, 1, 2, 3, 4, 5, 6]
+ 
+    # Legend order: signal categories, then dirt (9), then offbeam (7)
+    full_cats = list(display_cats) + [9, 7]
+ 
+    n_slices = len(slice_edges)
+    nrows = (n_slices + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6*ncols, 5*nrows),
+                             squeeze=False)
+    axes_flat = axes.flatten()
+    plot_bins = np.asarray(plot_bins, dtype=float)
+    n_bins = len(plot_bins) - 1
+    proxy = 'reco_costheta' if 'cos' in plot_var else 'reco_ke'
+    mc_final = sel_df[sel_df[stage_col]].copy()
+ 
+    for si, (s_lo, s_hi) in enumerate(slice_edges):
+        ax = axes_flat[si]
+        mc_slice = mc_final[
+            (mc_final[slice_var] >= s_lo) & (mc_final[slice_var] < s_hi)]
+ 
+        # ── Build in STACKING order (bottom→top) ─────────────────────────
+        # reversed MC cats + dirt + offbeam
+        stack_series, stack_weights, stack_labels, stack_colors = [], [], [], []
+ 
+        # MC in reverse (cosmic at bottom, signal on top)
+        for cat in reversed(display_cats):
+            vals = mc_slice.loc[mc_slice['truth_cat'] == cat,
+                                plot_var].dropna().values
+            stack_series.append(vals)
+            stack_weights.append(np.full(len(vals), pot_scale))
+            stack_labels.append(CAT_LABELS[cat])
+            stack_colors.append(CAT_COLORS[cat])
+ 
+        # Dirt (above signal)
+        sv = np.asarray(dirt_reco_dict.get(slice_var, []), dtype=float)
+        pv = np.asarray(dirt_reco_dict.get(plot_var, []), dtype=float)
+        valid = ~np.isnan(sv) & ~np.isnan(pv)
+        mask = valid & (sv >= s_lo) & (sv < s_hi)
+        stack_series.append(pv[mask])
+        stack_weights.append(np.full(mask.sum(), dirt_weight))
+        stack_labels.append(CAT_LABELS[9])
+        stack_colors.append(CAT_COLORS[9])
+ 
+        # Offbeam (top, closest to data)
+        sv = np.asarray(offbeam_reco_dict.get(slice_var, []), dtype=float)
+        pv = np.asarray(offbeam_reco_dict.get(plot_var, []), dtype=float)
+        valid = ~np.isnan(sv) & ~np.isnan(pv)
+        mask = valid & (sv >= s_lo) & (sv < s_hi)
+        stack_series.append(pv[mask])
+        stack_weights.append(np.full(mask.sum(), offbeam_weight))
+        stack_labels.append(CAT_LABELS[7])
+        stack_colors.append(CAT_COLORS[7])
+ 
+        n_stack = len(stack_series)
+        n_mc = len(display_cats)
+ 
+        # Clean NaN
+        clean_s, clean_w = [], []
+        for s, w in zip(stack_series, stack_weights):
+            s = np.asarray(s, dtype=float)
+            m = ~np.isnan(s)
+            clean_s.append(s[m])
+            clean_w.append(np.asarray(w, dtype=float)[m])
+ 
+        # Total for syst band
+        total_sl = np.zeros(n_bins)
+        for s, w in zip(clean_s, clean_w):
+            h, _ = np.histogram(s, bins=plot_bins, weights=w)
+            total_sl += h
+ 
+        frac_sl = frac_unc_fn(plot_bins, proxy)
+        unc_sl  = frac_sl * total_sl
+ 
+        # Plot stacked (already in bottom→top order, no invert needed)
+        ann = []
+        for lbl, (s, w) in zip(stack_labels, zip(clean_s, clean_w)):
+            h, _ = np.histogram(s, bins=plot_bins, weights=w)
+            ann.append(lbl)  # no counts in subplots to keep clean
+        ax.hist(clean_s, bins=plot_bins, weights=clean_w,
+                label=ann, color=stack_colors,
+                stacked=True, histtype="stepfilled")
+ 
+        # Syst band
+        bw = np.diff(plot_bins)
+        ax.bar(plot_bins[:-1], 2*unc_sl, bottom=total_sl - unc_sl,
+               width=bw, align='edge', alpha=0.25, color='gray',
+               hatch='///', linewidth=0)
+ 
+        # Data
+        data_sv = np.asarray(data_reco_dict.get(slice_var, []), dtype=float)
+        data_pv = np.asarray(data_reco_dict.get(plot_var, []), dtype=float)
+        valid_d = ~np.isnan(data_sv) & ~np.isnan(data_pv)
+        d_mask  = valid_d & (data_sv >= s_lo) & (data_sv < s_hi)
+        data_sl = data_pv[d_mask]
+        if len(data_sl) > 0:
+            dch, _ = np.histogram(data_sl, bins=plot_bins)
+            ctrs = 0.5 * (plot_bins[:-1] + plot_bins[1:])
+            ax.errorbar(ctrs, dch, yerr=np.sqrt(dch.clip(1)),
+                        fmt='ko', ms=4, zorder=10)
+ 
+        # Slice title
+        if slice_var == 'reco_ke':
+            ax.set_title(f'{int(s_lo)}–{int(s_hi)} MeV', fontsize=11)
+        else:
+            ax.set_title(f'{s_lo:.2g} < cos θ < {s_hi:.2g}', fontsize=11)
+        ax.set_xlabel(xlabel, fontsize=10)
+        ax.set_xlim(plot_bins[0], plot_bins[-1])
+ 
+        # Legend: reorder to signal-first (only on first subplot)
+        if si == 0:
+            handles_raw, labels_raw = ax.get_legend_handles_labels()
+            mc_h = handles_raw[:n_mc][::-1]
+            mc_l = labels_raw[:n_mc][::-1]
+            ext_h = handles_raw[n_mc:n_stack]
+            ext_l = labels_raw[n_mc:n_stack]
+            rest_h = handles_raw[n_stack:]
+            rest_l = labels_raw[n_stack:]
+            ax.legend(mc_h + ext_h + rest_h, mc_l + ext_l + rest_l,
+                      fontsize=7, ncol=2, loc='best',
+                      frameon=True, framealpha=0.8, edgecolor='none')
+        else:
+            leg = ax.get_legend()
+            if leg: leg.remove()
+ 
+    for j in range(si + 1, len(axes_flat)):
+        axes_flat[j].set_visible(False)
+ 
+    fig.suptitle(title, fontsize=13, y=1.01)
+    fig.tight_layout()
+    if savefig_fn and filename:
+        savefig_fn(fig, filename)
+    return fig, axes
 
-# ============================================================
+
+    
+    # ============================================================
 # Misc
 # ============================================================
 
