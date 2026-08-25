@@ -779,12 +779,12 @@ def plot_overlay_with_cov(
     # --- figure layout ---
     if draw_ratio:
         fig, (ax, rax) = plt.subplots(
-            2, 1, figsize=(7, 6),
+            2, 1, figsize=(6, 5),
             gridspec_kw={"height_ratios": [3, 1]},
             sharex=True
         )
     else:
-        fig, ax = plt.subplots(figsize=(7, 4))
+        fig, ax = plt.subplots(figsize=(6, 4))
         rax = None
 
     # --- stacked histogram look (filled steps) ---
