@@ -507,7 +507,12 @@ def plot_stacked_hist(series_list, labels, colors, bins, weights=None,
                       data_label="Data", pot_label="",
                       invert_stack_order=False,
                       show_counts=True, show_percentage=True,
-                      chi2_info=None, **hist_kw):
+                      chi2_info=None, n_mc_cats=7, **hist_kw):
+    """
+    n_mc_cats : int
+        Number of MC categories (cats 0-6 = 7). Used to compute purity
+        as signal / MC-only total, excluding dirt and offbeam.
+    """
     if ax is None:
         fig, ax = plt.subplots(figsize=(8, 6))
 
@@ -533,35 +538,33 @@ def plot_stacked_hist(series_list, labels, colors, bins, weights=None,
         h, _ = np.histogram(s, bins=bins_arr, weights=w)
         cat_totals.append(h.sum())
     grand_total = sum(cat_totals)
+    mc_only_total = sum(cat_totals[:n_mc_cats])
 
+    # Build annotated labels with MC-only purity for cats, grand_total for rest
     annotated_labels = []
-    for lbl, tot in zip(labels, cat_totals):
+    for i, (lbl, tot) in enumerate(zip(labels, cat_totals)):
         parts = [lbl]
         if show_counts or show_percentage:
             inner = []
             if show_counts:
                 inner.append(f"{tot:.1f}")
-            if show_percentage and grand_total > 0:
-                inner.append(f"{tot / grand_total:.1%}")
+            if show_percentage:
+                denom = mc_only_total if i < n_mc_cats else grand_total
+                if denom > 0:
+                    inner.append(f"{tot / denom:.1%}")
             parts.append(f"({', '.join(inner)})")
         annotated_labels.append(" ".join(parts))
 
-    n_stack = len(clean)
-    if invert_stack_order:
-        x_list = [c[0] for c in reversed(clean)]
-        w_list = [c[1] for c in reversed(clean)]
-        plot_lbl = list(reversed(annotated_labels))
-        col_list = list(reversed(colors))
-    else:
-        x_list = [c[0] for c in clean]
-        w_list = [c[1] for c in clean]
-        plot_lbl = annotated_labels
-        col_list = list(colors)
+    # Always stack in given order (signal at bottom)
+    x_list = [c[0] for c in clean]
+    w_list = [c[1] for c in clean]
+    col_list = list(colors)
 
     weights_arg = None if all(w is None for w in w_list) else w_list
 
+    # Suppress auto-legend — we build it manually
     ax.hist(x_list, bins=bins_arr, weights=weights_arg,
-            label=plot_lbl, color=col_list,
+            label='_nolegend_', color=col_list,
             stacked=True, histtype="stepfilled", density=density, **hist_kw)
 
     if data_series is not None:
@@ -570,19 +573,23 @@ def plot_stacked_hist(series_list, labels, colors, bins, weights=None,
         counts, _ = np.histogram(d, bins=bins_arr)
         centers = 0.5 * (bins_arr[:-1] + bins_arr[1:])
         ax.errorbar(centers, counts, yerr=np.sqrt(counts),
-                    fmt="ko", markersize=4, label=data_label, zorder=10)
+                    fmt="ko", markersize=4, label='_nolegend_', zorder=10)
 
-    handles, legend_labels = ax.get_legend_handles_labels()
-    if invert_stack_order and n_stack > 1:
-        stack_h = handles[:n_stack][::-1]
-        stack_l = legend_labels[:n_stack][::-1]
-        rest_h = handles[n_stack:]
-        rest_l = legend_labels[n_stack:]
-        handles = stack_h + rest_h
-        legend_labels = stack_l + rest_l
+    # ── Manual legend: always signal first, then data at the end ──────────
+    legend_handles = []
+    legend_labels_out = []
+
+    for lbl, col in zip(annotated_labels, col_list):
+        legend_handles.append(mpatches.Patch(facecolor=col, edgecolor='none'))
+        legend_labels_out.append(lbl)
+
+    if data_series is not None:
+        legend_handles.append(mlines.Line2D([], [], color='black', marker='o',
+                                            linestyle='None', markersize=4))
+        legend_labels_out.append(data_label)
 
     side = _best_legend_side([c[0] for c in clean], [c[1] for c in clean], bins_arr)
-    ax.legend(handles, legend_labels, fontsize=9, ncol=1,
+    ax.legend(legend_handles, legend_labels_out, fontsize=9, ncol=1,
               loc=f'upper {side}', frameon=True, framealpha=0.3, edgecolor="none")
 
     ax.set_xlabel(xlabel, fontsize=12)
@@ -674,7 +681,7 @@ def plot_unblinding_var(mc_vals, data_vals, truth_cat, bins, xlabel,
     bw = np.diff(bins_arr)
     bottoms = np.zeros(n_bins)
 
-    for h, col in zip(reversed(mc_hists), reversed(mc_colors)):
+    for h, col in zip(mc_hists, mc_colors):
         ax_main.bar(bins_arr[:-1], h, width=bw, bottom=bottoms,
                     align='edge', color=col, edgecolor='none', linewidth=0)
         bottoms += h
@@ -1161,211 +1168,410 @@ def plot_fracunc(vcfg, cv_arr, cov_results_var, block_key, categ,
 # ══════════════════════════════════════════════════════════════════════════════
 
 # Lynn's binning (first/last bins are underflow/overflow)
+def threshold_plots_cumulative(evtdf, cut_flow_result, cut_stage,
+                                shower_cuts, truth_categories=None,
+                                opt_thresholds_prev=None,
+                                fig_width=7, plot_folder="plots"):
+    """Apply shower-quality cuts cumulatively, scanning each threshold in turn.
+
+    Parameters
+    ----------
+    shower_cuts : list of tuples
+        (metric_col, bounds, xaxis_name, threshold_range, cut_dir, legend_loc, save_name)
+    opt_thresholds_prev : dict, optional
+        Pre-apply these thresholds before scanning (from a prior run).
+
+    Returns
+    -------
+    dict  {metric_col: optimal_threshold}
+    """
+    from nue_selection import PID_ELECTRON, classify_truth
+
+    il = inter_levels(evtdf)
+    presel_idx = cut_flow_result[cut_stage]["inter_index"]
+    cat = (truth_categories if truth_categories is not None
+           else classify_truth(evtdf, verbose=False))
+    rp_df = reco_particles(evtdf)._df
+
+    _MULTI = {'pid_scores': ('pid_scores', 'I1'),
+              'primary_scores': ('primary_scores', 'I1')}
+
+    def _resolve_col(mc):
+        if isinstance(mc, str) and mc in _MULTI:
+            return _MULTI[mc]
+        if isinstance(mc, str):
+            if mc in rp_df.columns:
+                return mc
+            if (mc, '') in rp_df.columns:
+                return (mc, '')
+            m = [c for c in rp_df.columns
+                 if (isinstance(c, tuple) and c[0] == mc) or c == mc]
+            if not m:
+                raise KeyError(f"'{mc}' not found in reco_particles.")
+            return m[0]
+        return mc
+
+    ke_col = ('ke', '') if ('ke', '') in rp_df.columns else 'ke'
+    pid_col = ('pid', '') if ('pid', '') in rp_df.columns else 'pid'
+    in_presel = rp_df.index.droplevel(-1).isin(presel_idx)
+    ele_presel = rp_df[in_presel & (rp_df[pid_col] == PID_ELECTRON)]
+
+    # Build per-cut metric Series
+    metric_frames = {}
+    for (mc, *_) in shower_cuts:
+        ck = _resolve_col(mc)
+        tmp = pd.DataFrame({'ke': ele_presel[ke_col].to_numpy(dtype=float),
+                            'metric': ele_presel[ck].to_numpy(dtype=float)},
+                           index=ele_presel.index)
+
+        def _mke(g):
+            return g.loc[g['ke'].idxmax(), 'metric']
+
+        metric_frames[mc] = tmp.groupby(level=il).apply(_mke)
+
+    master = pd.DataFrame(metric_frames)
+    master['is_signal'] = (cat.reindex(master.index).fillna(-1) == 0).values
+
+    surviving_mask = pd.Series(True, index=master.index)
+    if opt_thresholds_prev:
+        for mc, bounds, xaxis_name, trange, cut_dir, lloc, sname in shower_cuts:
+            if mc in opt_thresholds_prev:
+                thresh = opt_thresholds_prev[mc]
+                surviving_mask &= (master[mc] > thresh
+                                   if cut_dir == '>' else master[mc] < thresh)
+
+    opt_thresholds = {}
+
+    for mc, bounds, xaxis_name, trange, cut_dir, lloc, sname in shower_cuts:
+        xmin, xmax = bounds
+        current = master[surviving_mask]
+        metric_vals = current[mc].to_numpy(dtype=float)
+        is_signal = current['is_signal'].to_numpy()
+        valid = ~np.isnan(metric_vals)
+        metric_vals = metric_vals[valid]
+        is_signal = is_signal[valid]
+        n_total = len(metric_vals)
+        n_signal = is_signal.sum()
+        n_bkg = (~is_signal).sum()
+
+        fig = plt.figure(figsize=(fig_width, 8))
+        gs = fig.add_gridspec(4, 1, hspace=0.05)
+        ax1 = fig.add_subplot(gs[:3, 0])
+        ax1.hist(metric_vals[~is_signal], bins=np.linspace(xmin, xmax, 51),
+                 histtype='step', density=True,
+                 label=f'Background ({n_bkg:,} remaining)', color='orange', lw=1.5)
+        ax1.hist(metric_vals[is_signal], bins=np.linspace(xmin, xmax, 51),
+                 histtype='step', density=True,
+                 label=r'Signal $\nu_e$ CC' + f' ({n_signal:,} remaining)',
+                 color='blue', lw=1.5)
+        ax1.set_title(xaxis_name, fontsize=14, pad=8)
+        ax1.set_ylabel('Probability Density', fontsize=13)
+        ax1.legend(loc=f'upper {lloc}', framealpha=0.3, fontsize=11)
+        ax1.set_xlim(xmin, xmax)
+        ax1.tick_params(labelbottom=False)
+
+        start, stop, step = trange
+        thresholds = np.arange(start, stop + step / 2, step)
+        total_signal = is_signal.sum()
+        keep_above = (cut_dir == '>')
+        purities, efficiencies, f1s = [], [], []
+        for thresh in thresholds:
+            passed = (metric_vals > thresh) if keep_above else (metric_vals < thresh)
+            n_passed = passed.sum()
+            n_sig_passed = (passed & is_signal).sum()
+            pur = n_sig_passed / n_passed if n_passed > 0 else 0.0
+            eff = n_sig_passed / total_signal if total_signal > 0 else 0.0
+            f1 = 2 * pur * eff / (pur + eff) if (pur + eff) > 0 else 0.0
+            purities.append(pur)
+            efficiencies.append(eff)
+            f1s.append(f1)
+
+        f1s = np.array(f1s)
+        opt_idx = np.argmax(f1s)
+        opt_thresh = float(thresholds[opt_idx])
+        max_f1 = float(f1s[opt_idx])
+
+        ax2 = fig.add_subplot(gs[3, 0])
+        ax2.plot(thresholds, purities, 'b-', label='Purity', lw=1.5)
+        ax2.plot(thresholds, efficiencies, 'r-', label='Efficiency', lw=1.5)
+        ax2.plot(thresholds, f1s, color='purple', label='F1 Score', lw=1.5)
+        ax2.axvline(opt_thresh, color='purple', ls='--', lw=1.5)
+        ax2.set_xlabel(xaxis_name, fontsize=13)
+        ax2.set_ylabel('Performance', fontsize=13)
+        ax2.set_xlim(xmin, xmax)
+        ax2.set_ylim(0, 1)
+        ax2.legend(loc=f'upper {lloc}', framealpha=0.3, fontsize=11)
+        range_x = xmax - xmin
+        text_x = (opt_thresh + range_x * 0.05 if cut_dir == '<'
+                  else opt_thresh - range_x * 0.05)
+        ha = 'left' if cut_dir == '<' else 'right'
+        ax2.text(text_x, 0.05, f'Max F1 at {opt_thresh:.3f}', color='purple',
+                 va='bottom', ha=ha, fontsize=12,
+                 bbox=dict(boxstyle="round,pad=0.3", facecolor='white',
+                           edgecolor='none', alpha=0.5))
+        plt.tight_layout()
+        if sname:
+            save_plot(sname + "_cumulative", fig=fig, folder_name=plot_folder)
+        plt.show()
+
+        print(f"\n{'─' * 50}")
+        print(f"  Variable   : {mc}")
+        print(f"  Remaining  : {n_total:,} ({n_signal} signal, {n_bkg} bkg)")
+        print(f"  Cut dir    : {cut_dir} {opt_thresh:.4f}")
+        print(f"  Efficiency : {efficiencies[opt_idx] * 100:.1f}%")
+        print(f"  Purity     : {purities[opt_idx] * 100:.1f}%")
+        print(f"  Max F1     : {max_f1:.4f}")
+        print(f"{'─' * 50}\n")
+
+        opt_thresholds[mc] = opt_thresh
+        surviving_mask &= (master[mc] > opt_thresh
+                           if cut_dir == '>' else master[mc] < opt_thresh)
+
+    print(f"\nFinal surviving interactions: {surviving_mask.sum():,}")
+    return opt_thresholds
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 LYNN_KE_BINS_GEV = np.array([0.5, 0.7, 0.95, 1.25, 1.7, 2.5])   # GeV
 LYNN_KE_BINS_MEV = LYNN_KE_BINS_GEV * 1000.0                      # MeV
 LYNN_COS_BINS = np.array([-1.0, 0.6, 0.75, 0.85, 0.925, 1.0])
 
 
-def plot_lynn_comparison(sel_topo, stage_col, var_name,
-                         pot_scale_data, data_pot,
-                         data_reco, offbeam_reco, offbeam_weight,
-                         dirt_reco, dirt_weight,
-                         frac_unc_per_bin=None,
-                         display_cats=None,
-                         savefig_fn=None, filename=None,
-                         save_subdir='lynn_comparison',
-                         watermark='SBND Analysis In Progress'):
+def plot_handscan_binning(sel_topo, stage_col, var_name,
+                          pot_scale_data, data_pot,
+                          data_reco, offbeam_reco, offbeam_weight,
+                          dirt_reco, dirt_weight,
+                          frac_unc_per_bin=None,
+                          display_cats=None,
+                          bins_override=None,
+                          display_widths=None,
+                          savefig_fn=None, filename=None,
+                          save_subdir='lynn_comparison',
+                          title=r'SBND $\nu_e$ CC Inclusive'):
     """
-    Produce a stacked histogram + ratio panel using Lynn's variable-width
-    binning. Plots events / bin (NOT per-unit-width) to match her style.
-
-    First and last bins capture underflow/overflow respectively.
-
+    Stacked histogram + ratio panel with variable-width binning.
+    Style matches plot_unblinding_var exactly.
+ 
     Parameters
     ----------
-    var_name : 'reco_ke' or 'reco_costheta'
+    bins_override : array of physical bin edges. If None, uses defaults.
+    display_widths : array of visual widths per bin (len = n_bins).
+        If None, uses physical bin widths (linear axis).
     """
     if display_cats is None:
         display_cats = [0, 1, 2, 3, 4, 5, 6]
-
-    # Pick the right binning
+ 
+    # ── Pick binning ──────────────────────────────────────────────────────
     if var_name == 'reco_ke':
-        bins_arr = LYNN_KE_BINS_MEV.copy()
-        xlabel = r'Electron Energy $E_{e^-}$ (GeV)'
-        # We'll label the x-axis in GeV for comparison with Lynn
-        x_scale = 1e-3  # MeV → GeV for display
+        bins_arr = (np.asarray(bins_override, dtype=float)
+                    if bins_override is not None else LYNN_KE_BINS_MEV.copy())
+        xlabel = r'Reco leading-$e^-$ KE [MeV]'
     elif var_name == 'reco_costheta':
-        bins_arr = LYNN_COS_BINS.copy()
-        xlabel = r'Electron Direction, $\cos\theta$'
-        x_scale = 1.0
+        bins_arr = (np.asarray(bins_override, dtype=float)
+                    if bins_override is not None else LYNN_COS_BINS.copy())
+        xlabel = r'Reco leading-$e^-$ $\cos\theta$'
     else:
-        raise ValueError(f"var_name must be 'reco_ke' or 'reco_costheta', got {var_name}")
-
+        raise ValueError(f"var_name must be 'reco_ke' or 'reco_costheta'")
+ 
     n_bins = len(bins_arr) - 1
-    disp_edges = bins_arr * x_scale   # display edges (GeV or unitless)
-    centers = 0.5 * (disp_edges[:-1] + disp_edges[1:])
-
-    # ── Clip values into [first edge, last edge] for underflow/overflow ───
-    def _clip(v):
+    disp_edges_phys = bins_arr.copy()
+ 
+    # Custom display widths → non-uniform x positions
+    if display_widths is not None:
+        display_widths = np.asarray(display_widths, dtype=float)
+        assert len(display_widths) == n_bins, \
+            f"display_widths has {len(display_widths)} entries but {n_bins} bins"
+        x_edges = np.concatenate([[0], np.cumsum(display_widths)])
+        edge_labels = [f'{e:.3g}' for e in disp_edges_phys]
+        disp_edges = x_edges
+        centers = 0.5 * (x_edges[:-1] + x_edges[1:])
+        _custom_ticks = (x_edges, edge_labels)
+    else:
+        disp_edges = disp_edges_phys
+        centers = 0.5 * (disp_edges[:-1] + disp_edges[1:])
+        _custom_ticks = None
+ 
+    # Filter — exclude events outside bin range (not clip)
+    def _filter(v):
         v = np.asarray(v, dtype=float)
         v = v[~np.isnan(v)]
-        return np.clip(v, bins_arr[0], bins_arr[-1] - 1e-8)
-
+        return v[(v >= bins_arr[0]) & (v < bins_arr[-1])]
+ 
     # ── Histogram each component ──────────────────────────────────────────
     mc_hists, mc_labels, mc_colors, mc_totals = [], [], [], []
-    truth_cat = sel_topo.loc[sel_topo[stage_col], 'truth_cat']
-
     for cat in display_cats:
         m = sel_topo[stage_col] & (sel_topo['truth_cat'] == cat)
-        vals = _clip(sel_topo.loc[m, var_name].dropna().values)
+        vals = _filter(sel_topo.loc[m, var_name].dropna().values)
         h, _ = np.histogram(vals, bins=bins_arr,
                             weights=np.full(len(vals), pot_scale_data))
         mc_hists.append(h)
         mc_labels.append(CAT_LABELS[cat])
         mc_colors.append(CAT_COLORS[cat])
         mc_totals.append(h.sum())
-
+ 
     dirt_hist = np.zeros(n_bins)
     ob_hist = np.zeros(n_bins)
     dirt_total, ob_total = 0.0, 0.0
     has_dirt, has_ob = False, False
-
+ 
     if dirt_reco is not None and dirt_weight is not None:
-        dv = _clip(dirt_reco.get(var_name, []))
+        dv = _filter(dirt_reco.get(var_name, []))
         if len(dv) > 0:
             dirt_hist, _ = np.histogram(dv, bins=bins_arr,
                                         weights=np.full(len(dv), dirt_weight))
             dirt_total = dirt_hist.sum()
             has_dirt = True
-
+ 
     if offbeam_reco is not None and offbeam_weight is not None:
-        ov = _clip(offbeam_reco.get(var_name, []))
+        ov = _filter(offbeam_reco.get(var_name, []))
         if len(ov) > 0:
             ob_hist, _ = np.histogram(ov, bins=bins_arr,
                                       weights=np.full(len(ov), offbeam_weight))
             ob_total = ob_hist.sum()
             has_ob = True
-
+ 
     total_mc = sum(mc_hists) + dirt_hist + ob_hist
     grand_total = total_mc.sum()
-
-    # ── Figure ────────────────────────────────────────────────────────────
+    mc_only_total = sum(mc_totals)
+ 
+    # ── Auto-detect best legend side ──────────────────────────────────────
+    mid = n_bins // 2
+    left_max = total_mc[:mid].max() if mid > 0 else 0
+    right_max = total_mc[mid:].max() if mid < n_bins else 0
+    side = 'right' if right_max <= left_max else 'left'
+    info_side = 'right' if side == 'left' else 'left'
+    info_ha = 'right' if info_side == 'right' else 'left'
+    info_x = 0.98 if info_side == 'right' else 0.02
+ 
+    # ── Figure (same size as plot_unblinding_var) ─────────────────────────
     fig, (ax_main, ax_ratio) = plt.subplots(
-        2, 1, figsize=(7, 7),
+        2, 1, figsize=(8, 7.5),
         gridspec_kw={'height_ratios': [3.2, 1]}, sharex=True)
     plt.subplots_adjust(hspace=0.05)
-
+ 
     bw = np.diff(disp_edges)
     bottoms = np.zeros(n_bins)
-
-    # Stack: cosmic at bottom → signal on top
-    for h, col in zip(reversed(mc_hists), reversed(mc_colors)):
+ 
+    # Stack: signal (bottom) → cosmic → dirt → offbeam (top)
+    for h, col in zip(mc_hists, mc_colors):
         ax_main.bar(disp_edges[:-1], h, width=bw, bottom=bottoms,
                     align='edge', color=col, edgecolor='none', linewidth=0)
         bottoms += h
-
+ 
     if has_dirt:
         ax_main.bar(disp_edges[:-1], dirt_hist, width=bw, bottom=bottoms,
                     align='edge', color=CAT_COLORS[9], edgecolor='none', linewidth=0)
         bottoms += dirt_hist
-
+ 
     if has_ob:
         ax_main.bar(disp_edges[:-1], ob_hist, width=bw, bottom=bottoms,
                     align='edge', color=CAT_COLORS[7], edgecolor='none', linewidth=0)
         bottoms += ob_hist
-
-    # ── Syst band (hatched MC stat+syst) ──────────────────────────────────
+ 
+    # ── Syst band (same style as plot_unblinding_var) ─────────────────────
     frac = None
     if frac_unc_per_bin is not None:
         frac = np.asarray(frac_unc_per_bin, dtype=float)
         if len(frac) != n_bins:
-            frac = np.interp(centers,
-                             np.linspace(disp_edges[0], disp_edges[-1], len(frac)),
+            phys_centers = 0.5 * (bins_arr[:-1] + bins_arr[1:])
+            frac = np.interp(phys_centers,
+                             np.linspace(bins_arr[0], bins_arr[-1], len(frac)),
                              frac)
         unc = frac * total_mc
         ax_main.bar(disp_edges[:-1], 2 * unc, bottom=total_mc - unc,
-                    width=bw, align='edge', alpha=0.3, color='gray',
-                    hatch='xxxx', linewidth=0, zorder=5,
-                    label='MC stat.+syst.')
-
+                    width=bw, align='edge', alpha=0.25, color='gray',
+                    hatch='///', linewidth=0, zorder=5)
+ 
     # ── Data ──────────────────────────────────────────────────────────────
     has_data = data_reco is not None and len(data_reco.get(var_name, [])) > 0
     dc = None
     n_data = 0
     if has_data:
-        dv = _clip(data_reco[var_name])
+        dv = _filter(data_reco[var_name])
         dc, _ = np.histogram(dv, bins=bins_arr)
         n_data = int(dc.sum())
         ax_main.errorbar(centers, dc, yerr=np.sqrt(dc.clip(1)),
-                         fmt='ko', markersize=5, zorder=10,
-                         label=f'data ({n_data})')
-
-    # ── Legend ────────────────────────────────────────────────────────────
+                         fmt='ko', markersize=4, zorder=10)
+ 
+    # ── Legend (manual, same format as plot_unblinding_var) ────────────────
     legend_handles, legend_labels_list = [], []
-
-    # Data first (matches Lynn's style)
-    if has_data:
-        legend_handles.append(mlines.Line2D([], [], color='black', marker='o',
-                                            linestyle='None', markersize=5))
-        legend_labels_list.append(f'data ({n_data})')
-
-    # MC categories
+ 
+    # MC categories — purity = fraction of MC-only total
     for lbl, col, tot in zip(mc_labels, mc_colors, mc_totals):
-        pct = f"{tot / grand_total:.1%}" if grand_total > 0 else "0%"
+        pct = f"{tot / mc_only_total:.1%}" if mc_only_total > 0 else "0%"
         legend_handles.append(mpatches.Patch(facecolor=col, edgecolor='none'))
-        legend_labels_list.append(f"{lbl} ({pct})")
-
+        legend_labels_list.append(f"{lbl} ({tot:.1f}, {pct})")
+ 
+    # Dirt and offbeam — fraction of grand total
     if has_dirt:
         pct = f"{dirt_total / grand_total:.1%}" if grand_total > 0 else "0%"
         legend_handles.append(mpatches.Patch(facecolor=CAT_COLORS[9], edgecolor='none'))
-        legend_labels_list.append(f"{CAT_LABELS[9]} ({pct})")
+        legend_labels_list.append(f"{CAT_LABELS[9]} ({dirt_total:.1f}, {pct})")
     if has_ob:
         pct = f"{ob_total / grand_total:.1%}" if grand_total > 0 else "0%"
         legend_handles.append(mpatches.Patch(facecolor=CAT_COLORS[7], edgecolor='none'))
-        legend_labels_list.append(f"{CAT_LABELS[7]} ({pct})")
+        legend_labels_list.append(f"{CAT_LABELS[7]} ({ob_total:.1f}, {pct})")
+ 
+    # Data
+    if has_data:
+        legend_handles.append(mlines.Line2D([], [], color='black', marker='o',
+                                            linestyle='None', markersize=4))
+        legend_labels_list.append('On-beam data')
+ 
+    # Syst
     if frac is not None:
         legend_handles.append(mpatches.Patch(facecolor='gray', edgecolor='black',
-                                             alpha=0.3, hatch='xxxx', linewidth=0))
-        legend_labels_list.append('MC stat.+syst.')
-
+                                             alpha=0.25, hatch='///', linewidth=0))
+        legend_labels_list.append('Syst. unc.')
+ 
     ax_main.legend(legend_handles, legend_labels_list, fontsize=7, ncol=2,
-                   loc='upper left', frameon=True, framealpha=0.85, edgecolor='none')
-
-    # ── Annotation ────────────────────────────────────────────────────────
-    if has_data and frac is not None:
+                   loc=f'upper {side}', frameon=True, framealpha=0.85, edgecolor='none')
+ 
+    ymax = max(total_mc.max(), dc.max() if dc is not None else 0)
+    ax_main.set_ylim(bottom=0, top=ymax * 1.55)
+    ax_main.set_ylabel('Events / bin', fontsize=12)
+    ax_main.set_title(f'{title}', fontsize=12)
+ 
+    # ── Info text (same side logic as plot_unblinding_var) ─────────────────
+    header = [f'Data POT: {data_pot:.2e}', f'Total MC events: {grand_total:.0f}']
+    ax_main.text(info_x, 0.98, '\n'.join(header),
+                 transform=ax_main.transAxes, fontsize=9, color='gray',
+                 va='top', ha=info_ha, linespacing=1.15)
+ 
+    # ── Stats in ratio panel (same as plot_unblinding_var) ────────────────
+    if has_data:
         dcf = dc.astype(float)
+        cov = np.diag(np.where(dcf > 0, dcf, 1.0))
+        cov += np.diag(ob_hist + dirt_hist)
+        if frac is not None:
+            cov += np.diag((frac * total_mc) ** 2)
+        c2, nd, pv = chi2_pvalue(dcf, total_mc, cov_matrix=cov)
         ds, ms = float(dcf.sum()), float(total_mc.sum())
         dp = ds / ms if ms > 0 else 0
         se = np.sqrt(ds) / ms if ms > 0 else 0
-        sye = np.sqrt(np.sum((frac * total_mc) ** 2)) / ms if ms > 0 else 0
-
-        cov = np.diag(np.where(dcf > 0, dcf, 1.0))
-        cov += np.diag(ob_hist + dirt_hist)
-        cov += np.diag((frac * total_mc) ** 2)
-        c2, nd, pv = chi2_pvalue(dcf, total_mc, cov_matrix=cov)
-
-        stats = (f'Σ Data/Pred = {dp:.2f} ± {se:.2f} (stat.) ± {sye:.2f} (syst.)\n'
-                 f'$\\chi^2$/ndf = {c2:.1f}/{nd}, p = {pv:.2f}')
-        ax_main.text(0.98, 0.55, stats, transform=ax_main.transAxes,
-                     fontsize=9, color='gray', va='top', ha='right', linespacing=1.3)
-
-    ymax = max(total_mc.max(), dc.max() if dc is not None else 0)
-    ax_main.set_ylim(bottom=0, top=ymax * 1.6)
-    ax_main.set_ylabel('Events', fontsize=12)
-
-    # Header
-    pot_str = f'{data_pot:.2e} POT' if data_pot else ''
-    ax_main.text(0.01, 1.02, watermark, transform=ax_main.transAxes,
-                 fontsize=10, va='bottom', ha='left', fontweight='bold')
-    ax_main.text(0.99, 1.02, pot_str, transform=ax_main.transAxes,
-                 fontsize=10, va='bottom', ha='right')
-
+        sye = (np.sqrt(np.sum((frac * total_mc) ** 2)) / ms
+               if frac is not None and ms > 0 else 0)
+        stats_text = (f'$\\Sigma$ Data/Pred = {dp:.2f} $\\pm$ {se:.2f} (stat.) '
+                      f'$\\pm$ {sye:.2f} (syst.)\n'
+                      f'$\\chi^2$/ndf = {c2:.1f}/{nd}, p = {pv:.2f}')
+        ax_ratio.text(info_x, 0.98, stats_text,
+                      transform=ax_ratio.transAxes, fontsize=9, color='gray',
+                      va='top', ha=info_ha, linespacing=1.15)
+        print(f"  {var_name}:")
+        print(f"    Data/Pred = {dp:.3f} ± {se:.3f} (stat.) ± {sye:.3f} (syst.)")
+        print(f"    chi2/ndf = {c2:.1f}/{nd}  p = {pv:.3f}")
+ 
     # ── Tick labels at bin edges ──────────────────────────────────────────
-    ax_ratio.set_xticks(disp_edges)
-    ax_ratio.set_xticklabels([f'{e:.3g}' if abs(e) < 10 else f'{e:.0f}'
-                              for e in disp_edges], fontsize=9)
-
-    # ── Ratio panel ───────────────────────────────────────────────────────
+    if _custom_ticks is not None:
+        ax_ratio.set_xticks(_custom_ticks[0])
+        ax_ratio.set_xticklabels(_custom_ticks[1], fontsize=9)
+    else:
+        ax_ratio.set_xticks(disp_edges)
+        ax_ratio.set_xticklabels(
+            [f'{int(e)}' if e == int(e) else f'{e:.3g}' for e in disp_edges],
+            fontsize=9)
+ 
+    # ── Ratio panel (same style as plot_unblinding_var) ───────────────────
     if has_data:
         dcf = dc.astype(float)
         with np.errstate(divide='ignore', invalid='ignore'):
@@ -1374,18 +1580,23 @@ def plot_lynn_comparison(sel_topo, stage_col, var_name,
         ax_ratio.errorbar(centers, ratio, yerr=rerr, fmt='ko', ms=3, zorder=5)
         ax_ratio.axhline(1.0, color='gray', ls='--', lw=1)
         if frac is not None:
-            # Draw syst band on ratio panel
-            for i in range(n_bins):
-                ax_ratio.fill_between(
-                    [disp_edges[i], disp_edges[i + 1]],
-                    1 - frac[i], 1 + frac[i],
-                    alpha=0.15, color='red', linewidth=0)
+            ax_ratio.fill_between(centers, 1 - frac, 1 + frac,
+                                  alpha=0.2, color='gray', step='mid')
         ax_ratio.set_ylim(0, 2)
-    ax_ratio.set_ylabel('Data/Pred', fontsize=11)
+        ax_ratio.set_ylabel('Data/MC', fontsize=11)
+    else:
+        ax_ratio.set_ylabel('Data/MC', fontsize=11)
+        ax_ratio.text(0.5, 0.5, 'No data', transform=ax_ratio.transAxes,
+                      ha='center', va='center', fontsize=12, color='gray')
+ 
     ax_ratio.set_xlabel(xlabel, fontsize=12)
     ax_ratio.set_xlim(disp_edges[0], disp_edges[-1])
-
+ 
     fig.tight_layout()
     if savefig_fn and filename:
         savefig_fn(fig, filename, save_subdir)
     return fig
+ 
+ 
+# Backward-compatible alias
+plot_lynn_comparison = plot_handscan_binning

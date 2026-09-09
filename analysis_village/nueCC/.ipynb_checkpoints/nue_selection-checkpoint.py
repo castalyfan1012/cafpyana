@@ -83,11 +83,11 @@ CUT_LABELS_MORE = [
 ]
 
 THRESH_PRIMARY_SCORE = 0.99
-THRESH_PID_SCORE     = 0.91
-THRESH_VERTEX_DIST   = 3.95
+THRESH_PID_SCORE     = 0.915
+THRESH_VERTEX_DIST   = 2.65
 THRESH_DIR_SPREAD    = 0.199
 THRESH_AXIAL_SPREAD  = 0.02
-THRESH_DEDX          = 7.6
+THRESH_DEDX          = 7.95
 
 THRESH_SB_DEDX_LO = 3.0   # MeV/cm — sideband dE/dx lower bound
 THRESH_SB_DEDX_HI = 6.0   # MeV/cm — sideband dE/dx upper bound

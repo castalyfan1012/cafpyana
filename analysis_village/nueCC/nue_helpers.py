@@ -951,8 +951,16 @@ try:
         plot_pid_fraction_vs_ke,
         save_plot,
         plot_lynn_comparison,
-        SRC_LABEL, COLORS,
+        LYNN_KE_BINS_GEV,
+        LYNN_KE_BINS_MEV,
+        LYNN_COS_BINS,
+        SRC_LABEL,
+        COLORS,
         _mat,
     )
-except ImportError:
-    pass  # nue_plotter not yet on path
+except ImportError as _e:
+    import warnings as _w
+    _w.warn(
+        f"nue_helpers: could not import from nue_plotter — "
+        f"plotting functions will be unavailable. Error: {_e}"
+    )
