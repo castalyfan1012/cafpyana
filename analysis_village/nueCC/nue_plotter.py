@@ -846,13 +846,13 @@ def plot_differential_slices(
         mc_slice = mc_final[(mc_final[slice_var] >= s_lo) & (mc_final[slice_var] < s_hi)]
 
         stack_series, stack_weights, stack_labels, stack_colors = [], [], [], []
-        for cat in reversed(display_cats):
+        for cat in display_cats:                      # was: reversed(display_cats)
             vals = mc_slice.loc[mc_slice['truth_cat'] == cat, plot_var].dropna().values
             stack_series.append(vals)
             stack_weights.append(np.full(len(vals), pot_scale))
             stack_labels.append(CAT_LABELS[cat])
             stack_colors.append(CAT_COLORS[cat])
-
+            
         sv = np.asarray(dirt_reco_dict.get(slice_var, []), dtype=float)
         pv = np.asarray(dirt_reco_dict.get(plot_var, []), dtype=float)
         valid = ~np.isnan(sv) & ~np.isnan(pv)
@@ -918,13 +918,8 @@ def plot_differential_slices(
 
         if si == 0:
             handles_raw, labels_raw = ax.get_legend_handles_labels()
-            mc_h = handles_raw[:n_mc][::-1]
-            mc_l = labels_raw[:n_mc][::-1]
-            ext_h = handles_raw[n_mc:n_stack]
-            ext_l = labels_raw[n_mc:n_stack]
-            rest_h = handles_raw[n_stack:]
-            rest_l = labels_raw[n_stack:]
-            ax.legend(mc_h + ext_h + rest_h, mc_l + ext_l + rest_l,
+            # forward order already matches canonical: cats 0-6, dirt, offbeam
+            ax.legend(handles_raw, labels_raw,
                       fontsize=7, ncol=2, loc='best',
                       frameon=True, framealpha=0.8, edgecolor='none')
         else:
@@ -1163,6 +1158,85 @@ def plot_fracunc(vcfg, cv_arr, cov_results_var, block_key, categ,
     return fig
 
 
+def plot_source_breakdown(sub_univ_dict, sig_cv, vcfg, categ='Signal',
+                          top_n=5, group_label='GENIE', color=None,
+                          get_cov_self=None, savefig_fn=None,
+                          filename=None, save_subdir='source_breakdown',
+                          title=r'SBND $\nu_e$ CC Inclusive'):
+    """
+    Fractional-uncertainty breakdown by named sub-source.
+
+    Parameters
+    ----------
+    sub_univ_dict : dict {sub_source_name: universe_hist (n_univ, n_bins)}
+        Per-named-dial universe histograms for one systematic family.
+    sig_cv : (n_bins,) central-value histogram (signal or bkg).
+    get_cov_self : callable(univ, cv) -> cov matrix (n_bins, n_bins).
+        Pass in get_covariance_matrix_self.
+    top_n : rank sub-sources by their summed (sqrt of trace) frac unc.
+    """
+    import warnings
+    assert get_cov_self is not None, "pass get_covariance_matrix_self as get_cov_self"
+
+    bins_arr = vcfg.bins
+    centers = vcfg.bin_centers
+    n_bins = len(sig_cv)
+
+    # Per-source per-bin fractional uncertainty + a scalar rank metric
+    per_source = {}
+    for name, univ in sub_univ_dict.items():
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)
+            cov = _mat(get_cov_self(univ, sig_cv))
+        diag = np.diag(cov).clip(0)
+        frac = np.where(sig_cv > 0, np.sqrt(diag) / sig_cv, 0.0)
+        # rank metric: total fractional unc = sqrt(sum diag)/sum cv
+        total_frac = (np.sqrt(diag.sum()) / sig_cv.sum()
+                      if sig_cv.sum() > 0 else 0.0)
+        per_source[name] = dict(frac=frac, diag=diag, total=total_frac)
+
+    ranked = sorted(per_source.items(), key=lambda kv: kv[1]['total'],
+                    reverse=True)
+    top = ranked[:top_n]
+
+    # Quadrature total over ALL sub-sources (not just top-N)
+    total_diag = sum(v['diag'] for v in per_source.values())
+    total_frac_bin = np.where(sig_cv > 0, np.sqrt(total_diag) / sig_cv, 0.0)
+    total_scalar = (np.sqrt(total_diag.sum()) / sig_cv.sum()
+                    if sig_cv.sum() > 0 else 0.0)
+
+    # ── Plot ──────────────────────────────────────────────────────────────
+    import matplotlib.cm as cm
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    base = color or COLORS.get(group_label.lower(), 'tab:blue')
+    shades = cm.get_cmap('viridis')(np.linspace(0.15, 0.85, len(top)))
+
+    for (name, v), sh in zip(top, shades):
+        xe = np.append(bins_arr[:-1], bins_arr[-1])
+        ye = np.append(v['frac'], v['frac'][-1])
+        ax.step(xe, ye, where='post', lw=1.7, color=sh,
+                label=f"{name} ({v['total']*100:.1f}%)")
+
+    xe = np.append(bins_arr[:-1], bins_arr[-1])
+    ye = np.append(total_frac_bin, total_frac_bin[-1])
+    ax.step(xe, ye, where='post', lw=2.4, ls='--', color='black',
+            label=f"Total {group_label} ({total_scalar*100:.1f}%)")
+
+    ax.set_xlabel(vcfg.var_plot_name, fontsize=12)
+    ax.set_ylabel('Fractional uncertainty', fontsize=12)
+    ax.set_title(f'{title} — {group_label} breakdown ({categ})', fontsize=12)
+    ax.legend(fontsize=9, ncol=1, loc='best', title='Top sources',
+              framealpha=0.4)
+    ax.set_xlim(bins_arr[0], bins_arr[-1])
+    ax.set_ylim(bottom=0)
+    ax.grid(axis='y', alpha=0.3)
+    ax.text(0.99, 0.97, vcfg.pot_label, transform=ax.transAxes,
+            ha='right', va='top', fontsize=10, color='gray')
+    fig.tight_layout()
+    if savefig_fn and filename:
+        savefig_fn(fig, filename, save_subdir)
+    return fig, ranked
+    
 # ══════════════════════════════════════════════════════════════════════════════
 # ★ NEW: Lynn-style variable-width binning comparison plots
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1597,6 +1671,8 @@ def plot_handscan_binning(sel_topo, stage_col, var_name,
         savefig_fn(fig, filename, save_subdir)
     return fig
  
- 
+
+
+
 # Backward-compatible alias
 plot_lynn_comparison = plot_handscan_binning

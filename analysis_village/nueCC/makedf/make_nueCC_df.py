@@ -897,3 +897,110 @@ def make_nuecc_wgtdf(f):
     print(f"  wgtdf output: {len(out)} rows x {out.shape[1]} cols  "
           f"({out.memory_usage(deep=True).sum()/1e9:.3f} GB)")
     return out
+
+
+def make_nuecc_wgtdf_full(f):
+    """
+    Per-dial (slim=False) weights for the breakdown plots.
+    Compact: multisim dials keep 100 univs; +/-sigma dials keep only ps1;
+    morph dials keep their single column. Preselected nus only.
+
+    Returns a frame with the SAME index as make_nuecc_wgtdf, columns are
+    MultiIndex (dial_name, variation).
+    """
+    from makedf import bnbsyst, geniesyst
+    from makedf.getsyst import getsyst
+
+    # ── Steps 1-3: identical preselection → presel_ind ───────────────────────
+    truth_info = _get_truth_info(f)
+    if truth_info.empty:
+        return pd.DataFrame()
+    presel_mct = truth_info.loc[truth_info["passed_presel"], "mct_index"]
+    presel_mct = presel_mct[presel_mct >= 0]
+    if presel_mct.empty:
+        return pd.DataFrame()
+
+    pair_df = pd.DataFrame({
+        "entry": np.asarray(presel_mct.index.get_level_values(0)),
+        "mct":   presel_mct.astype(np.int64).values,
+    }).drop_duplicates().reset_index(drop=True)
+
+    _spine_cache.clear(); _truth_info_cache.clear()
+    del truth_info, presel_mct
+    _force_free()
+
+    mcdf = make_mcnudf(f, include_weights=False)
+    mcdf_pair_idx = pd.MultiIndex.from_arrays(
+        [mcdf.index.get_level_values(0),
+         np.asarray(mcdf.index.get_level_values(-1), dtype=np.int64)],
+        names=["entry", "mct"])
+    presel_pair_idx = pd.MultiIndex.from_arrays(
+        [pair_df["entry"].values, pair_df["mct"].values], names=["entry", "mct"])
+    keep_mask = mcdf_pair_idx.isin(presel_pair_idx)
+    presel_mcdf_index = mcdf.index[keep_mask]
+    del mcdf, mcdf_pair_idx, presel_pair_idx, keep_mask, pair_df
+    gc.collect()
+
+    if len(presel_mcdf_index) == 0:
+        return pd.DataFrame()
+
+    presel_ind = pd.Series(
+        np.asarray(presel_mcdf_index.get_level_values(-1), dtype=np.int64),
+        index=presel_mcdf_index)
+
+    # ── Helper: shrink a slim=False frame to compact per-dial columns ────────
+    def _compact(df):
+        """Keep multisim univ_* in full; reduce +/-sigma to ps1; morph as-is."""
+        if df is None or df.empty:
+            return None
+        keep_cols = []
+        for name in dict.fromkeys(c[0] for c in df.columns):  # ordered unique
+            dcols = [c for c in df.columns if c[0] == name]
+            seconds = [c[1] for c in dcols]
+            if all('univ_' in s for s in seconds):            # multisim → keep all
+                keep_cols.extend(dcols)
+            elif 'ps1' in seconds:                            # +/-sigma → ps1 only
+                keep_cols.append((name, 'ps1'))
+            elif 'morph' in seconds:                          # morph → keep
+                keep_cols.append((name, 'morph'))
+            # (cv columns and ps2/ms2/... are dropped)
+        out = df[keep_cols].copy()
+        # downcast to float32 to halve memory
+        return out.astype(np.float32)
+
+    out = None
+    for fn, kw in [
+        (lambda: bnbsyst.bnbsyst(f, presel_ind, multisim_nuniv=100, slim=False), {}),
+        (lambda: geniesyst.geniesyst(f, presel_ind, multisim_nuniv=100, slim=False), {}),
+        (lambda: getsyst(f, EXTRA_XSEC_SYSTS, presel_ind,
+                         multisim_nuniv=100, slim=False), {}),
+    ]:
+        try:
+            w = _compact(fn())
+            if w is not None and not w.empty:
+                out = w if out is None else multicol_concat(out, w)
+                del w
+        except Exception as e:
+            warnings.warn(f"make_nuecc_wgtdf_full: sub-syst failed — {e}")
+        _force_free()
+
+    # g4: already per-channel and small; keep as-is (3×100)
+    try:
+        from makedf import g4syst as g4syst_mod
+        g4 = g4syst_mod.g4syst(f, presel_ind)
+        if g4 is not None and not g4.empty:
+            g4 = g4.astype(np.float32)
+            out = g4 if out is None else multicol_concat(out, g4)
+            del g4
+    except Exception as e:
+        warnings.warn(f"make_nuecc_wgtdf_full: G4 failed — {e}")
+    _force_free()
+
+    del presel_ind, presel_mcdf_index
+    gc.collect()
+
+    if out is None or out.empty:
+        return pd.DataFrame()
+    print(f"  wgtdf_full: {len(out)} rows x {out.shape[1]} cols  "
+          f"({out.memory_usage(deep=True).sum()/1e9:.3f} GB)")
+    return out

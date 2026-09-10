@@ -736,7 +736,7 @@ def annotate_chi2(ax, observed, expected, cov_matrix=None, stat_errors=None,
 CAT_COLORS = {
     0:  "#56B4E9",   1:  "#0072B2",   2:  "green",     3:  "#009E73",
     4:  "#E69F00",   5:  "#CC79A7",   6:  "#F0E442",   7:  "#BDBDBD",
-    9:  "#D2691E",  -1:  "#7F7F7F",
+    9:  "#BFB89A",  -1:  "#7F7F7F",
 }
 CAT_LABELS = {
     0:  r"$\nu_e$ CC (FV)",          1:  r"$\nu_e$ CC (out FV)",
