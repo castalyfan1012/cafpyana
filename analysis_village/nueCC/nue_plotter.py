@@ -1111,7 +1111,7 @@ def plot_heatmap_custom(matrix, title, vcfg, axis_labels=None,
 # ══════════════════════════════════════════════════════════════════════════════
 
 SRC_LABEL = {
-    'flux': 'BNB Flux', 'genie': 'GENIE', 'extra_xsec': 'Extra Xsec',
+    'flux': 'BNB Flux', 'genie': 'GENIE', 'extra_xsec': 'Other Xsec',
     'g4': 'Geant4', 'mcstat': 'MCstat', 'pot': 'POT',
     'ntargets': r'$N_\mathrm{targets}$', 'detsys': 'Detector',
 }
@@ -1236,7 +1236,66 @@ def plot_source_breakdown(sub_univ_dict, sig_cv, vcfg, categ='Signal',
     if savefig_fn and filename:
         savefig_fn(fig, filename, save_subdir)
     return fig, ranked
-    
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Per-family dial breakdown plot
+# ══════════════════════════════════════════════════════════════════════════════
+
+FAMILY_LABELS = {
+    'genie': 'GENIE', 'flux': 'BNB Flux',
+    'other_xsec': 'Other Xsec', 'g4': 'Geant4',
+}
+
+def plot_dial_breakdown(vcfg, sig_cv, rankings, family,
+                        top_n=5, title=r'SBND $\nu_e$ CC Inclusive',
+                        savefig_fn=None, save_subdir='source_breakdown'):
+    """
+    Plot per-dial fractional uncertainty breakdown for one variable and family.
+    Matches Lynn's Fig 7, 8, 41-43 style.
+    """
+    import matplotlib.cm as cm
+
+    if not rankings:
+        return None
+
+    top = rankings[:top_n]
+    total_diag = sum(r[3] for r in rankings)
+    total_frac = np.where(sig_cv > 0, np.sqrt(total_diag) / sig_cv, 0.0)
+    total_scalar = (np.sqrt(total_diag.sum()) / sig_cv.sum()
+                    if sig_cv.sum() > 0 else 0.0)
+
+    family_label = FAMILY_LABELS.get(family, family)
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    shades = cm.get_cmap('tab10')(np.linspace(0, 0.5, max(top_n, 3)))
+
+    for (name, tot, frac, _), sh in zip(top, shades):
+        xe = np.append(vcfg.bins[:-1], vcfg.bins[-1])
+        ye = np.append(frac, frac[-1])
+        ax.step(xe, ye, where='post', lw=1.7, color=sh,
+                label=f"{name} ({tot*100:.1f}%)")
+
+    xe = np.append(vcfg.bins[:-1], vcfg.bins[-1])
+    ye = np.append(total_frac, total_frac[-1])
+    ax.step(xe, ye, where='post', lw=2.4, ls='--', color='black',
+            label=f"Total {family_label} ({total_scalar*100:.1f}%)")
+
+    ax.set_xlabel(vcfg.var_plot_name, fontsize=12)
+    ax.set_ylabel('Fractional uncertainty', fontsize=12)
+    ax.set_title(f'{title} — {family_label} breakdown (Signal)', fontsize=12)
+    ax.legend(fontsize=9, ncol=1, loc='best', framealpha=0.4,
+              title=f'top {top_n} sources')
+    ax.set_xlim(vcfg.bins[0], vcfg.bins[-1])
+    ax.set_ylim(bottom=0)
+    ax.grid(axis='y', alpha=0.3)
+    ax.text(0.99, 0.97, vcfg.pot_label, transform=ax.transAxes,
+            ha='right', va='top', fontsize=10, color='gray')
+    fig.tight_layout()
+
+    if savefig_fn:
+        savefig_fn(fig, f'{vcfg.name}_{family}_breakdown_signal', save_subdir)
+    return fig
 # ══════════════════════════════════════════════════════════════════════════════
 # ★ NEW: Lynn-style variable-width binning comparison plots
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1456,7 +1515,7 @@ def plot_handscan_binning(sel_topo, stage_col, var_name,
         assert len(display_widths) == n_bins, \
             f"display_widths has {len(display_widths)} entries but {n_bins} bins"
         x_edges = np.concatenate([[0], np.cumsum(display_widths)])
-        edge_labels = [f'{e:.3g}' for e in disp_edges_phys]
+        edge_labels = [f'{int(e)}' if e == int(e) else f'{e:.2f}' for e in disp_edges_phys]
         disp_edges = x_edges
         centers = 0.5 * (x_edges[:-1] + x_edges[1:])
         _custom_ticks = (x_edges, edge_labels)

@@ -18,6 +18,25 @@ from tqdm.auto import tqdm
 # 1.  Generic HDF helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
+# def load_hdf_key(hdf_file, key_prefix):
+#     """Load a (possibly split) HDF key, concatenating sub-keys."""
+#     with pd.HDFStore(hdf_file, mode="r") as store:
+#         keys = store.keys()
+#         if '/split' in keys:
+#             try:
+#                 split_df = store['split']
+#                 n = int(split_df['n_split'].iloc[0])
+#                 return pd.concat([store[f'{key_prefix}_{k}'] for k in range(n)])
+#             except (AttributeError, KeyError, TypeError):
+#                 pass
+#         matching = sorted(
+#             k for k in keys
+#             if k.lstrip('/').startswith(key_prefix.lstrip('/'))
+#         )
+#         if not matching:
+#             raise KeyError(f"No keys matching {key_prefix!r} in {hdf_file}")
+#         return pd.concat([store[k] for k in matching])
+        
 def load_hdf_key(hdf_file, key_prefix):
     """Load a (possibly split) HDF key, concatenating sub-keys."""
     with pd.HDFStore(hdf_file, mode="r") as store:
@@ -29,14 +48,16 @@ def load_hdf_key(hdf_file, key_prefix):
                 return pd.concat([store[f'{key_prefix}_{k}'] for k in range(n)])
             except (AttributeError, KeyError, TypeError):
                 pass
-        matching = sorted(
-            k for k in keys
-            if k.lstrip('/').startswith(key_prefix.lstrip('/'))
+        # Match e.g. /mcnu_0 but NOT /mcnu_full_0
+        # Key must be /<prefix>_<digits> exactly
+        import re
+        pattern = re.compile(
+            r'^/?' + re.escape(key_prefix.lstrip('/')) + r'_\d+$'
         )
+        matching = sorted(k for k in keys if pattern.match(k.lstrip('/')))
         if not matching:
             raise KeyError(f"No keys matching {key_prefix!r} in {hdf_file}")
         return pd.concat([store[k] for k in matching])
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 2.  sel_topo loader
@@ -672,6 +693,261 @@ def extract_lowE_extras(lowE_data, extract_reco_fn=None):
     return lowE_data
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Per-dial breakdown: loading & alignment
+# ══════════════════════════════════════════════════════════════════════════════
+
+def load_mcnu_full_selected(weights_file, df_file, sel_topo, final_stage,
+                            verbose=True):
+    """
+    Load mcnu_full per-dial weights for final-selection events only.
+
+    Memory-efficient: loads one sub-key at a time, matches via mct_index,
+    keeps only ~8K selected rows. Returns ~(n_selected, n_dial_cols) float32.
+
+    Parameters
+    ----------
+    weights_file : str — HDF with mcnu_full_0..N keys
+    df_file      : str — evtdf HDF (for mct_index alignment)
+    sel_topo     : DataFrame with FINAL_STAGE boolean column
+    final_stage  : str — column name for final selection stage
+
+    Returns
+    -------
+    wgt_full_sel : DataFrame (sel_topo-indexed, per-dial columns)
+    """
+    import re
+
+    sel_final_idx = sel_topo.index[sel_topo[final_stage]]
+    if verbose:
+        print(f"Final-selection events: {len(sel_final_idx)}")
+
+    # Step 1: read mct_index from evtdf
+    with pd.HDFStore(df_file, mode='r') as store:
+        evt_keys = sorted(k for k in store.keys()
+                          if re.match(r'^/?evt_\d+$', k.lstrip('/')))
+
+    sample_cols = pd.read_hdf(df_file, key=evt_keys[0], start=0, stop=0).columns.tolist()
+    mct_col = next(c for c in sample_cols
+                   if 'mct_index' in str(c) and 'dlp_true' in str(c))
+
+    mct_frames = []
+    for ek in tqdm(evt_keys, desc='reading mct_index', leave=False):
+        with pd.HDFStore(df_file, mode='r') as store:
+            chunk = store[ek]
+        chunk = chunk[[mct_col]]
+        il = chunk.index.names[:-1]
+        mct_frames.append(chunk.groupby(level=il).first())
+        del chunk; gc.collect()
+    mct_inter = pd.concat(mct_frames)
+    del mct_frames; gc.collect()
+
+    mct_sel = mct_inter.reindex(sel_final_idx)[mct_col].dropna().astype(np.int64)
+    if verbose:
+        print(f"Selected events with valid mct_index: {len(mct_sel)}")
+
+    lookup = pd.DataFrame({
+        'entry': mct_sel.index.get_level_values('entry').astype(np.int64),
+        'mct':   mct_sel.values,
+        '_sel_pos': np.arange(len(mct_sel), dtype=np.int32),
+    }, index=mct_sel.index)
+    del mct_inter, mct_sel; gc.collect()
+
+    # Step 2: find mcnu_full sub-keys
+    with pd.HDFStore(weights_file, mode='r') as store:
+        full_keys = sorted(k for k in store.keys()
+                           if re.match(r'^/?mcnu_full_\d+$', k.lstrip('/')))
+    if verbose:
+        print(f"mcnu_full sub-keys: {len(full_keys)}")
+
+    # Get column structure from first chunk
+    with pd.HDFStore(weights_file, mode='r') as store:
+        _sample = store[full_keys[0]].head(1)
+        full_cols = _sample.columns.tolist()
+        del _sample
+
+    # Step 3: load one sub-key at a time, match to selected events
+    n_sel = len(lookup)
+    result_arr = np.full((n_sel, len(full_cols)), np.nan, dtype=np.float32)
+    total_matched = 0
+
+    for fk in tqdm(full_keys, desc='loading mcnu_full', leave=False):
+        with pd.HDFStore(weights_file, mode='r') as store:
+            chunk = store[fk]
+
+        chunk_df = pd.DataFrame({
+            'entry': chunk.index.get_level_values(0).astype(np.int64).values,
+            'mct':   chunk.index.get_level_values(-1).astype(np.int64).values,
+            '_chunk_pos': np.arange(len(chunk), dtype=np.int32),
+        })
+
+        merged = lookup.reset_index(drop=True)[['entry','mct','_sel_pos']].merge(
+            chunk_df, on=['entry','mct'], how='inner')
+
+        if len(merged) > 0:
+            result_arr[merged['_sel_pos'].values] = \
+                chunk.values[merged['_chunk_pos'].values].astype(np.float32)
+            total_matched += len(merged)
+
+        del chunk, chunk_df, merged; gc.collect()
+
+    if verbose:
+        print(f"Total matched: {total_matched} / {n_sel}")
+
+    wgt_full_sel = pd.DataFrame(
+        result_arr, index=lookup.index,
+        columns=pd.MultiIndex.from_tuples(full_cols))
+    del result_arr, lookup; gc.collect()
+
+    if verbose:
+        print(f"wgt_full_sel shape: {wgt_full_sel.shape}  "
+              f"memory: {wgt_full_sel.memory_usage(deep=True).sum()/1e6:.1f} MB  "
+              f"NaN: {wgt_full_sel.isna().mean().mean():.1%}")
+    return wgt_full_sel
+
+
+def classify_dials(wgt_full_sel):
+    """
+    Classify per-dial columns into type (multisim/sigma/morph) and family
+    (genie/flux/other_xsec/g4).
+
+    Returns dict: dial_name → {cols, seconds, type, family}
+    """
+    dial_info = {}
+    for c in wgt_full_sel.columns:
+        name, second = c[0], c[1]
+        if name not in dial_info:
+            dial_info[name] = {'cols': [], 'seconds': []}
+        dial_info[name]['cols'].append(c)
+        dial_info[name]['seconds'].append(second)
+
+    for name, info in dial_info.items():
+        seconds = info['seconds']
+        n = len(seconds)
+        if n >= 100 and all('univ_' in str(s) for s in seconds):
+            info['type'] = 'multisim'
+        elif n == 1 and seconds[0] == 'morph':
+            info['type'] = 'morph'
+        elif any('ps' in str(s) for s in seconds):
+            info['type'] = 'sigma'
+        else:
+            info['type'] = 'other'
+
+    for name, info in dial_info.items():
+        ns = str(name)
+        if 'GENIEReWeight' in ns:
+            info['family'] = 'genie'
+        elif any(k in ns for k in ['MINERvA','MiscInteraction','NOvAStyle']):
+            info['family'] = 'other_xsec'
+        elif 'reinteractions' in ns:
+            info['family'] = 'g4'
+        else:
+            info['family'] = 'flux'
+
+    return dial_info
+
+
+def build_dial_univs(dial_name, info, sel_df, stage_col, wgt_sel,
+                     var_col, bins, ps, n_univ=100):
+    """Build universe histograms for one dial (multisim/sigma/morph)."""
+    _eps = 1e-8
+    sel = sel_df[sel_df[stage_col]]
+    smk = (sel['truth_cat'] == 0).values
+    reco = sel[var_col].clip(bins[0], bins[-1] - _eps).values
+    nb = len(bins) - 1
+    cols = info['cols']
+    wmat = wgt_sel.reindex(sel.index)[cols].values.astype(np.float32)
+
+    if info['type'] == 'multisim':
+        su = np.zeros((min(n_univ, wmat.shape[1]), nb))
+        for u in range(su.shape[0]):
+            w = np.where(np.isfinite(wmat[:, u]), wmat[:, u], 1.0)
+            w = np.clip(w, 0.0, 10.0) * ps
+            su[u], _ = np.histogram(reco[smk], bins=bins, weights=w[smk])
+        return su
+    elif info['type'] == 'sigma':
+        ps1_idx = info['seconds'].index('ps1')
+        ps1_w = np.where(np.isfinite(wmat[:, ps1_idx]), wmat[:, ps1_idx], 1.0)
+        su = np.zeros((n_univ, nb))
+        for u in range(n_univ):
+            z = np.random.normal(0, 1)
+            w = np.clip(1.0 + (ps1_w - 1.0) * z, 0.0, 10.0) * ps
+            su[u], _ = np.histogram(reco[smk], bins=bins, weights=w[smk])
+        return su
+    elif info['type'] == 'morph':
+        mw = np.where(np.isfinite(wmat[:, 0]), wmat[:, 0], 1.0)
+        su = np.zeros((n_univ, nb))
+        for u in range(n_univ):
+            z = np.abs(np.random.normal(0, 1))
+            w = np.clip(1.0 + (mw - 1.0) * 2 * z, 0.0, 10.0) * ps
+            su[u], _ = np.histogram(reco[smk], bins=bins, weights=w[smk])
+        return su
+    return np.zeros((n_univ, nb))
+
+
+def short_dial_name(full_name):
+    """Strip GENIE/Flux prefixes for cleaner legend labels."""
+    for prefix in ['GENIEReWeight_SBN_v1_multisim_',
+                    'GENIEReWeight_SBN_v1_multisigma_']:
+        if full_name.startswith(prefix):
+            return full_name[len(prefix):]
+    if full_name.endswith('_Flux'):
+        return full_name[:-5]
+    return full_name
+
+
+def compute_dial_rankings(var_cfgs, cv_results, dial_info, sel_topo,
+                          final_stage, wgt_full_sel, pot_scale,
+                          families=None, n_univ=100):
+    """
+    Compute per-dial fractional uncertainty rankings for each variable and family.
+
+    Returns dict: vcfg.name → family → [(short_name, total_frac, frac_per_bin, diag)]
+    """
+    from analysis_village.unfolding.covariance import get_covariance_matrix_self
+
+    if families is None:
+        families = ['genie', 'flux', 'other_xsec', 'g4']
+
+    np.random.seed(42)
+    breakdown_results = {}
+
+    for vcfg in var_cfgs:
+        sig_cv = cv_results[vcfg.name]['sig_cv']
+        breakdown_results[vcfg.name] = {}
+
+        for family in families:
+            family_dials = {n: v for n, v in dial_info.items()
+                           if v['family'] == family}
+            if not family_dials:
+                continue
+
+            rankings = []
+            for dial_name, info in tqdm(family_dials.items(),
+                                         desc=f'{vcfg.name}/{family}', leave=False):
+                su = build_dial_univs(
+                    dial_name, info, sel_topo, final_stage,
+                    wgt_full_sel, vcfg.name, vcfg.bins, pot_scale, n_univ)
+                with warnings.catch_warnings():
+                    warnings.simplefilter('ignore', RuntimeWarning)
+                    cov = get_covariance_matrix_self(su, sig_cv)
+                    if isinstance(cov, dict):
+                        cov = cov.get('cov', np.zeros_like(np.outer(sig_cv, sig_cv)))
+                diag = np.diag(cov).clip(0)
+                frac = np.where(sig_cv > 0, np.sqrt(diag) / sig_cv, 0.0)
+                total = (np.sqrt(diag.sum()) / sig_cv.sum()
+                         if sig_cv.sum() > 0 else 0.0)
+                rankings.append((short_dial_name(dial_name), total, frac, diag))
+
+            rankings.sort(key=lambda x: x[1], reverse=True)
+            breakdown_results[vcfg.name][family] = rankings
+
+            print(f"\n{vcfg.name} / {family} — top 5:")
+            for i, (name, tot, _, _) in enumerate(rankings[:5]):
+                print(f"  {i+1}. {name:<40s} {tot*100:.2f}%")
+
+    return breakdown_results
+    
 # ============================================================
 # chi2 / p-value utilities
 # ============================================================
