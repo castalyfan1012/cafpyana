@@ -1296,6 +1296,42 @@ def plot_dial_breakdown(vcfg, sig_cv, rankings, family,
     if savefig_fn:
         savefig_fn(fig, f'{vcfg.name}_{family}_breakdown_signal', save_subdir)
     return fig
+
+
+def plot_cosmic_breakdown(vcfg, sig_cv, ob_h, it_h, total_mc,
+                          title=r'SBND $\nu_e$ CC Inclusive',
+                          savefig_fn=None, save_subdir='source_breakdown'):
+    """
+    Cosmic uncertainty vs kinematic variable, matching the dial-breakdown style.
+    Shows per-bin |offbeam - intime|/total and the conservative envelope.
+    """
+    _eps = 1e-8
+    with np.errstate(divide='ignore', invalid='ignore'):
+        frac_diff = np.where(total_mc > 0, np.abs(ob_h - it_h) / total_mc, 0.0)
+    envelope = np.full(len(frac_diff), np.nanmax(frac_diff))
+    scalar = np.nanmax(frac_diff)
+
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    xe = np.append(vcfg.bins[:-1], vcfg.bins[-1])
+    ax.step(xe, np.append(frac_diff, frac_diff[-1]), where='post', lw=1.7,
+            color='#E91E63', label='Per-bin |OB−intime|/MC')
+    ax.step(xe, np.append(envelope, envelope[-1]), where='post', lw=2.4,
+            ls='--', color='black', label=f'Envelope ({scalar*100:.1f}%)')
+    ax.set_xlabel(vcfg.var_plot_name, fontsize=12)
+    ax.set_ylabel('Cosmic fractional uncertainty', fontsize=12)
+    ax.set_title(f'{title} — Cosmic breakdown', fontsize=12)
+    ax.legend(fontsize=9, loc='best', framealpha=0.4)
+    ax.set_xlim(vcfg.bins[0], vcfg.bins[-1]); ax.set_ylim(bottom=0)
+    ax.grid(axis='y', alpha=0.3)
+    ax.text(0.99, 0.97, vcfg.pot_label, transform=ax.transAxes,
+            ha='right', va='top', fontsize=10, color='gray')
+    fig.tight_layout()
+    if savefig_fn:
+        savefig_fn(fig, f'{vcfg.name}_cosmic_breakdown', save_subdir)
+    return fig
+
+
+    
 # ══════════════════════════════════════════════════════════════════════════════
 # ★ NEW: Lynn-style variable-width binning comparison plots
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1479,7 +1515,7 @@ def plot_handscan_binning(sel_topo, stage_col, var_name,
                           bins_override=None,
                           display_widths=None,
                           savefig_fn=None, filename=None,
-                          save_subdir='lynn_comparison',
+                          save_subdir='designed_binning',
                           title=r'SBND $\nu_e$ CC Inclusive'):
     """
     Stacked histogram + ratio panel with variable-width binning.
@@ -1733,5 +1769,5 @@ def plot_handscan_binning(sel_topo, stage_col, var_name,
 
 
 
-# Backward-compatible alias
-plot_lynn_comparison = plot_handscan_binning
+# # Backward-compatible alias
+# plot_designed_binning = plot_handscan_binning
