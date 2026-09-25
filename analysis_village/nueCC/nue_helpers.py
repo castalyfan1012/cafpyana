@@ -701,36 +701,29 @@ def load_mcnu_full_selected(weights_file, df_file, sel_topo, final_stage,
                             verbose=True):
     """
     Load mcnu_full per-dial weights for final-selection events only.
-
-    Memory-efficient: loads one sub-key at a time, matches via mct_index,
-    keeps only ~8K selected rows. Returns ~(n_selected, n_dial_cols) float32.
-
-    Parameters
-    ----------
-    weights_file : str — HDF with mcnu_full_0..N keys
-    df_file      : str — evtdf HDF (for mct_index alignment)
-    sel_topo     : DataFrame with FINAL_STAGE boolean column
-    final_stage  : str — column name for final selection stage
-
+ 
+    Events are matched on (index level 0, index level 1, mct_index), the same
+    keys align_weights() uses, so each selected event gets exactly one row.
+ 
     Returns
     -------
     wgt_full_sel : DataFrame (sel_topo-indexed, per-dial columns)
     """
     import re
-
+ 
     sel_final_idx = sel_topo.index[sel_topo[final_stage]]
     if verbose:
         print(f"Final-selection events: {len(sel_final_idx)}")
-
+ 
     # Step 1: read mct_index from evtdf
     with pd.HDFStore(df_file, mode='r') as store:
         evt_keys = sorted(k for k in store.keys()
                           if re.match(r'^/?evt_\d+$', k.lstrip('/')))
-
+ 
     sample_cols = pd.read_hdf(df_file, key=evt_keys[0], start=0, stop=0).columns.tolist()
     mct_col = next(c for c in sample_cols
                    if 'mct_index' in str(c) and 'dlp_true' in str(c))
-
+ 
     mct_frames = []
     for ek in tqdm(evt_keys, desc='reading mct_index', leave=False):
         with pd.HDFStore(df_file, mode='r') as store:
@@ -741,69 +734,83 @@ def load_mcnu_full_selected(weights_file, df_file, sel_topo, final_stage,
         del chunk; gc.collect()
     mct_inter = pd.concat(mct_frames)
     del mct_frames; gc.collect()
-
+ 
     mct_sel = mct_inter.reindex(sel_final_idx)[mct_col].dropna().astype(np.int64)
     if verbose:
         print(f"Selected events with valid mct_index: {len(mct_sel)}")
-
+ 
+    # Key = (level 0, level 1, mct) — same as align_weights()
     lookup = pd.DataFrame({
-        'entry': mct_sel.index.get_level_values('entry').astype(np.int64),
-        'mct':   mct_sel.values,
+        'k0':  mct_sel.index.get_level_values(0).astype(np.int64),
+        'k1':  mct_sel.index.get_level_values(1).astype(np.int64),
+        'mct': mct_sel.values,
         '_sel_pos': np.arange(len(mct_sel), dtype=np.int32),
-    }, index=mct_sel.index)
+    })
+    sel_index = mct_sel.index
+    if lookup.duplicated(['k0', 'k1', 'mct']).any():
+        raise ValueError("Selected events are not unique on (level0, level1, mct_index)")
     del mct_inter, mct_sel; gc.collect()
-
+ 
     # Step 2: find mcnu_full sub-keys
     with pd.HDFStore(weights_file, mode='r') as store:
         full_keys = sorted(k for k in store.keys()
                            if re.match(r'^/?mcnu_full_\d+$', k.lstrip('/')))
     if verbose:
         print(f"mcnu_full sub-keys: {len(full_keys)}")
-
-    # Get column structure from first chunk
+ 
     with pd.HDFStore(weights_file, mode='r') as store:
         _sample = store[full_keys[0]].head(1)
         full_cols = _sample.columns.tolist()
+        if _sample.index.nlevels < 3:
+            raise ValueError(f"mcnu_full index has {_sample.index.nlevels} levels; "
+                             "expected (level0, level1, ..., mct_index)")
         del _sample
-
-    # Step 3: load one sub-key at a time, match to selected events
+ 
+    # Step 3: one sub-key at a time
     n_sel = len(lookup)
     result_arr = np.full((n_sel, len(full_cols)), np.nan, dtype=np.float32)
-    total_matched = 0
-
+    filled = np.zeros(n_sel, dtype=bool)
+ 
     for fk in tqdm(full_keys, desc='loading mcnu_full', leave=False):
         with pd.HDFStore(weights_file, mode='r') as store:
             chunk = store[fk]
-
+ 
         chunk_df = pd.DataFrame({
-            'entry': chunk.index.get_level_values(0).astype(np.int64).values,
-            'mct':   chunk.index.get_level_values(-1).astype(np.int64).values,
+            'k0':  chunk.index.get_level_values(0).astype(np.int64).values,
+            'k1':  chunk.index.get_level_values(1).astype(np.int64).values,
+            'mct': chunk.index.get_level_values(-1).astype(np.int64).values,
             '_chunk_pos': np.arange(len(chunk), dtype=np.int32),
         })
-
-        merged = lookup.reset_index(drop=True)[['entry','mct','_sel_pos']].merge(
-            chunk_df, on=['entry','mct'], how='inner')
-
+        merged = lookup.merge(chunk_df, on=['k0', 'k1', 'mct'], how='inner')
+ 
         if len(merged) > 0:
-            result_arr[merged['_sel_pos'].values] = \
-                chunk.values[merged['_chunk_pos'].values].astype(np.float32)
-            total_matched += len(merged)
-
+            pos = merged['_sel_pos'].values
+            if merged['_sel_pos'].duplicated().any() or filled[pos].any():
+                raise ValueError(f"{fk}: a selected event matched more than one "
+                                 "mcnu_full row — check the index levels")
+            result_arr[pos] = chunk.values[merged['_chunk_pos'].values].astype(np.float32)
+            filled[pos] = True
+ 
         del chunk, chunk_df, merged; gc.collect()
-
+ 
     if verbose:
-        print(f"Total matched: {total_matched} / {n_sel}")
-
+        print(f"Total matched: {filled.sum()} / {n_sel}")
+    if filled.sum() < n_sel:
+        warnings.warn(f"{n_sel - filled.sum()} selected events have no mcnu_full row "
+                      "(weights left NaN → treated as 1 downstream)")
+ 
     wgt_full_sel = pd.DataFrame(
-        result_arr, index=lookup.index,
+        result_arr, index=sel_index,
         columns=pd.MultiIndex.from_tuples(full_cols))
     del result_arr, lookup; gc.collect()
-
+ 
     if verbose:
         print(f"wgt_full_sel shape: {wgt_full_sel.shape}  "
               f"memory: {wgt_full_sel.memory_usage(deep=True).sum()/1e6:.1f} MB  "
               f"NaN: {wgt_full_sel.isna().mean().mean():.1%}")
     return wgt_full_sel
+
+
 
 
 def classify_dials(wgt_full_sel):
@@ -1240,3 +1247,391 @@ except ImportError as _e:
         f"nue_helpers: could not import from nue_plotter — "
         f"plotting functions will be unavailable. Error: {_e}"
     )
+
+
+# 10.  Systematic sources, per-knob universes, covariances
+# ══════════════════════════════════════════════════════════════════════════════
+import re as _re
+import zlib as _zlib
+from tqdm import tqdm as _tqdm_txt          # plain-text bars (no Jupyter widget errors)
+ 
+FAM_MAP = {'flux': 'flux', 'genie': 'genie', 'other_xsec': 'extra_xsec', 'g4': 'g4'}
+N_UNIV_SIGMA = 100          # universes generated for every ±1σ / morph knob
+COV_BLOCKS = ['cov_ms_ms', 'cov_bs_bs', 'cov_ms_bs', 'cov_bs_ms']
+ 
+ 
+def _src_entry(family, group, cols, label, dial_type='multisim'):
+    return dict(family=family, group=group, cols=list(cols), kind='multisim',
+                dial_type=dial_type, label=label)
+ 
+ 
+def split_sources(aligned_src_cols, tag=''):
+    """family → cols (from align_weights)  ⟶  {key: source} — one source per weight group."""
+    out = {}
+    for fam, cols in aligned_src_cols.items():
+        for c in cols:
+            g = c[0] if isinstance(c, tuple) else str(c)
+            key = f"{fam}__{tag}{_re.sub(r'[^A-Za-z0-9]+', '_', str(g)).strip('_')}"
+            label = f"{tag.rstrip('_')}: {g}" if tag else str(g)
+            out.setdefault(key, _src_entry(fam, g, [], label))['cols'].append(c)
+    return out
+ 
+ 
+def knob_sources(wgt_full, tag='', skip_families=('g4',)):
+    """One source per knob in a mcnu_full weight table (see classify_dials)."""
+    out = {}
+    for name, info in classify_dials(wgt_full).items():
+        fam = FAM_MAP.get(info['family'], info['family'])
+        if fam in skip_families:
+            continue
+        if info['type'] == 'multisim':
+            cols = info['cols']
+        elif info['type'] == 'sigma':
+            cols = [c for c, s in zip(info['cols'], info['seconds']) if s == 'ps1']
+        elif info['type'] == 'morph':
+            cols = info['cols']
+        else:
+            print(f'  ⚠️ skipping {name}: dial type {info["type"]}')
+            continue
+        short = short_dial_name(name)
+        out[f'{fam}__{tag}{short}'] = _src_entry(
+            fam, name, cols, (f"{tag.rstrip('_')}: " if tag else '') + short, info['type'])
+    return out
+ 
+ 
+def knob_weights(wgt_full, src, n_univ=N_UNIV_SIGMA):
+    """(N_events, n_univ) universe weights for one source.
+    multisim     → the stored universes
+    ±1σ / morph  → universe u: w_u = 1 + (w − 1)·z_u, z_u ~ N(0,1), one z_u per universe,
+                   shared by all events; seeded by the knob name, so main MC, dirt and every
+                   variable get identical throws (morph treated as a ±1σ shift)."""
+    if src['dial_type'] == 'multisim':
+        return wgt_full[src['cols']]
+    w1 = wgt_full[src['cols'][0]].to_numpy(dtype=np.float32)
+    z = np.random.default_rng(_zlib.crc32(str(src['group']).encode())).standard_normal(n_univ)
+    cols = pd.MultiIndex.from_tuples([(src['group'], f'univ_{u}') for u in range(n_univ)])
+    return pd.DataFrame(1.0 + (w1[:, None] - 1.0) * z[None, :].astype(np.float32),
+                        index=wgt_full.index, columns=cols)
+ 
+ 
+def _fill_missing_weights(w, reco, bins, cls_masks):
+    """Unmatched events (NaN weight) get the mean weight of matched events of the same
+    class in the same bin (i.e. the same relative variation); 1 if the bin has none."""
+    miss = ~np.isfinite(w)
+    if not miss.any():
+        return w
+    out = w.copy()
+    b = np.clip(np.digitize(reco, bins) - 1, 0, len(bins) - 2)
+    nb = len(bins) - 1
+    for m in cls_masks:
+        ok = m & ~miss
+        s = np.bincount(b[ok], weights=w[ok], minlength=nb)
+        n = np.bincount(b[ok], minlength=nb)
+        mean = np.where(n > 0, s / np.maximum(n, 1), 1.0)
+        fill = m & miss
+        out[fill] = mean[b[fill]]
+    out[~np.isfinite(out)] = 1.0          # everything else (cosmics, no true ν) → weight 1
+    return out
+ 
+ 
+def build_univ_hists(sel_df, stage_col, wgt_aligned, univ_cols,
+                     var_col, bins, ps, clip=10.0, fill_missing=True):
+    """Signal / background universe histograms (n_univ, n_bins) at one selection stage.
+    fill_missing=True: neutrino events without a weight row (weight file built from a
+    different file list) take the bin-average variation of matched events of the same
+    class (signal / ν background); cosmics (truth_cat 6+) and no-ν events keep weight 1."""
+    sel = sel_df[sel_df[stage_col]]
+    nb, nu = len(bins) - 1, len(univ_cols)
+    if sel.empty:
+        return np.zeros((nu, nb)), np.zeros((nu, nb))
+    tc   = sel['truth_cat'].values
+    smk  = tc == 0
+    bmk  = (tc >= 1) & (tc <= 6)
+    nubk = (tc >= 1) & (tc <= 5)
+    reco = sel[var_col].clip(bins[0], bins[-1] - 1e-8).values
+ 
+    nwl = wgt_aligned.index.nlevels
+    if sel.index.nlevels > nwl:
+        sidx = sel.index.droplevel(list(range(nwl, sel.index.nlevels)))
+    elif sel.index.nlevels == nwl:
+        sidx = sel.index
+    else:
+        warnings.warn(f"build_univ_hists: sel has {sel.index.nlevels} index levels, "
+                      f"weights have {nwl}")
+        return np.zeros((nu, nb)), np.zeros((nu, nb))
+ 
+    wgt_sub = wgt_aligned[univ_cols]
+    if wgt_sub.index.duplicated().any():
+        wgt_sub = wgt_sub[~wgt_sub.index.duplicated(keep='first')]
+    wmat = wgt_sub.reindex(sidx).values.astype(np.float64)
+    wmat = np.where(np.isfinite(wmat), np.clip(wmat, 0.0, clip), np.nan)
+ 
+    su, bu = np.zeros((nu, nb)), np.zeros((nu, nb))
+    for u in range(nu):
+        w = wmat[:, u]
+        w = _fill_missing_weights(w, reco, bins, [smk, nubk]) if fill_missing \
+            else np.where(np.isfinite(w), w, 1.0)
+        w = w * ps
+        su[u], _ = np.histogram(reco[smk], bins=bins, weights=w[smk])
+        bu[u], _ = np.histogram(reco[bmk], bins=bins, weights=w[bmk])
+    return su, bu
+ 
+ 
+def fill_univ_results(sources, wgt, sel_df, stage_col, var_cfgs, ps, target, desc=''):
+    """target[var][key] = {'sig','bkg'} universe histograms for every source."""
+    for vcfg in var_cfgs:
+        target.setdefault(vcfg.name, {})
+        for key, s in _tqdm_txt(sources.items(), desc=f'{desc}{vcfg.name}', leave=False):
+            W = knob_weights(wgt, s)
+            target[vcfg.name][key] = dict(zip(
+                ('sig', 'bkg'),
+                build_univ_hists(sel_df, stage_col, W, list(W.columns),
+                                 vcfg.name, vcfg.bins, ps)))
+    return target
+ 
+ 
+def has_mcnu_full(weights_file):
+    with pd.HDFStore(weights_file, mode='r') as st:
+        return any(_re.match(r'^/mcnu_full_\d+$', k) for k in st.keys())
+ 
+ 
+def source_registry(*source_dicts):
+    """→ (family, kind, label) dicts for every source, plus the flat sources."""
+    fam, kind, label = {}, {}, {}
+    for d in source_dicts:
+        for k, v in d.items():
+            fam[k] = v['family']
+            kind[k] = v.get('kind', 'multisim')
+            label[k] = v.get('label', str(v.get('group', k)))
+    for k in ['mcstat', 'pot', 'ntargets', 'detsys']:
+        fam[k], kind[k] = k, 'flat'
+    fam['mcstat__dirt'], kind['mcstat__dirt'], label['mcstat__dirt'] = 'mcstat', 'multisim', 'dirt: MCstat'
+    return fam, kind, label
+ 
+ 
+def compute_covs(su, bu, s_cv, b_cv):
+    from analysis_village.unfolding.covariance import (
+        get_covariance_matrix_self, get_covariance_matrix)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        return {
+            'cov_ms_ms': get_covariance_matrix_self(su, s_cv),
+            'cov_bs_bs': get_covariance_matrix_self(bu, b_cv),
+            'cov_ms_bs': get_covariance_matrix(su, s_cv, bu, b_cv),
+            'cov_bs_ms': get_covariance_matrix(bu, b_cv, su, s_cv),
+        }
+ 
+ 
+def build_source_covs(univ_results, lowE_univ_results, cv_results, lowE_cv,
+                      combined_check=()):
+    """One covariance per source. Dirt is background-only (signal blocks zero).
+    Sources in combined_check go to a separate dict (cross-check, not in the total)."""
+    cov, check = {}, {}
+    for vn, cv in cv_results.items():
+        cov[vn], check[vn] = {}, {}
+        for src, ud in univ_results.get(vn, {}).items():
+            c = compute_covs(ud['sig'], ud['bkg'], cv['sig_cv'], cv['bkg_cv'])
+            (check if src in combined_check else cov)[vn][src] = c
+        dirt_cv = lowE_cv[vn]
+        for src, ud in lowE_univ_results.get(vn, {}).items():
+            c = compute_covs(np.zeros_like(ud['bkg']), ud['bkg'],
+                             np.zeros_like(dirt_cv), dirt_cv)
+            key = src if src not in cov[vn] else f'{src}__dirt'   # e.g. 'mcstat' → 'mcstat__dirt'
+            (check if src in combined_check else cov)[vn][key] = c
+    return cov, check
+ 
+ 
+def print_knob_crosscheck(cov_results, cov_check, cv_results, lowE_cv, src_family,
+                          knob_main, knob_dirt):
+    """Σ per-knob covariance vs the combined universe set of the same family."""
+    _m = lambda b: b.get('cov', b) if isinstance(b, dict) else b
+    print(f"{'var':<14s} {'combined set':<22s} {'Σ knobs':>9s} {'combined':>9s} {'ratio':>6s}")
+    for vn, checks in cov_check.items():
+        for ck, covs in checks.items():
+            dirt = '__dirt_' in ck
+            knobs = knob_dirt if dirt else knob_main
+            bk, ref = ('cov_bs_bs', lowE_cv[vn]) if dirt else ('cov_ms_ms', cv_results[vn]['sig_cv'])
+            fam = src_family[ck]
+            ks = [k for k in knobs if knobs[k]['family'] == fam]
+            if not ks:
+                continue
+            ksum = sum(_m(cov_results[vn][k][bk]) for k in ks)
+            fk = np.sqrt(np.diag(ksum).clip(0).sum()) / ref.sum()
+            fc = np.sqrt(np.diag(_m(covs[bk])).clip(0).sum()) / ref.sum()
+            print(f"{vn:<14s} {ck:<22s} {fk*100:>8.2f}% {fc*100:>8.2f}% {fk/fc:>6.2f}")
+ 
+ 
+def cosmic_covs(offbeam_reco, var_cfgs, n_ob_final, n_it_final,
+                offbeam_scale, intime_scale, offbeam_scale_6e20, verbose=True):
+    """Cosmic (off-beam) background covariance, background block only.
+    cosmic__stat : Poisson statistics of the off-beam sample (diagonal)
+    cosmic__norm : |OB − in-time MC| at the final selection (stat. fluctuation subtracted in
+                   quadrature) as a fully correlated normalization of the off-beam prediction.
+    Returns ({var: {'cosmic__stat': covs, 'cosmic__norm': covs}}, norm_frac)."""
+    OB, IT = n_ob_final * offbeam_scale, n_it_final * intime_scale
+    var_stat = n_ob_final * offbeam_scale**2 + n_it_final * intime_scale**2
+    frac = np.sqrt(max((OB - IT)**2 - var_stat, 0.0)) / OB if OB > 0 else 0.0
+    if verbose:
+        print(f"Final selection (data POT): off-beam {OB:.2f} ({n_ob_final} raw)  "
+              f"in-time MC {IT:.2f} ({n_it_final} raw)  OB/IT = {OB/IT if IT else np.nan:.2f}")
+        print(f"cosmic normalization uncertainty = {frac*100:.1f}% of the off-beam prediction")
+    out = {}
+    for vcfg in var_cfgs:
+        bins = vcfg.bins
+        v = np.asarray(offbeam_reco.get(vcfg.name, []), dtype=float)
+        v = v[~np.isnan(v)]
+        raw, _ = np.histogram(v.clip(bins[0], bins[-1] - 1e-8), bins=bins)
+        h = raw * offbeam_scale_6e20
+        z = np.zeros((len(h), len(h)))
+        out[vcfg.name] = {
+            'cosmic__stat': {'cov_ms_ms': z, 'cov_bs_bs': np.diag(raw * offbeam_scale_6e20**2),
+                             'cov_ms_bs': z, 'cov_bs_ms': z},
+            'cosmic__norm': {'cov_ms_ms': z, 'cov_bs_bs': frac**2 * np.outer(h, h),
+                             'cov_ms_bs': z, 'cov_bs_ms': z},
+        }
+    return out, frac
+ 
+ 
+ 
+# ── Matching by run / subrun / event (the __ntuple numbering differs between files) ──
+_RSE_CACHE = {}
+ 
+def hdr_rse(path):
+    """(__ntuple, entry) → run, subrun, evt from all hdr_* keys (cached per file)."""
+    if path in _RSE_CACHE:
+        return _RSE_CACHE[path]
+    with pd.HDFStore(path, mode='r') as st:
+        keys = sorted(k for k in st.keys() if _re.match(r'^/hdr_\d+$', k))
+        if not keys:
+            raise KeyError(f"{path} has no hdr_* keys — cannot match by run/subrun/event")
+        h = pd.concat([st[k] for k in keys])
+    ev = next(c for c in ['evt', 'event'] if c in h.columns)
+    r = (h[['run', 'subrun', ev]].rename(columns={ev: 'evt'})
+         .groupby(level=[0, 1]).first().astype(np.int64))
+    _RSE_CACHE[path] = r
+    return r
+ 
+ 
+def _rse_keys(lvl0, lvl1, mct, rse):
+    """DataFrame(run, subrun, evt, mct) for arrays of (level0, level1, mct); -1 where unknown."""
+    r = rse.reindex(pd.MultiIndex.from_arrays([np.asarray(lvl0), np.asarray(lvl1)])).to_numpy()
+    r = np.where(np.isnan(r.astype(float)), -1, r).astype(np.int64)
+    return pd.DataFrame({'run': r[:, 0], 'subrun': r[:, 1], 'evt': r[:, 2],
+                         'mct': np.asarray(mct, dtype=np.int64)})
+ 
+ 
+def _evt_mct_inter(evtdf_file):
+    """Per-interaction mct_index from all evt_* keys of an evtdf file.
+    (Reads each key once; the mct_index column is found from the first key's columns —
+    no start/stop reads, which break on fixed-format MultiIndex frames.)"""
+    with pd.HDFStore(evtdf_file, mode='r') as store:
+        keys = store.keys()
+        if '/split' in keys:
+            n = int(store['split']['n_split'].iloc[0])
+            evt_keys = [f'/evt_{k}' for k in range(n)]
+        else:
+            evt_keys = sorted(k for k in keys if _re.match(r'^/evt_\d+$', k))
+    mct_col, frames = None, []
+    for ek in _tqdm_txt(evt_keys, desc='  reading mct_index', leave=False):
+        with pd.HDFStore(evtdf_file, mode='r') as store:
+            chunk = store[ek]
+        if mct_col is None:
+            cols = chunk.columns.tolist()
+            mct_col = next((c for c in cols if 'mct_index' in str(c) and 'dlp_true' in str(c)),
+                           next(c for c in cols if 'mct_index' in str(c)))
+        chunk = chunk[[mct_col]]
+        frames.append(chunk.groupby(level=chunk.index.names[:-1]).first())
+        del chunk; gc.collect()
+    out = pd.concat(frames)[mct_col]
+    del frames; gc.collect()
+    return out
+ 
+ 
+def align_weights_rse(evtdf_file, weights_file, mcnu_df_in, src_cols_dict, verbose=True):
+    """Like align_weights, but matches on (run, subrun, event, mct_index) via the hdr keys
+    of both files, so it works when the two files were built from different file lists.
+    Returns (wgt_aligned indexed like the evtdf interactions, aligned_src_cols)."""
+    mct = _evt_mct_inter(evtdf_file)
+    e_rse, w_rse = hdr_rse(evtdf_file), hdr_rse(weights_file)
+    ek = _rse_keys(mct.index.get_level_values(0), mct.index.get_level_values(1),
+                   mct.fillna(-1).values, e_rse)
+    wi = mcnu_df_in.index
+    wk = _rse_keys(wi.get_level_values(0), wi.get_level_values(1), wi.get_level_values(-1), w_rse)
+    wk['_iloc'] = np.arange(len(wk), dtype=np.int64)
+    wk = wk[wk['run'] >= 0]
+    n_dup = wk.duplicated(['run', 'subrun', 'evt', 'mct']).sum()
+    if n_dup:
+        warnings.warn(f"align_weights_rse: {n_dup} duplicate (run,subrun,evt,mct) rows in weights — keeping first")
+        wk = wk.drop_duplicates(['run', 'subrun', 'evt', 'mct'])
+    m = ek.merge(wk, on=['run', 'subrun', 'evt', 'mct'], how='left')
+    has = m['_iloc'].notna().values & (ek['mct'].values >= 0)
+    row = np.where(has, m['_iloc'].fillna(0).values, 0).astype(np.int64)
+    if verbose:
+        print(f'  RSE matching: {has.sum():,}/{len(has):,} interactions matched '
+              f'({has.mean():.1%}); with a true ν (mct≥0): '
+              f'{has.sum():,}/{(ek["mct"].values >= 0).sum():,}')
+    frames, aligned = [], {}
+    for src, cols in src_cols_dict.items():
+        aligned[src] = list(cols)
+        if not cols:
+            continue
+        arr = mcnu_df_in[cols].values[row].astype(np.float32)
+        arr[~has] = np.nan
+        frames.append(pd.DataFrame(arr, columns=cols, index=mct.index))
+        del arr; gc.collect()
+    wgt = pd.concat(frames, axis=1)
+    del frames; gc.collect()
+    return wgt, aligned
+ 
+ 
+def load_mcnu_full_selected(weights_file, df_file, sel_topo, final_stage, verbose=True):
+    """mcnu_full per-dial weights for final-selection events, matched on
+    (run, subrun, event, mct_index). Unmatched rows are NaN (filled downstream)."""
+    sel_idx = sel_topo.index[sel_topo[final_stage]]
+    mct = _evt_mct_inter(df_file).reindex(sel_idx)
+    e_rse, w_rse = hdr_rse(df_file), hdr_rse(weights_file)
+    lk = _rse_keys(sel_idx.get_level_values(0), sel_idx.get_level_values(1),
+                   mct.fillna(-1).values, e_rse)
+    lk['_sel_pos'] = np.arange(len(lk), dtype=np.int64)
+    look = lk[(lk['run'] >= 0) & (lk['mct'] >= 0)]
+ 
+    with pd.HDFStore(weights_file, mode='r') as store:
+        full_keys = sorted(k for k in store.keys() if _re.match(r'^/mcnu_full_\d+$', k))
+        full_cols = store[full_keys[0]].head(1).columns.tolist()
+ 
+    n_sel = len(sel_idx)
+    result = np.full((n_sel, len(full_cols)), np.nan, dtype=np.float32)
+    filled = np.zeros(n_sel, dtype=bool)
+    n_dup = 0
+    for fk in _tqdm_txt(full_keys, desc='loading mcnu_full', leave=False):
+        with pd.HDFStore(weights_file, mode='r') as store:
+            chunk = store[fk]
+        ci = chunk.index
+        ck = _rse_keys(ci.get_level_values(0), ci.get_level_values(1), ci.get_level_values(-1), w_rse)
+        ck['_chunk_pos'] = np.arange(len(ck), dtype=np.int64)
+        m = look.merge(ck[ck['run'] >= 0], on=['run', 'subrun', 'evt', 'mct'], how='inner')
+        if len(m):
+            m = m.drop_duplicates('_sel_pos')
+            new = ~filled[m['_sel_pos'].values]
+            n_dup += (~new).sum()
+            m = m[new]
+            result[m['_sel_pos'].values] = chunk.values[m['_chunk_pos'].values].astype(np.float32)
+            filled[m['_sel_pos'].values] = True
+        del chunk, ck, m; gc.collect()
+ 
+    if verbose:
+        tc = sel_topo.loc[sel_idx, 'truth_cat'].values
+        nu = lk['mct'].values >= 0
+        print(f"Final-selection events: {n_sel}   with a true ν (mct≥0): {nu.sum()}")
+        print(f"Matched by run/subrun/event/mct: {filled.sum()} / {nu.sum()} ν events "
+              f"({filled.sum()/max(nu.sum(),1):.1%})" + (f"   [{n_dup} duplicate matches ignored]" if n_dup else ''))
+        um = nu & ~filled
+        if um.any():
+            vc = pd.Series(tc[um]).value_counts().sort_index()
+            print("  unmatched ν events by truth_cat: " + ', '.join(f'{int(k)}:{v}' for k, v in vc.items())
+                  + "  → truth_cat 0–5 get the bin-average variation of matched events, others weight 1")
+ 
+    wgt = pd.DataFrame(result, index=sel_idx, columns=pd.MultiIndex.from_tuples(full_cols))
+    return wgt
+
+
