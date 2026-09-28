@@ -22,9 +22,9 @@ from tqdm import tqdm
 # ════════════════════════════════════════════════════════════════════════════
 
 # ── lowE evtdf ────────────────────────────────────────────────────────────
-# INPUT_PATTERN = "/pnfs/sbnd/scratch/users/castalyf/cafpyana_out/dfs/2026_08_12_180822__mc1e20_lowE_v2/mc*.df"
-# OUTPUT_FILE   = "/exp/sbnd/data/users/castalyf/nue_sel/production_files/gen1/mc1e20_lowE_v2.df"
-# JOB_LIST      = "/exp/sbnd/data/users/castalyf/nue_sel/production_files/gen1/lowE_joblist.txt"
+# INPUT_PATTERN = "/pnfs/sbnd/scratch/users/castalyf/cafpyana_out/dfs/2026_09_26_210757__mc1e20_lowE_v3/mc*.df"
+# OUTPUT_FILE   = "/exp/sbnd/data/users/castalyf/nue_sel/production_files/gen1_v2/mc1e20_lowE.df"
+# JOB_LIST      = "/exp/sbnd/data/users/castalyf/nue_sel/production_files/gen1_v2/lowE_joblist_v3.txt"
 
 # ── lowE sys ──────────────────────────────────────────────────────────────
 # INPUT_PATTERN = "/pnfs/sbnd/scratch/users/castalyf/cafpyana_out/dfs/2026_08_12_180953__mc1e20_lowE_sys_v2/mc*.df"
@@ -32,14 +32,14 @@ from tqdm import tqdm
 # JOB_LIST      = "/exp/sbnd/data/users/castalyf/nue_sel/production_files/gen1/lowE_joblist.txt"
 
 # ── main MC evtdf ─────────────────────────────────────────────────────────
-# INPUT_PATTERN = "/pnfs/sbnd/scratch/users/castalyf/cafpyana_out/dfs/2026_08_10_165955__mc1e20_nueCC_v2-2/mc*.df"
-# OUTPUT_FILE   = "/exp/sbnd/data/users/castalyf/nue_sel/production_files/gen1/mc1e20_nueCC_v2-2.df"
-# JOB_LIST      = "/exp/sbnd/data/users/castalyf/nue_sel/production_files/gen1/nueCC_joblist.txt"
+# INPUT_PATTERN = "/pnfs/sbnd/scratch/users/castalyf/cafpyana_out/dfs/2026_09_25_202705__mc1e20_nueCC_v3/mc*.df"
+# OUTPUT_FILE   = "/exp/sbnd/data/users/castalyf/nue_sel/production_files/gen1_v2/mc1e20_nueCC.df"
+# JOB_LIST      = "/exp/sbnd/data/users/castalyf/nue_sel/production_files/gen1_v2/nueCC_joblist_v3.txt"
 
 # ── main MC sys ───────────────────────────────────────────────────────────
-# INPUT_PATTERN = "/pnfs/sbnd/scratch/users/castalyf/cafpyana_out/dfs/2026_08_10_170310__mc1e20_nueCC_sys_v2-2/mc*.df"
-# OUTPUT_FILE   = "/exp/sbnd/data/users/castalyf/nue_sel/production_files/gen1/mc1e20_nueCC_sys_v2-2.df"
-# JOB_LIST      = "/exp/sbnd/data/users/castalyf/nue_sel/production_files/gen1/nueCC_joblist.txt"
+# INPUT_PATTERN = "/pnfs/sbnd/scratch/users/castalyf/cafpyana_out/dfs/2026_09_25_205353__mc1e20_nueCC_sys_v3/mc*.df"
+# OUTPUT_FILE   = "/exp/sbnd/data/users/castalyf/nue_sel/production_files/gen1_v2/mc1e20_nueCC_sys.df"
+# JOB_LIST      = "/exp/sbnd/data/users/castalyf/nue_sel/production_files/gen1_v2/nueCC_joblist_v3.txt"
 
 # ── data (on-beam) ────────────────────────────────────────────────────────
 # INPUT_PATTERN = "/pnfs/sbnd/scratch/users/castalyf/cafpyana_out/dfs/2026_08_10_171943__data_dev_v2-2/data*.df"
@@ -52,9 +52,9 @@ from tqdm import tqdm
 # JOB_LIST      = None
 
 # ── ACTIVE ────────────────────────────────────────────────────────────────
-INPUT_PATTERN = "/pnfs/sbnd/scratch/users/castalyf/cafpyana_out/dfs/2026_09_14_000233__mc1e20_nueCC_sys_v3/mc*.df"
-OUTPUT_FILE   = "/exp/sbnd/data/users/castalyf/nue_sel/production_files/gen1/mc1e20_nueCC_sys_v3.df"
-JOB_LIST      = "/exp/sbnd/data/users/castalyf/nue_sel/production_files/gen1/nueCC_joblist_v3.txt"
+INPUT_PATTERN = "/pnfs/sbnd/scratch/users/castalyf/cafpyana_out/dfs/2026_09_26_210932__mc1e20_lowE_sys_v3/mc*.df"
+OUTPUT_FILE   = "/exp/sbnd/data/users/castalyf/nue_sel/production_files/gen1_v2/mc1e20_lowE_sys.df"
+JOB_LIST      = "/exp/sbnd/data/users/castalyf/nue_sel/production_files/gen1_v2/lowE_joblist_v3.txt"
 
 XROOTD_REDIRECTOR = "root://fndca1.fnal.gov:1094/"
 WRITE_BATCH = 50

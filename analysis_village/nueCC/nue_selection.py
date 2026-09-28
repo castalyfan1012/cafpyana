@@ -30,7 +30,7 @@ from nue_helpers import (
 )
 
 # ── Thresholds (MeV) — must match make_nueCC_df.py ───────────────────────────
-ELECTRON_THRESHOLD_MEV = 75.0
+ELECTRON_THRESHOLD_MEV = 500.0
 MUON_THRESHOLD_MEV     = 50.0
 PHOTON_THRESHOLD_MEV   = 25.0
 PION_THRESHOLD_MEV     = 25.0
@@ -43,7 +43,7 @@ PID_MUON     = 2
 PID_PION     = 3
 PID_PROTON   = 4
 
-# Cut labels
+# ── Cut names / labels ────────────────────────────────────────────────────────
 CUT_NAMES = [
     "precut",
     "valid_flashmatch",
@@ -57,6 +57,30 @@ CUT_LABELS = [
     "Final state topology",
 ]
 
+# ── Shower-quality cuts ──────────────────────────────────────────────────────
+# Thresholds from the cumulative threshold scan (nh.threshold_plots_cumulative).
+# The THRESH_* names are kept because other cells/modules may import them.
+THRESH_PRIMARY_SCORE = 0.995     # leading e primary softmax (I1)   >
+THRESH_PID_SCORE     = 0.91      # leading e PID softmax (I1)       >
+THRESH_VERTEX_DIST   = 3.45      # conversion gap [cm]              <
+THRESH_DEDX          = 7.90      # start dE/dx [MeV/cm]             <   ← re-check after re-scan
+THRESH_DIR_SPREAD    = 0.50      # directional spread               <   (not used)
+THRESH_AXIAL_SPREAD  = 0.00      # axial spread                     >   (not used)
+
+# Registry of every shower cut the code knows how to apply:
+#   cut name : (leading-electron column, direction, threshold, table label)
+# A cut is APPLIED only if its name is listed in CUT_NAMES_MORE below.
+SHOWER_CUTS = {
+    "electron_primary_score": (("primary_scores", "I1"),   ">", THRESH_PRIMARY_SCORE, "Electron primary score"),
+    "electron_pid_score"    : (("pid_scores", "I1"),       ">", THRESH_PID_SCORE,     "Electron PID score"),
+    "vertex_distance"       : (("vertex_distance", ""),    "<", THRESH_VERTEX_DIST,   "Conversion gap"),
+    "directional_spread"    : (("directional_spread", ""), "<", THRESH_DIR_SPREAD,    "Directional spread"),
+    "axial_spread"          : (("axial_spread", ""),       ">", THRESH_AXIAL_SPREAD,  "Axial spread"),
+    "start_dedx"            : (("start_dedx", ""),         "<", THRESH_DEDX,          "Start dE/dx"),
+}
+
+# Cuts applied, in order.  Comment a line out to drop that cut — nothing else
+# needs to change (labels, cut flow and tables all follow this list).
 CUT_NAMES_MORE = [
     "precut",
     "valid_flashmatch",
@@ -65,32 +89,22 @@ CUT_NAMES_MORE = [
     "electron_primary_score",
     "electron_pid_score",
     "vertex_distance",
-    # "start_dedx",
+    # "directional_spread",
     # "axial_spread",
-    # "directional_spread"
-]
-CUT_LABELS_MORE = [
-    "No cut",
-    "Flash match",
-    "In FV",
-    "Final state topology",
-    "Electron primary score",
-    "Electron PID score",
-    "Conversion gap",
-    # "Start dE/dx",
-    # "Axial spread",
-    # "Opening angle"
+    "start_dedx",
 ]
 
-THRESH_PRIMARY_SCORE = 0.99
-THRESH_PID_SCORE     = 0.915
-THRESH_VERTEX_DIST   = 2.65
-THRESH_DIR_SPREAD    = 0.199
-THRESH_AXIAL_SPREAD  = 0.02
-THRESH_DEDX          = 7.95
+CUT_LABEL_MAP = dict(zip(CUT_NAMES, CUT_LABELS))
+CUT_LABEL_MAP.update({k: v[3] for k, v in SHOWER_CUTS.items()})
+
+_unknown = [c for c in CUT_NAMES_MORE if c not in CUT_LABEL_MAP]
+if _unknown:
+    raise ValueError(f"CUT_NAMES_MORE has cuts not defined in SHOWER_CUTS: {_unknown}")
+CUT_LABELS_MORE = [CUT_LABEL_MAP[c] for c in CUT_NAMES_MORE]
 
 THRESH_SB_DEDX_LO = 3.0   # MeV/cm — sideband dE/dx lower bound
 THRESH_SB_DEDX_HI = 6.0   # MeV/cm — sideband dE/dx upper bound
+
 
 # ── Fiducial volume ───────────────────────────────────────────────────────────
 
@@ -352,60 +366,67 @@ def build_cut_flow(evtdf, flash_times_df=None):
     return results
 
 
+# ── Leading PRIMARY electron (the one that defines the topology) ─────────────
+
+def leading_primary_electron(evtdf):
+    """
+    One row per interaction: the highest-KE primary reco electron above
+    ELECTRON_THRESHOLD_MEV — the same particle used by single_electron and by
+    leading_electron_ke / _p / _costheta.  Index = interaction levels.
+
+    (The old shower_qual_cuts took the highest-KE reco electron of ANY kind,
+    which can be a non-primary fragment, so the quality cuts could be applied
+    to a different particle than the one being measured.)
+    """
+    il     = inter_levels(evtdf)
+    rp_df  = reco_particles(evtdf)._df
+    m      = primary_electron_mask(evtdf)
+    ke     = rp_df[('ke', '')][m]
+    lead_i = ke.groupby(level=il).idxmax().dropna()
+    lead_mi = pd.MultiIndex.from_tuples(list(lead_i.values), names=rp_df.index.names)
+    lead   = rp_df.loc[lead_mi].copy()
+    lead.index = lead_i.index
+    return lead
+
+
+def _shower_cut_pass(step, lead):
+    """Interaction-level boolean Series: True = leading primary electron passes `step`."""
+    if step not in SHOWER_CUTS:
+        raise ValueError(f"Unknown shower quality cut: {step!r} "
+                         f"(defined: {list(SHOWER_CUTS)})")
+    col, cdir, thr, _ = SHOWER_CUTS[step]
+    if col not in lead.columns:
+        raise KeyError(f"{step}: column {col} not in reco particle columns")
+    v = lead[col]
+    return (v > thr) if cdir == ">" else (v < thr)      # NaN fails the cut
+
+
 # ── Extended cut flow (shower quality) ───────────────────────────────────────
 
 def shower_qual_cuts(evtdf, flash_times_df=None):
     """
-    Full cut-flow including shower-quality cuts after single_electron.
-    Leading reco electron computed once and reused for all extra cuts.
-
-    Parameters
-    ----------
-    evtdf          : merged SPINE reco+truth particle-level DataFrame.
-    flash_times_df : passed through to build_cut_flow for the FM cut.
-                     See build_cut_flow docstring for details.
+    Full cut-flow including the cuts after single_electron listed in
+    CUT_NAMES_MORE.  Shower variables are taken from the leading PRIMARY
+    electron (see leading_primary_electron).
     """
     cut_flow = build_cut_flow(evtdf, flash_times_df=flash_times_df)
-    il       = inter_levels(evtdf)
+    row_inter = evtdf.index.droplevel(-1)          # computed once
 
     def _pmask(idx):
-        return pd.Series(evtdf.index.droplevel(-1).isin(idx), index=evtdf.index)
+        return pd.Series(row_inter.isin(idx), index=evtdf.index)
 
     additional_cuts = CUT_NAMES_MORE[CUT_NAMES_MORE.index("single_electron") + 1:]
     if not additional_cuts:
         return cut_flow
 
-    rp    = reco_particles(evtdf)
-    rp_df = rp._df
-    KE_COL = ('ke', '')
-    ele_mask = rp.pid == PID_ELECTRON
-    leading_electron = rp_df.loc[
-        rp_df[ele_mask][KE_COL].groupby(level=il).idxmax()
-    ]
-
+    lead    = leading_primary_electron(evtdf)
     steps   = tqdm(additional_cuts, desc="Shower quality cuts", leave=True)
     current = cut_flow["single_electron"]["inter_index"]
 
     for step in steps:
         steps.set_postfix(n=len(current))
-
-        if step == "electron_primary_score":
-            soft_inter = leading_electron[('primary_scores', 'I1')] > THRESH_PRIMARY_SCORE
-        elif step == "electron_pid_score":
-            soft_inter = leading_electron[('pid_scores', 'I1')] > THRESH_PID_SCORE
-        elif step == "vertex_distance":
-            soft_inter = leading_electron[('vertex_distance', '')] < THRESH_VERTEX_DIST
-        # elif step == "start_dedx":
-        #     soft_inter = leading_electron[('start_dedx', '')] < THRESH_DEDX
-        # elif step == "axial_spread":
-        #     soft_inter = leading_electron[('axial_spread', '')] > THRESH_AXIAL_SPREAD
-        # elif step == "directional_spread":
-        #     soft_inter = leading_electron[('directional_spread', '')] < THRESH_DIR_SPREAD
-        else:
-            raise ValueError(f"Unknown shower quality cut: {step}")
-
-        soft_inter = soft_inter.groupby(level=il).any()
-        current    = current.intersection(soft_inter[soft_inter].index)
+        ok      = _shower_cut_pass(step, lead)
+        current = current.intersection(ok[ok].index)
         cut_flow[step] = {
             "inter_index":   current,
             "particle_mask": _pmask(current),

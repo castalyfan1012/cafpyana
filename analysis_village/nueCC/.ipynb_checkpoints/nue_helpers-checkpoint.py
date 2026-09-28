@@ -1249,6 +1249,7 @@ except ImportError as _e:
     )
 
 
+# ══════════════════════════════════════════════════════════════════════════════
 # 10.  Systematic sources, per-knob universes, covariances
 # ══════════════════════════════════════════════════════════════════════════════
 import re as _re
@@ -1633,5 +1634,74 @@ def load_mcnu_full_selected(weights_file, df_file, sel_topo, final_stage, verbos
  
     wgt = pd.DataFrame(result, index=sel_idx, columns=pd.MultiIndex.from_tuples(full_cols))
     return wgt
+ 
+ 
+# ══════════════════════════════════════════════════════════════════════════════
+# 11.  Cosmic normalization (off-beam gates / in-time windows / on-beam spills)
+#      and in-time CORSIKA sample loader
+# ══════════════════════════════════════════════════════════════════════════════
+def _all_hdr(path):
+    with pd.HDFStore(path, mode='r') as st:
+        keys = sorted(k for k in st.keys() if _re.match(r'^/hdr_\d+$', k))
+        return pd.concat([st[k] for k in keys])
+ 
+ 
+def livetime_scales(data_file, offbeam_file, intime_file,
+                    duty_fraction=None, verbose=True):
+    """Normalization of off-beam data and in-time MC to the on-beam data.
+    on-beam  : number of BNB spills  = rows of pot_0 with TOR860 > 0
+    off-beam : number of gates       = Σ noffbeambnb over first_in_subrun rows
+    in-time  : generated windows     = Σ ngenevt over unique (run, subrun)
+    scale    = (1 − duty) × on-beam spills / (off-beam gates  or  in-time windows)
+    (in-time MC ↔ off-beam: intime_scale = offbeam_scale × gates / ngenevt)"""
+    duty = BEAM_DUTY_FRACTION if duty_fraction is None else duty_fraction
+    with pd.HDFStore(data_file, mode='r') as st:
+        pot0 = st['pot_0']
+    n_spills = int((pot0['TOR860'] > 0).sum())
+    ob = _all_hdr(offbeam_file)
+    n_gates = int(ob.loc[ob['first_in_subrun'].astype(bool), 'noffbeambnb'].sum())
+    it = _all_hdr(intime_file)
+    n_gen = int(it.drop_duplicates(['run', 'subrun'])['ngenevt'].sum())
+    out = dict(onbeam_nspills=n_spills, offbeam_ngates=n_gates, intime_ngenevt=n_gen,
+               offbeam_scale=(1 - duty) * n_spills / n_gates,
+               intime_scale=(1 - duty) * n_spills / n_gen,
+               n_offbeam_events=len(ob), n_intime_events=len(it))
+    if verbose:
+        print(f"On-beam spills (pot_0, TOR860>0): {n_spills:,}  "
+              f"({pot0['TOR860'].sum()/max(n_spills, 1):.2e} POT/spill)")
+        print(f"Off-beam gates (noffbeambnb):     {n_gates:,}  → offbeam_scale = {out['offbeam_scale']:.6f}")
+        print(f"In-time generated (ngenevt):      {n_gen:,}  → intime_scale  = {out['intime_scale']:.6e}")
+        print(f"Triggered fraction: off-beam {len(ob)/n_gates:.2%}   in-time {len(it)/n_gen:.2%}")
+    return out
+ 
+ 
+def load_intime_sample(intime_file, intime_scale, verbose=True):
+    """In-time CORSIKA MC: selection cut flow, reco at FV / topology / final, FV vertex."""
+    import nue_selection as _nsel
+    evtdf, _ = patch_vertex_cols(pd.read_hdf(intime_file, key='evt_0'))
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        cf = _nsel.shower_qual_cuts(evtdf)
+    il = list(range(evtdf.index.nlevels - 1))
+    if verbose:
+        print("In-time MC cut flow (data-scaled):")
+        for stage, d in cf.items():
+            n = len(d['inter_index'])
+            print(f"  {stage:<25s}: {n:>8,}  →  {n * intime_scale:>8.2f}")
+    fv_idx = cf['fiducial']['inter_index']
+    ri = evtdf["rec"]["dlp"]
+    vertex = {}
+    for coord in ['x', 'y', 'z']:
+        for cc in [('vertex', coord, ''), ('vertex', coord)]:
+            if cc in ri.columns:
+                vertex[coord] = ri[cc].groupby(level=il).first().reindex(fv_idx).dropna().values
+                break
+    out = dict(cut_flow=cf, il=il, vertex=vertex,
+               reco_final=extract_reco(evtdf, cf['vertex_distance']['inter_index'], il),
+               reco_topo=extract_reco(evtdf, cf['single_electron']['inter_index'], il),
+               reco_fv=extract_reco(evtdf, fv_idx, il))
+    del evtdf; gc.collect()
+    return out
+
 
 
