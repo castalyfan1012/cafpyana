@@ -1514,22 +1514,38 @@ def plot_handscan_binning(sel_topo, stage_col, var_name,
                           display_cats=None,
                           bins_override=None,
                           display_widths=None,
+                          overflow_last_bin=None,
+                          overflow_max=5000.0,
+                          figsize=(7.0, 7.5),
                           savefig_fn=None, filename=None,
                           save_subdir='designed_binning',
                           title=r'SBND $\nu_e$ CC Inclusive'):
     """
     Stacked histogram + ratio panel with variable-width binning.
     Style matches plot_unblinding_var exactly.
- 
+
     Parameters
     ----------
     bins_override : array of physical bin edges. If None, uses defaults.
     display_widths : array of visual widths per bin (len = n_bins).
         If None, uses physical bin widths (linear axis).
+    overflow_last_bin : bool or None. If True, events above the last edge
+        (up to overflow_max) are folded into the last bin, and its label gets
+        a "+" (e.g. "3000+"). If None, defaults to True for 'reco_ke',
+        False otherwise.
+        - Edges ending at 3000 (e.g. [500, ..., 3000]): events in
+          [3000, overflow_max) go into the last bin; the final edge is
+          labelled "3000+".
+        - Edges ending at >= overflow_max (e.g. [..., 3000, 5000]): the last
+          bin is already the overflow bin; its lower edge is labelled "3000+"
+          and the upper-edge label is hidden.
+    overflow_max : upper cut on the overflow bin (MeV). None = no cap
+        (all events above the last edge are folded in).
+    figsize : (width, height) of the figure. Original was (8, 7.5).
     """
     if display_cats is None:
         display_cats = [0, 1, 2, 3, 4, 5, 6]
- 
+
     # ── Pick binning ──────────────────────────────────────────────────────
     if var_name == 'reco_ke':
         bins_arr = (np.asarray(bins_override, dtype=float)
@@ -1541,31 +1557,54 @@ def plot_handscan_binning(sel_topo, stage_col, var_name,
         xlabel = r'Reco leading-$e^-$ $\cos\theta$'
     else:
         raise ValueError(f"var_name must be 'reco_ke' or 'reco_costheta'")
- 
+
+    if overflow_last_bin is None:
+        overflow_last_bin = (var_name == 'reco_ke')
+
     n_bins = len(bins_arr) - 1
     disp_edges_phys = bins_arr.copy()
- 
+
+    # ── Edge tick labels (shared by both axis modes) ──────────────────────
+    def _fmt_edge(e):
+        return f'{int(e)}' if e == int(e) else f'{e:.2f}'
+
+    edge_labels = [_fmt_edge(e) for e in disp_edges_phys]
+    upper_cut = bins_arr[-1]          # events at/above this are dropped
+    fold_into_last = False            # fold [bins_arr[-1], upper_cut) into last bin
+    if overflow_last_bin and n_bins >= 1:
+        cap = np.inf if overflow_max is None else float(overflow_max)
+        if bins_arr[-1] >= cap:
+            # Last bin already spans to the cap, e.g. [3000, 5000]
+            edge_labels[-2] = f'{_fmt_edge(disp_edges_phys[-2])}+'   # "3000+"
+            edge_labels[-1] = ''
+        else:
+            # Range ends at e.g. 3000; fold [3000, cap) into the last bin
+            upper_cut = cap
+            fold_into_last = True
+            edge_labels[-1] = f'{_fmt_edge(disp_edges_phys[-1])}+'   # "3000+"
+    last_bin_max = np.nextafter(bins_arr[-1], -np.inf)
+
     # Custom display widths → non-uniform x positions
     if display_widths is not None:
         display_widths = np.asarray(display_widths, dtype=float)
         assert len(display_widths) == n_bins, \
             f"display_widths has {len(display_widths)} entries but {n_bins} bins"
         x_edges = np.concatenate([[0], np.cumsum(display_widths)])
-        edge_labels = [f'{int(e)}' if e == int(e) else f'{e:.2f}' for e in disp_edges_phys]
         disp_edges = x_edges
-        centers = 0.5 * (x_edges[:-1] + x_edges[1:])
-        _custom_ticks = (x_edges, edge_labels)
     else:
         disp_edges = disp_edges_phys
-        centers = 0.5 * (disp_edges[:-1] + disp_edges[1:])
-        _custom_ticks = None
- 
-    # Filter — exclude events outside bin range (not clip)
+    centers = 0.5 * (disp_edges[:-1] + disp_edges[1:])
+
+    # Filter — drop events below the first edge or at/above upper_cut;
+    # with overflow, events in [bins_arr[-1], upper_cut) go into the last bin
     def _filter(v):
         v = np.asarray(v, dtype=float)
         v = v[~np.isnan(v)]
-        return v[(v >= bins_arr[0]) & (v < bins_arr[-1])]
- 
+        v = v[(v >= bins_arr[0]) & (v < upper_cut)]
+        if fold_into_last:
+            v = np.minimum(v, last_bin_max)
+        return v
+
     # ── Histogram each component ──────────────────────────────────────────
     mc_hists, mc_labels, mc_colors, mc_totals = [], [], [], []
     for cat in display_cats:
@@ -1577,12 +1616,12 @@ def plot_handscan_binning(sel_topo, stage_col, var_name,
         mc_labels.append(CAT_LABELS[cat])
         mc_colors.append(CAT_COLORS[cat])
         mc_totals.append(h.sum())
- 
+
     dirt_hist = np.zeros(n_bins)
     ob_hist = np.zeros(n_bins)
     dirt_total, ob_total = 0.0, 0.0
     has_dirt, has_ob = False, False
- 
+
     if dirt_reco is not None and dirt_weight is not None:
         dv = _filter(dirt_reco.get(var_name, []))
         if len(dv) > 0:
@@ -1590,7 +1629,7 @@ def plot_handscan_binning(sel_topo, stage_col, var_name,
                                         weights=np.full(len(dv), dirt_weight))
             dirt_total = dirt_hist.sum()
             has_dirt = True
- 
+
     if offbeam_reco is not None and offbeam_weight is not None:
         ov = _filter(offbeam_reco.get(var_name, []))
         if len(ov) > 0:
@@ -1598,11 +1637,11 @@ def plot_handscan_binning(sel_topo, stage_col, var_name,
                                       weights=np.full(len(ov), offbeam_weight))
             ob_total = ob_hist.sum()
             has_ob = True
- 
+
     total_mc = sum(mc_hists) + dirt_hist + ob_hist
     grand_total = total_mc.sum()
     mc_only_total = sum(mc_totals)
- 
+
     # ── Auto-detect best legend side ──────────────────────────────────────
     mid = n_bins // 2
     left_max = total_mc[:mid].max() if mid > 0 else 0
@@ -1611,33 +1650,33 @@ def plot_handscan_binning(sel_topo, stage_col, var_name,
     info_side = 'right' if side == 'left' else 'left'
     info_ha = 'right' if info_side == 'right' else 'left'
     info_x = 0.98 if info_side == 'right' else 0.02
- 
-    # ── Figure (same size as plot_unblinding_var) ─────────────────────────
+
+    # ── Figure ────────────────────────────────────────────────────────────
     fig, (ax_main, ax_ratio) = plt.subplots(
-        2, 1, figsize=(8, 7.5),
+        2, 1, figsize=figsize,
         gridspec_kw={'height_ratios': [3.2, 1]}, sharex=True)
     plt.subplots_adjust(hspace=0.05)
- 
+
     bw = np.diff(disp_edges)
     bottoms = np.zeros(n_bins)
- 
+
     # Stack: signal (bottom) → cosmic → dirt → offbeam (top)
     for h, col in zip(mc_hists, mc_colors):
         ax_main.bar(disp_edges[:-1], h, width=bw, bottom=bottoms,
                     align='edge', color=col, edgecolor='none', linewidth=0)
         bottoms += h
- 
+
     if has_dirt:
         ax_main.bar(disp_edges[:-1], dirt_hist, width=bw, bottom=bottoms,
                     align='edge', color=CAT_COLORS[9], edgecolor='none', linewidth=0)
         bottoms += dirt_hist
- 
+
     if has_ob:
         ax_main.bar(disp_edges[:-1], ob_hist, width=bw, bottom=bottoms,
                     align='edge', color=CAT_COLORS[7], edgecolor='none', linewidth=0)
         bottoms += ob_hist
- 
-    # ── Syst band (same style as plot_unblinding_var) ─────────────────────
+
+    # ── Syst band ─────────────────────────────────────────────────────────
     frac = None
     if frac_unc_per_bin is not None:
         frac = np.asarray(frac_unc_per_bin, dtype=float)
@@ -1650,7 +1689,7 @@ def plot_handscan_binning(sel_topo, stage_col, var_name,
         ax_main.bar(disp_edges[:-1], 2 * unc, bottom=total_mc - unc,
                     width=bw, align='edge', alpha=0.25, color='gray',
                     hatch='///', linewidth=0, zorder=5)
- 
+
     # ── Data ──────────────────────────────────────────────────────────────
     has_data = data_reco is not None and len(data_reco.get(var_name, [])) > 0
     dc = None
@@ -1661,16 +1700,16 @@ def plot_handscan_binning(sel_topo, stage_col, var_name,
         n_data = int(dc.sum())
         ax_main.errorbar(centers, dc, yerr=np.sqrt(dc.clip(1)),
                          fmt='ko', markersize=4, zorder=10)
- 
-    # ── Legend (manual, same format as plot_unblinding_var) ────────────────
+
+    # ── Legend ────────────────────────────────────────────────────────────
     legend_handles, legend_labels_list = [], []
- 
+
     # MC categories — purity = fraction of MC-only total
     for lbl, col, tot in zip(mc_labels, mc_colors, mc_totals):
         pct = f"{tot / mc_only_total:.1%}" if mc_only_total > 0 else "0%"
         legend_handles.append(mpatches.Patch(facecolor=col, edgecolor='none'))
         legend_labels_list.append(f"{lbl} ({tot:.1f}, {pct})")
- 
+
     # Dirt and offbeam — fraction of grand total
     if has_dirt:
         pct = f"{dirt_total / grand_total:.1%}" if grand_total > 0 else "0%"
@@ -1680,34 +1719,34 @@ def plot_handscan_binning(sel_topo, stage_col, var_name,
         pct = f"{ob_total / grand_total:.1%}" if grand_total > 0 else "0%"
         legend_handles.append(mpatches.Patch(facecolor=CAT_COLORS[7], edgecolor='none'))
         legend_labels_list.append(f"{CAT_LABELS[7]} ({ob_total:.1f}, {pct})")
- 
+
     # Data
     if has_data:
         legend_handles.append(mlines.Line2D([], [], color='black', marker='o',
                                             linestyle='None', markersize=4))
         legend_labels_list.append('On-beam data')
- 
+
     # Syst
     if frac is not None:
         legend_handles.append(mpatches.Patch(facecolor='gray', edgecolor='black',
                                              alpha=0.25, hatch='///', linewidth=0))
         legend_labels_list.append('Syst. unc.')
- 
+
     ax_main.legend(legend_handles, legend_labels_list, fontsize=7, ncol=2,
                    loc=f'upper {side}', frameon=True, framealpha=0.85, edgecolor='none')
- 
+
     ymax = max(total_mc.max(), dc.max() if dc is not None else 0)
     ax_main.set_ylim(bottom=0, top=ymax * 1.55)
     ax_main.set_ylabel('Events / bin', fontsize=12)
     ax_main.set_title(f'{title}', fontsize=12)
- 
-    # ── Info text (same side logic as plot_unblinding_var) ─────────────────
+
+    # ── Info text ─────────────────────────────────────────────────────────
     header = [f'Data POT: {data_pot:.2e}', f'Total MC events: {grand_total:.0f}']
     ax_main.text(info_x, 0.98, '\n'.join(header),
                  transform=ax_main.transAxes, fontsize=9, color='gray',
                  va='top', ha=info_ha, linespacing=1.15)
- 
-    # ── Stats in ratio panel (same as plot_unblinding_var) ────────────────
+
+    # ── Stats in ratio panel ──────────────────────────────────────────────
     if has_data:
         dcf = dc.astype(float)
         cov = np.diag(np.where(dcf > 0, dcf, 1.0))
@@ -1729,18 +1768,12 @@ def plot_handscan_binning(sel_topo, stage_col, var_name,
         print(f"  {var_name}:")
         print(f"    Data/Pred = {dp:.3f} ± {se:.3f} (stat.) ± {sye:.3f} (syst.)")
         print(f"    chi2/ndf = {c2:.1f}/{nd}  p = {pv:.3f}")
- 
+
     # ── Tick labels at bin edges ──────────────────────────────────────────
-    if _custom_ticks is not None:
-        ax_ratio.set_xticks(_custom_ticks[0])
-        ax_ratio.set_xticklabels(_custom_ticks[1], fontsize=9)
-    else:
-        ax_ratio.set_xticks(disp_edges)
-        ax_ratio.set_xticklabels(
-            [f'{int(e)}' if e == int(e) else f'{e:.3g}' for e in disp_edges],
-            fontsize=9)
- 
-    # ── Ratio panel (same style as plot_unblinding_var) ───────────────────
+    ax_ratio.set_xticks(disp_edges)
+    ax_ratio.set_xticklabels(edge_labels, fontsize=9)
+
+    # ── Ratio panel ───────────────────────────────────────────────────────
     if has_data:
         dcf = dc.astype(float)
         with np.errstate(divide='ignore', invalid='ignore'):
@@ -1757,10 +1790,10 @@ def plot_handscan_binning(sel_topo, stage_col, var_name,
         ax_ratio.set_ylabel('Data/MC', fontsize=11)
         ax_ratio.text(0.5, 0.5, 'No data', transform=ax_ratio.transAxes,
                       ha='center', va='center', fontsize=12, color='gray')
- 
+
     ax_ratio.set_xlabel(xlabel, fontsize=12)
     ax_ratio.set_xlim(disp_edges[0], disp_edges[-1])
- 
+
     fig.tight_layout()
     if savefig_fn and filename:
         savefig_fn(fig, filename, save_subdir)
