@@ -25,16 +25,44 @@ Output HDF5 keys (via nueCC_data.py config)
     hdr_0         run/subrun/event header
     pot_0         EXT POT per file (or BNB depending on run type)
 
-Truth categories (match nue_selection.py exactly)
---------------------------------------------------
-    0  nueCC FV          <- signal
-    1  nueCC out FV
-    2  numuCC + pi0
-    3  NC pi0
-    4  other numuCC
-    5  other NC
-    6  cosmic / non-neutrino
-    7  neutrino catch-all
+Truth categories (from GENIE truth, rec.mc.nu — see _categorize_neutrinos)
+--------------------------------------------------------------------------
+First matching category wins (same order as the SPINE category config):
+
+    0  nue CC in FV      <- signal: (anti)nue CC, true vertex in FV,
+                            exactly 1 primary e+- with KE >= 500 MeV
+    1  nue CC not in FV     same electron requirement, true vertex outside FV
+    2  numu CC pi0          CC, primary muon KE > 50 MeV, >= 1 primary pi0
+    3  nu NC pi0            NC, >= 1 primary pi0
+    4  other numu CC        CC, primary muon KE > 50 MeV
+    5  other nu NC          NC
+    6  other nu             any other neutrino: nue CC whose electron has
+                            KE < 500 MeV (true-threshold migration into the
+                            reco >= 500 MeV selection), numu CC with a muon
+                            KE <= 50 MeV, nutau CC, and matched neutrinos
+                            with no rec.mc.nu entry
+    7  cosmic               reco interaction not matched to a neutrino
+
+    Each reco interaction is linked to its GENIE neutrino through
+    rec.dlp_true.nu_id, which indexes rec.mc.nu. rec.dlp_true.mct_index is
+    the MCTruth index and is 0 for every neutrino in a multi-neutrino spill,
+    so it cannot be used as the rec.mc.nu key; the output 'mct_index'
+    (truth_info and evt) is therefore filled with nu_id.
+
+    Truth particles are NOT taken from the reco-matched dlp_true particle
+    table: every reco fragment carries its best-matched true particle, so one
+    electron split into two reco fragments was counted twice, and particles
+    that were never reconstructed (e.g. a muon) were missing.
+
+Efficiency denominator
+----------------------
+    truth_info["is_true_signal"] is True for exactly ONE row per true signal
+    neutrino: the reco interaction that got furthest (presel > FM > none) if
+    the neutrino was split into several reco interactions, or an extra
+    "truth-only" row (is_truth_only=True, rec.dlp..index = -1 - nu index,
+    passed_* = False) if no reco interaction was matched to it at all.
+    So truth_info["is_true_signal"].sum() counts every true signal neutrino
+    once.  truth_cat is 0 on ALL reco interactions of a signal neutrino.
 
 Fiducial volume (fiducial_cut_tmp — matches C++ definition)
 ------------------------------------------------------------
@@ -94,10 +122,20 @@ except ImportError:
 
 # ── Constants — must match nue_selection.py exactly ──────────────────────────
 BRANCH_TRUE            = "dlp_true"
-ELECTRON_THRESHOLD_MEV = 500.0
+ELECTRON_THRESHOLD_MEV = 500.0     # signal: primary e+- KE >= this
 MUON_THRESHOLD_MEV     = 50.0
 PID_ELECTRON           = 1
 PID_MUON               = 2
+
+# ── GENIE truth branches (rec.mc.nu, indexed by dlp_true.nu_id) ──────────────
+_MCNU_BRANCHES = ["rec.mc.nu." + b for b in [
+    "E", "pdg", "iscc", "genie_mode", "position.x", "position.y", "position.z",
+]]
+_MCPRIM_BRANCHES = ["rec.mc.nu.prim." + b for b in [
+    "pdg", "genE", "genp.x", "genp.y", "genp.z",
+]]
+ELECTRON_MASS_GEV = 0.000511
+MUON_MASS_GEV     = 0.105658
 
 # ── Vertex coordinate I0/I1/I2 → x/y/z mapping ──────────────────────────────
 # SPINE data-mode CAFs store reco vertex as I0/I1/I2 instead of x/y/z.
@@ -339,7 +377,7 @@ def _find_vertex_col(df, coord, branch_kw=None):
 
 # ── Shared FM + FV preselection logic ─────────────────────────────────────────
 
-def _apply_presel(spine_df, flash_times_s=None):
+def _apply_presel(spine_df, flash_times_s=None, inter=None):
     """
     Apply FM + reco-FV preselection to spine_df (works for both MC and data).
 
@@ -347,6 +385,7 @@ def _apply_presel(spine_df, flash_times_s=None):
     ----------
     spine_df      : SPINE particle-level DataFrame (2- or 3-level MultiIndex)
     flash_times_s : optional flash_times Series (see _build_truth_info for details)
+    inter         : optional spine_df.groupby(level=il).first(), if already built
 
     Returns
     -------
@@ -356,7 +395,8 @@ def _apply_presel(spine_df, flash_times_s=None):
     il             : list of groupby levels (all but last)
     """
     il    = list(range(spine_df.index.nlevels - 1))
-    inter = spine_df.groupby(level=il).first()
+    if inter is None:
+        inter = spine_df.groupby(level=il).first()
     idx   = inter.index
 
     # ── Flash-match ────────────────────────────────────────────────────────
@@ -405,13 +445,99 @@ def _apply_presel(spine_df, flash_times_s=None):
     return passed_fm, passed_fv_reco, idx, il
 
 
+# ── GENIE truth: one row per neutrino in rec.mc.nu ───────────────────────────
+
+def _load_genie_truth(f):
+    """
+    Per-neutrino GENIE truth, indexed (entry, rec.mc.nu index).  The second
+    level is what rec.dlp_true.nu_id refers to.
+
+    Columns: E [GeV], pdg, iscc, genie_mode, position.{x,y,z},
+             n_e_above  (# primary e+- with KE >= ELECTRON_THRESHOLD_MEV),
+             has_mu, has_pi0,
+             lead_e_ke [MeV], lead_e_p [MeV/c], lead_e_costheta
+             (leading primary e+- by energy, no threshold; NaN if none).
+    """
+    rec  = f["recTree"]
+    nu   = _loadbranches(rec, _MCNU_BRANCHES)
+    nu.columns = [".".join(p for p in c[3:] if p) for c in nu.columns]
+    idx  = nu.index
+    il   = list(range(idx.nlevels))
+
+    prim = _loadbranches(rec, _MCPRIM_BRANCHES)
+    prim.columns = [".".join(p for p in c[4:] if p) for c in prim.columns]
+    apdg = prim["pdg"].abs()
+
+    e    = prim[apdg == 11]
+    e_ke = (e["genE"] - ELECTRON_MASS_GEV) * 1e3
+    nu["n_e_above"] = (
+        (e_ke >= ELECTRON_THRESHOLD_MEV).groupby(level=il).sum()
+        .reindex(idx, fill_value=0).astype(np.int16)
+    )
+    mu_ke = (prim["genE"][apdg == 13] - MUON_MASS_GEV) * 1e3
+    nu["has_mu"] = (
+        (mu_ke > MUON_THRESHOLD_MEV).groupby(level=il).any()
+        .reindex(idx, fill_value=False).astype(bool)
+    )
+    nu["has_pi0"] = (
+        (apdg == 111).groupby(level=il).any()
+        .reindex(idx, fill_value=False).astype(bool)
+    )
+
+    # leading primary e+- — idxmax over electron rows only
+    nu["lead_e_ke"] = np.nan
+    nu["lead_e_p"] = np.nan
+    nu["lead_e_costheta"] = np.nan
+    if len(e) > 0:
+        lead = e_ke.groupby(level=il).idxmax()
+        lr   = e.loc[pd.MultiIndex.from_tuples(lead.values, names=e.index.names)]
+        lr.index = lead.index
+        p    = np.sqrt(lr["genp.x"]**2 + lr["genp.y"]**2 + lr["genp.z"]**2)
+        nu["lead_e_ke"]       = e_ke.loc[lead.values].set_axis(lead.index).reindex(idx)
+        nu["lead_e_p"]        = (p * 1e3).reindex(idx)
+        nu["lead_e_costheta"] = (lr["genp.z"] / p.replace(0, np.nan)).reindex(idx)
+    return nu
+
+
+def _empty_genie_truth():
+    cols = ([b.split("rec.mc.nu.")[1] for b in _MCNU_BRANCHES]
+            + ["n_e_above", "has_mu", "has_pi0",
+               "lead_e_ke", "lead_e_p", "lead_e_costheta"])
+    return pd.DataFrame(columns=cols, index=pd.MultiIndex.from_arrays(
+        [[], []], names=["entry", "rec.mc.nu..index"]), dtype=float)
+
+
+def _categorize_neutrinos(g):
+    """truth_cat for each GENIE neutrino; first matching category wins, in
+    the same order as the SPINE category config (see module docstring)."""
+    apdg   = g["pdg"].abs()
+    cc     = g["iscc"].astype(bool)
+    pi0    = g["has_pi0"].astype(bool)
+    mu     = g["has_mu"].astype(bool)
+    in_fv  = _fiducial_cut_tmp(g["position.x"], g["position.y"], g["position.z"])
+    one_e  = g["n_e_above"] == 1
+    nue_cc = cc & (apdg == 12)
+
+    cat = np.select(
+        [nue_cc & in_fv & one_e,      # 0  nue CC in FV (signal)
+         nue_cc & ~in_fv & one_e,     # 1  nue CC not in FV
+         cc & mu & pi0,               # 2  numu CC pi0
+         ~cc & pi0,                   # 3  nu NC pi0
+         cc & mu,                     # 4  other numu CC
+         ~cc],                        # 5  other nu NC
+        [0, 1, 2, 3, 4, 5],
+        default=6)                    # 6  other nu   (7 = cosmic, set per reco interaction)
+    return pd.Series(cat, index=g.index, dtype=np.int8), in_fv.astype(bool), one_e
+
+
 # ── Core: build per-interaction truth + reco-presel metadata ─────────────────
 
-def _build_truth_info(spine_df, flash_times_s=None):
+def _build_truth_info(spine_df, genie, flash_times_s=None):
     """
     Parameters
     ----------
     spine_df      : merged SPINE reco+truth particle-level DataFrame
+    genie         : _load_genie_truth(f) (per-neutrino GENIE truth)
     flash_times_s : optional Series with 3-level MultiIndex
                     (entry, dlp_inter_idx, flash_entry_idx) containing
                     rec.dlp.flash_times values.  When supplied the full C++
@@ -425,182 +551,119 @@ def _build_truth_info(spine_df, flash_times_s=None):
     inter = spine_df.groupby(level=il).first()
     idx   = inter.index
 
-    nu_col   = _safe(_find_col, spine_df, "nu_id",           branch_must_contain=BRANCH_TRUE)
-    cc_col   = _safe(_find_col, spine_df, "current_type",    branch_must_contain=BRANCH_TRUE)
-    pid_col  = _safe(_find_col, spine_df, "pid",             branch_must_contain=BRANCH_TRUE)
-    pri_col  = _safe(_find_col, spine_df, "is_primary",      branch_must_contain=BRANCH_TRUE)
-    ke_col   = _safe(_find_col, spine_df, "ke",              branch_must_contain=BRANCH_TRUE)
-    ppd_col  = _safe(_find_col, spine_df, "parent_pdg_code", branch_must_contain=BRANCH_TRUE)
-    mct_col  = _safe(_find_col, spine_df, "mct_index",       branch_must_contain=BRANCH_TRUE)
-    fm_col   = _safe(_find_col, spine_df, "is_flash_matched",branch_must_not_contain=BRANCH_TRUE)
-    pe_col   = _safe(_find_col, spine_df, "flash_total_pe",  branch_must_not_contain=BRANCH_TRUE)
-
-    # ── Vertex columns (fixed: tries x/y/z then I0/I1/I2) ────────────────
-    tvx_col = _find_vertex_col(spine_df, 'x', BRANCH_TRUE)
-    tvy_col = _find_vertex_col(spine_df, 'y', BRANCH_TRUE)
-    tvz_col = _find_vertex_col(spine_df, 'z', BRANCH_TRUE)
-    rvx_col = _find_vertex_col(spine_df, 'x', f'!{BRANCH_TRUE}')
-    rvy_col = _find_vertex_col(spine_df, 'y', f'!{BRANCH_TRUE}')
-    rvz_col = _find_vertex_col(spine_df, 'z', f'!{BRANCH_TRUE}')
-
-    fv_t_col = _safe(_find_col, spine_df, "is_fiducial", branch_must_contain=BRANCH_TRUE)
-    fv_r_col = _safe(_find_col, spine_df, "is_fiducial", branch_must_not_contain=BRANCH_TRUE)
-
-    required = [nu_col, cc_col, pid_col, pri_col, ke_col, ppd_col]
-    if any(c is None for c in required):
-        missing = [name for name, col in zip(
-            ["nu_id", "current_type", "pid", "is_primary", "ke", "parent_pdg_code"],
-            required,
-        ) if col is None]
-        warnings.warn(f"_build_truth_info: missing columns {missing}")
+    nu_col = _safe(_find_col, spine_df, "nu_id", branch_must_contain=BRANCH_TRUE)
+    if nu_col is None:
+        warnings.warn("_build_truth_info: missing column dlp_true nu_id")
         return pd.DataFrame()
 
-    def _b(s):
-        return s.reindex(idx, fill_value=False).astype(bool)
-
-    is_nu = _b(inter[nu_col] >= 0)
-    is_cc = _b(inter[cc_col] == 0)
-
-    if tvx_col and tvy_col and tvz_col:
-        is_fv_true = _fiducial_cut_tmp(
-            inter[tvx_col], inter[tvy_col], inter[tvz_col]
-        ).reindex(idx, fill_value=False).astype(bool)
-    elif fv_t_col:
-        warnings.warn("_build_truth_info: truth vertex coords missing, using is_fiducial")
-        is_fv_true = _b(inter[fv_t_col] == 1)
-    else:
-        is_fv_true = pd.Series(False, index=idx)
-
-    _elec_mask = (
-        (spine_df[pid_col] == PID_ELECTRON) &
-        (spine_df[pri_col] == 1) &
-        (spine_df[ke_col]  > ELECTRON_THRESHOLD_MEV)
-    )
-    has_true_electron = (
-        _elec_mask.groupby(level=il).sum().reindex(idx, fill_value=0) == 1
-    )
-    has_true_muon = (
-        (spine_df[pid_col] == PID_MUON) &
-        (spine_df[pri_col] == 1) &
-        (spine_df[ke_col]  > MUON_THRESHOLD_MEV)
-    ).groupby(level=il).any().reindex(idx, fill_value=False)
-
-    has_pi0 = (
-        (spine_df[ppd_col].abs() == 111)
-        .groupby(level=il).any()
-        .reindex(idx, fill_value=False)
-    )
-
-    cat = pd.Series(7, index=idx, dtype=np.int8)
-    cat[~is_nu]                                              = 6
-    nu = is_nu
-    cat[nu &  is_cc & ~is_fv_true & has_true_electron]      = 1
-    cat[nu &  is_cc &  is_fv_true & has_true_electron]      = 0
-    cat[nu &  is_cc & has_true_muon & has_pi0]               = 2
-    cat[nu & ~is_cc & has_pi0]                               = 3
-    cat[nu &  is_cc & has_true_muon & ~has_pi0]              = 4
-    cat[nu & ~is_cc & ~has_pi0]                              = 5
-
-    # ── Flash-match cut ───────────────────────────────────────────────────────
-    if fm_col is not None:
-        fm_pass = (spine_df[fm_col] == 1)
-
-        if flash_times_s is not None:
-            ft_il        = list(range(flash_times_s.index.nlevels - 1))
-            first_ft     = flash_times_s.groupby(level=ft_il).first()
-            has_valid_ft = first_ft.notna().reindex(idx, fill_value=False).astype(bool)
-            fm_inter  = fm_pass.groupby(level=il).any().reindex(idx, fill_value=False)
-            passed_fm = fm_inter & has_valid_ft
-        else:
-            if pe_col is not None:
-                fm_pass = fm_pass & (spine_df[pe_col] > 0)
-            passed_fm = fm_pass.groupby(level=il).any().reindex(idx, fill_value=False)
-    else:
-        passed_fm = pd.Series(False, index=idx)
-
-    # ── Reco FV (fixed: tries x/y/z then I0/I1/I2) ───────────────────────
-    if rvx_col and rvy_col and rvz_col:
-        passed_fv_reco = _fiducial_cut_tmp(
-            inter[rvx_col], inter[rvy_col], inter[rvz_col]
-        ).reindex(idx, fill_value=False).astype(bool)
-    elif fv_r_col:
-        warnings.warn("_build_truth_info: reco vertex coords missing, using is_fiducial")
-        passed_fv_reco = (
-            (spine_df[fv_r_col] == 1)
-            .groupby(level=il).any()
-            .reindex(idx, fill_value=False)
-        )
-    else:
-        passed_fv_reco = pd.Series(False, index=idx)
-
+    passed_fm, passed_fv_reco, _, _ = _apply_presel(spine_df, flash_times_s, inter=inter)
     passed_presel = passed_fm & passed_fv_reco
 
-    mct_index_vals = (
-        inter[mct_col].fillna(-1).astype(np.int32)
-        if mct_col is not None
-        else pd.Series(-1, index=idx, dtype=np.int32)
-    )
+    # ── Link each reco interaction to its GENIE neutrino (entry, nu_id) ───────
+    nu_id = inter[nu_col].fillna(-1).astype(np.int32)
+    is_nu = (nu_id >= 0)
 
-    true_leading_e_ke       = pd.Series(np.nan, index=idx, dtype=np.float32)
-    true_leading_e_costheta = pd.Series(np.nan, index=idx, dtype=np.float32)
-    true_leading_e_p        = pd.Series(np.nan, index=idx, dtype=np.float32)
+    g_cat, g_fv, g_one_e = _categorize_neutrinos(genie)
+    gi = genie.assign(truth_cat=g_cat, is_fv_true=g_fv, has_true_electron=g_one_e)
+    key = pd.MultiIndex.from_arrays([idx.get_level_values(0), nu_id.values])
+    g = gi.reindex(key)
+    g.index = idx
+    has_genie = is_nu & g["pdg"].notna()
+    if (is_nu & ~has_genie).any():
+        warnings.warn(f"_build_truth_info: {(is_nu & ~has_genie).sum()} reco interactions "
+                      "have nu_id >= 0 but no rec.mc.nu entry -> truth_cat 6 (other nu)")
 
-    try:
-        momx_col = _find_col_ends(spine_df, "particles", "momentum", "x",
-                                  branch_must_contain=BRANCH_TRUE)
-        momy_col = _find_col_ends(spine_df, "particles", "momentum", "y",
-                                  branch_must_contain=BRANCH_TRUE)
-        momz_col = _find_col_ends(spine_df, "particles", "momentum", "z",
-                                  branch_must_contain=BRANCH_TRUE)
-        elec_ke_for_max = spine_df[ke_col].where(_elec_mask, -np.inf)
-        lead_4idx       = elec_ke_for_max.groupby(level=il).idxmax().dropna()
-        if len(lead_4idx) > 0:
-            lead_mi      = pd.MultiIndex.from_tuples(
-                lead_4idx.values, names=spine_df.index.names
-            )
-            leading_rows = spine_df.loc[
-                lead_mi, [ke_col, momx_col, momy_col, momz_col]
-            ].copy()
-            leading_rows.index = lead_4idx.index
-            px   = leading_rows[momx_col]
-            py   = leading_rows[momy_col]
-            pz   = leading_rows[momz_col]
-            pmag = np.sqrt(px**2 + py**2 + pz**2).replace(0, np.nan)
-            true_leading_e_ke       = leading_rows[ke_col].reindex(idx).astype(np.float32)
-            true_leading_e_costheta = (pz / pmag).reindex(idx).astype(np.float32)
-            true_leading_e_p        = pmag.reindex(idx).astype(np.float32)
-    except Exception:
-        pass
+    cat = pd.Series(6, index=idx, dtype=np.int8)    # other nu (incl. no rec.mc.nu entry)
+    cat[~is_nu]    = 7                               # cosmic
+    cat[has_genie] = g.loc[has_genie, "truth_cat"].astype(np.int8)
 
-    return pd.DataFrame({
+    # ── One is_true_signal row per signal neutrino ────────────────────────────
+    # (a neutrino split into several reco interactions keeps truth_cat 0 on
+    #  all of them, but only the one that got furthest counts in the
+    #  denominator)
+    sig_rows = pd.DataFrame({
+        "_entry": idx.get_level_values(0), "_nu": nu_id.values,
+        "rank":  2 * passed_presel.values + passed_fm.values,
+    }, index=idx)[(cat == 0).values]
+    rep = (sig_rows.sort_values("rank", ascending=False, kind="stable")
+           .groupby(["_entry", "_nu"]).head(1).index)
+    is_true_signal = pd.Series(idx.isin(rep), index=idx)
+
+    out = pd.DataFrame({
         "truth_cat"              : cat,
-        "is_true_signal"         : (cat == 0),
+        "is_true_signal"         : is_true_signal,
         "is_nu"                  : is_nu,
-        "is_cc"                  : is_cc,
-        "is_fv_true"             : is_fv_true,
-        "has_true_electron"      : has_true_electron,
-        "has_true_muon"          : has_true_muon,
-        "has_pi0"                : has_pi0,
+        "is_cc"                  : has_genie & g["iscc"].fillna(False).astype(bool),
+        "is_fv_true"             : has_genie & g["is_fv_true"].fillna(False).astype(bool),
+        "has_true_electron"      : has_genie & g["has_true_electron"].fillna(False).astype(bool),
+        "has_true_muon"          : has_genie & g["has_mu"].fillna(False).astype(bool),
+        "has_pi0"                : has_genie & g["has_pi0"].fillna(False).astype(bool),
         "passed_fm"              : passed_fm,
         "passed_fv_reco"         : passed_fv_reco,
         "passed_presel"          : passed_presel,
-        "true_leading_e_ke"      : true_leading_e_ke,
-        "true_leading_e_costheta": true_leading_e_costheta,
-        "true_leading_e_p"       : true_leading_e_p,
-        "mct_index"              : mct_index_vals,
-    }, index=idx).astype({
-        "truth_cat"         : np.int8,
-        "is_true_signal"    : bool,
-        "is_nu"             : bool,
-        "is_cc"             : bool,
-        "is_fv_true"        : bool,
-        "has_true_electron" : bool,
-        "has_true_muon"     : bool,
-        "has_pi0"           : bool,
-        "passed_fm"         : bool,
-        "passed_fv_reco"    : bool,
-        "passed_presel"     : bool,
-        "mct_index"         : np.int32,
+        "true_leading_e_ke"      : g["lead_e_ke"],
+        "true_leading_e_costheta": g["lead_e_costheta"],
+        "true_leading_e_p"       : g["lead_e_p"],
+        "mct_index"              : nu_id,        # rec.mc.nu index (see module docstring)
+        "nu_pdg"                 : g["pdg"].fillna(0),
+        "genie_mode"             : g["genie_mode"].fillna(-1),
+        "true_nu_e"              : g["E"],
+        "n_true_e"               : g["n_e_above"].fillna(0),
+        "is_truth_only"          : False,
+    }, index=idx)
+
+    # ── Truth-only rows: signal neutrinos with no reco interaction ────────────
+    matched = pd.MultiIndex.from_arrays([idx.get_level_values(0)[is_nu],
+                                         nu_id.values[is_nu]])
+    gs = gi[(gi["truth_cat"] == 0) & ~gi.index.isin(matched)]
+    if len(gs) > 0:
+        nu_i = gs.index.get_level_values(1).astype(np.int32)
+        miss = pd.DataFrame({
+            "truth_cat"              : np.int8(0),
+            "is_true_signal"         : True,
+            "is_nu"                  : True,
+            "is_cc"                  : True,
+            "is_fv_true"             : True,
+            "has_true_electron"      : True,
+            "has_true_muon"          : gs["has_mu"].values,
+            "has_pi0"                : gs["has_pi0"].values,
+            "passed_fm"              : False,
+            "passed_fv_reco"         : False,
+            "passed_presel"          : False,
+            "true_leading_e_ke"      : gs["lead_e_ke"].values,
+            "true_leading_e_costheta": gs["lead_e_costheta"].values,
+            "true_leading_e_p"       : gs["lead_e_p"].values,
+            "mct_index"              : nu_i,
+            "nu_pdg"                 : gs["pdg"].values,
+            "genie_mode"             : gs["genie_mode"].values,
+            "true_nu_e"              : gs["E"].values,
+            "n_true_e"               : gs["n_e_above"].values,
+            "is_truth_only"          : True,
+        }, index=pd.MultiIndex.from_arrays(
+            [gs.index.get_level_values(0), -1 - nu_i], names=idx.names))
+        out = pd.concat([out, miss])
+
+    return out.astype({
+        "truth_cat"              : np.int8,
+        "is_true_signal"         : bool,
+        "is_nu"                  : bool,
+        "is_cc"                  : bool,
+        "is_fv_true"             : bool,
+        "has_true_electron"      : bool,
+        "has_true_muon"          : bool,
+        "has_pi0"                : bool,
+        "passed_fm"              : bool,
+        "passed_fv_reco"         : bool,
+        "passed_presel"          : bool,
+        "true_leading_e_ke"      : np.float32,
+        "true_leading_e_costheta": np.float32,
+        "true_leading_e_p"       : np.float32,
+        "mct_index"              : np.int32,
+        "nu_pdg"                 : np.int32,
+        "genie_mode"             : np.int32,
+        "true_nu_e"              : np.float32,
+        "n_true_e"               : np.int16,
+        "is_truth_only"          : bool,
     })
 
 
@@ -620,7 +683,16 @@ def _get_truth_info(f):
                     f"falling back to flash_total_pe proxy — {e}"
                 )
 
-        _truth_info_cache[fname] = _build_truth_info(_get_spine_df(f), flash_times_s)
+        try:
+            genie = _load_genie_truth(f)
+        except Exception as e:
+            # e.g. cosmic-only MC with an empty rec.mc.nu; any reco interaction
+            # with nu_id >= 0 then lands in truth_cat 6 with a warning
+            warnings.warn(f"_get_truth_info: GENIE truth (rec.mc.nu) load failed — {e}")
+            genie = _empty_genie_truth()
+
+        _truth_info_cache[fname] = _build_truth_info(
+            _get_spine_df(f), genie, flash_times_s)
     return _truth_info_cache[fname]
 
 
@@ -629,16 +701,28 @@ def _get_truth_info(f):
 def make_nuecc_evtdf(f):
     """
     Reco+truth SPINE particle-level df, FM+FV preselected, merged with MC CV.
+
+    The interaction-level rec.dlp_true.mct_index column is overwritten with
+    rec.dlp_true.nu_id (the rec.mc.nu index), so (entry, mct_index) is the
+    correct key for the mcnu merge here and for the weight alignment
+    downstream (nue_helpers.align_weights / load_mcnu_full_selected).
     """
     spine_df   = _get_spine_df(f)
     truth_info = _get_truth_info(f)
 
+    if not truth_info.empty:
+        presel_idx = truth_info.index[truth_info["passed_presel"]]
+        spine_df   = spine_df[spine_df.index.droplevel(-1).isin(presel_idx)].copy()
+
     try:
+        mct_col = _find_col_ends(spine_df, BRANCH_TRUE, "mct_index")
+        nu_col  = _find_col(spine_df, "nu_id", branch_must_contain=BRANCH_TRUE)
+        spine_df[mct_col] = spine_df[nu_col].fillna(-1).astype(np.int32)
+
         mcdf    = make_mcnudf(f, include_weights=False)
         mcdf.columns = pd.MultiIndex.from_tuples(
             [tuple(["mcnu"] + list(c)) for c in mcdf.columns]
         )
-        mct_col = _find_col(spine_df, "mct_index", branch_must_contain=BRANCH_TRUE)
         merged  = multicol_merge(
             lhs      = spine_df.reset_index(level=list(range(1, spine_df.index.nlevels))),
             rhs      = mcdf.reset_index(),
@@ -651,10 +735,6 @@ def make_nuecc_evtdf(f):
         del merged, mcdf
     except Exception as e:
         warnings.warn(f"make_nuecc_evtdf: MC CV merge skipped — {e}")
-
-    if not truth_info.empty:
-        presel_idx = truth_info.index[truth_info["passed_presel"]]
-        spine_df   = spine_df[spine_df.index.droplevel(-1).isin(presel_idx)]
 
     return spine_df
 
@@ -715,6 +795,47 @@ def make_nuecc_truth_info_df(f):
 def make_nuecc_statsdf(f):
     """Backward-compatible alias for make_nuecc_truth_info_df."""
     return make_nuecc_truth_info_df(f)
+
+
+# Extra cross-section dials (module level: used by both wgtdf makers)
+EXTRA_XSEC_SYSTS = [
+    # MINERvA 2p2h (indices 82-86)
+    "MINERvAE2p2h_SBN_v1_E2p2h_A_nu",
+    "MINERvAE2p2h_SBN_v1_E2p2h_B_nu",
+    "MINERvAE2p2h_SBN_v1_E2p2h_A_nubar",
+    "MINERvAE2p2h_SBN_v1_E2p2h_B_nubar",
+    "MINERvAq0q3Weighting_SBN_v1_Mnv2p2hGaussEnhancement",
+    # MiscInteractionSysts (indices 87-91)
+    "MiscInteractionSysts_SBN_v1_C12ToAr40_2p2hScaling_nu",
+    "MiscInteractionSysts_SBN_v1_C12ToAr40_2p2hScaling_nubar",
+    "MiscInteractionSysts_SBN_v1_nuenuebar_xsec_ratio",
+    "MiscInteractionSysts_SBN_v1_nuenumu_xsec_ratio",
+    "MiscInteractionSysts_SBN_v1_SPPLowQ2Suppression",
+    # NOvAStyleNonResPionNorm (indices 92-114)
+    "NOvAStyleNonResPionNorm_SBN_v1_NR_nu_n_CC_2Pi",
+    "NOvAStyleNonResPionNorm_SBN_v1_NR_nu_n_CC_3Pi",
+    "NOvAStyleNonResPionNorm_SBN_v1_NR_nu_p_CC_2Pi",
+    "NOvAStyleNonResPionNorm_SBN_v1_NR_nu_p_CC_3Pi",
+    "NOvAStyleNonResPionNorm_SBN_v1_NR_nu_np_CC_1Pi",
+    "NOvAStyleNonResPionNorm_SBN_v1_NR_nu_n_NC_1Pi",
+    "NOvAStyleNonResPionNorm_SBN_v1_NR_nu_n_NC_2Pi",
+    "NOvAStyleNonResPionNorm_SBN_v1_NR_nu_n_NC_3Pi",
+    "NOvAStyleNonResPionNorm_SBN_v1_NR_nu_p_NC_1Pi",
+    "NOvAStyleNonResPionNorm_SBN_v1_NR_nu_p_NC_2Pi",
+    "NOvAStyleNonResPionNorm_SBN_v1_NR_nu_p_NC_3Pi",
+    "NOvAStyleNonResPionNorm_SBN_v1_NR_nubar_n_CC_1Pi",
+    "NOvAStyleNonResPionNorm_SBN_v1_NR_nubar_n_CC_2Pi",
+    "NOvAStyleNonResPionNorm_SBN_v1_NR_nubar_n_CC_3Pi",
+    "NOvAStyleNonResPionNorm_SBN_v1_NR_nubar_p_CC_1Pi",
+    "NOvAStyleNonResPionNorm_SBN_v1_NR_nubar_p_CC_2Pi",
+    "NOvAStyleNonResPionNorm_SBN_v1_NR_nubar_p_CC_3Pi",
+    "NOvAStyleNonResPionNorm_SBN_v1_NR_nubar_n_NC_1Pi",
+    "NOvAStyleNonResPionNorm_SBN_v1_NR_nubar_n_NC_2Pi",
+    "NOvAStyleNonResPionNorm_SBN_v1_NR_nubar_n_NC_3Pi",
+    "NOvAStyleNonResPionNorm_SBN_v1_NR_nubar_p_NC_1Pi",
+    "NOvAStyleNonResPionNorm_SBN_v1_NR_nubar_p_NC_2Pi",
+    "NOvAStyleNonResPionNorm_SBN_v1_NR_nubar_p_NC_3Pi",
+]
 
 
 # ── Public maker 4: wgtdf ────────────────────────────────────────────────────
@@ -812,45 +933,6 @@ def make_nuecc_wgtdf(f):
     _force_free()
 
     from makedf.getsyst import getsyst
-
-    EXTRA_XSEC_SYSTS = [
-        # MINERvA 2p2h (indices 82-86)
-        "MINERvAE2p2h_SBN_v1_E2p2h_A_nu",
-        "MINERvAE2p2h_SBN_v1_E2p2h_B_nu",
-        "MINERvAE2p2h_SBN_v1_E2p2h_A_nubar",
-        "MINERvAE2p2h_SBN_v1_E2p2h_B_nubar",
-        "MINERvAq0q3Weighting_SBN_v1_Mnv2p2hGaussEnhancement",
-        # MiscInteractionSysts (indices 87-91)
-        "MiscInteractionSysts_SBN_v1_C12ToAr40_2p2hScaling_nu",
-        "MiscInteractionSysts_SBN_v1_C12ToAr40_2p2hScaling_nubar",
-        "MiscInteractionSysts_SBN_v1_nuenuebar_xsec_ratio",
-        "MiscInteractionSysts_SBN_v1_nuenumu_xsec_ratio",
-        "MiscInteractionSysts_SBN_v1_SPPLowQ2Suppression",
-        # NOvAStyleNonResPionNorm (indices 92-114)
-        "NOvAStyleNonResPionNorm_SBN_v1_NR_nu_n_CC_2Pi",
-        "NOvAStyleNonResPionNorm_SBN_v1_NR_nu_n_CC_3Pi",
-        "NOvAStyleNonResPionNorm_SBN_v1_NR_nu_p_CC_2Pi",
-        "NOvAStyleNonResPionNorm_SBN_v1_NR_nu_p_CC_3Pi",
-        "NOvAStyleNonResPionNorm_SBN_v1_NR_nu_np_CC_1Pi",
-        "NOvAStyleNonResPionNorm_SBN_v1_NR_nu_n_NC_1Pi",
-        "NOvAStyleNonResPionNorm_SBN_v1_NR_nu_n_NC_2Pi",
-        "NOvAStyleNonResPionNorm_SBN_v1_NR_nu_n_NC_3Pi",
-        "NOvAStyleNonResPionNorm_SBN_v1_NR_nu_p_NC_1Pi",
-        "NOvAStyleNonResPionNorm_SBN_v1_NR_nu_p_NC_2Pi",
-        "NOvAStyleNonResPionNorm_SBN_v1_NR_nu_p_NC_3Pi",
-        "NOvAStyleNonResPionNorm_SBN_v1_NR_nubar_n_CC_1Pi",
-        "NOvAStyleNonResPionNorm_SBN_v1_NR_nubar_n_CC_2Pi",
-        "NOvAStyleNonResPionNorm_SBN_v1_NR_nubar_n_CC_3Pi",
-        "NOvAStyleNonResPionNorm_SBN_v1_NR_nubar_p_CC_1Pi",
-        "NOvAStyleNonResPionNorm_SBN_v1_NR_nubar_p_CC_2Pi",
-        "NOvAStyleNonResPionNorm_SBN_v1_NR_nubar_p_CC_3Pi",
-        "NOvAStyleNonResPionNorm_SBN_v1_NR_nubar_n_NC_1Pi",
-        "NOvAStyleNonResPionNorm_SBN_v1_NR_nubar_n_NC_2Pi",
-        "NOvAStyleNonResPionNorm_SBN_v1_NR_nubar_n_NC_3Pi",
-        "NOvAStyleNonResPionNorm_SBN_v1_NR_nubar_p_NC_1Pi",
-        "NOvAStyleNonResPionNorm_SBN_v1_NR_nubar_p_NC_2Pi",
-        "NOvAStyleNonResPionNorm_SBN_v1_NR_nubar_p_NC_3Pi",
-    ]
 
     try:
         extra_wgt = getsyst(

@@ -347,7 +347,16 @@ def extract_reco(evtdf, stage_idx, il):
     }
 
 
-def load_onbeam_data(data_file, target_pot, pot_scale, verbose=True):
+def _final_stage(final_stage=None):
+    """Last cut of the selection (nue_selection.CUT_NAMES_MORE[-1], i.e. 'start_dedx')
+    unless a stage name is given explicitly. Accepts 'sel_start_dedx' or 'start_dedx'."""
+    if final_stage is None:
+        import nue_selection as _ns
+        final_stage = list(_ns.CUT_NAMES_MORE)[-1]
+    return final_stage[4:] if final_stage.startswith('sel_') else final_stage
+
+
+def load_onbeam_data(data_file, target_pot, pot_scale, final_stage=None, verbose=True):
     """Load on-beam data, patch vertex cols, run selection, extract reco.
 
     Returns dict with keys:
@@ -381,7 +390,7 @@ def load_onbeam_data(data_file, target_pot, pot_scale, verbose=True):
         for stage, d in cut_flow.items():
             print(f'  {stage:<30s}: {len(d["inter_index"]):>8,}')
 
-    final_stage = 'vertex_distance'
+    final_stage = _final_stage(final_stage)
     reco_final = extract_reco(evtdf, cut_flow[final_stage]['inter_index'], il)
     reco_topo = extract_reco(evtdf, cut_flow['single_electron']['inter_index'], il)
 
@@ -418,7 +427,7 @@ def _count_offbeam_parts(evtdf, idx, il, ptype):
     return mask.groupby(level=il).sum().reindex(idx, fill_value=0).values
 
 
-def load_offbeam_data(offbeam_file, data_file, verbose=True):
+def load_offbeam_data(offbeam_file, data_file, final_stage=None, verbose=True):
     """Load off-beam data, run selection, extract reco at all stages.
 
     Returns dict with keys:
@@ -448,7 +457,7 @@ def load_offbeam_data(offbeam_file, data_file, verbose=True):
             n = len(d['inter_index'])
             print(f'  {stage:<30s}: {n:>8,}  →  {n * scale:>7.1f}')
 
-    reco_final = extract_reco(evtdf, cut_flow['vertex_distance']['inter_index'], il)
+    reco_final = extract_reco(evtdf, cut_flow[_final_stage(final_stage)]['inter_index'], il)
     reco_topo = extract_reco(evtdf, cut_flow['single_electron']['inter_index'], il)
     reco_fv = extract_reco(evtdf, cut_flow['fiducial']['inter_index'], il)
 
@@ -497,7 +506,7 @@ def load_offbeam_data(offbeam_file, data_file, verbose=True):
 # 7.  lowE dirt loader
 # ══════════════════════════════════════════════════════════════════════════════
 
-def load_lowE_sample(lowe_file, target_pot, data_total_pot, verbose=True):
+def load_lowE_sample(lowe_file, target_pot, data_total_pot, final_stage=None, verbose=True):
     """Load lowE dirt sample, run selection, extract reco.
 
     Returns dict with keys:
@@ -557,7 +566,7 @@ def load_lowE_sample(lowe_file, target_pot, data_total_pot, verbose=True):
             'reco_p': reco_p.reindex(idx).dropna().values,
         }
 
-    final_idx = cut_flow['vertex_distance']['inter_index']
+    final_idx = cut_flow[_final_stage(final_stage)]['inter_index']
     topo_idx = cut_flow['single_electron']['inter_index']
 
     # Vertex at FV
@@ -596,19 +605,11 @@ def build_sideband_idx_and_reco(evtdf, topo_idx, il, extract_reco_fn):
     ke_c = ('ke', '') if ('ke', '') in rp.columns else 'ke'
     pi_c = ('pid', '') if ('pid', '') in rp.columns else 'pid'
 
-    ele = rp[rp.index.droplevel(-1).isin(topo_idx) & (rp[pi_c] == 1)]
-    if ele.empty:
+    ld = _ns.leading_primary_electron(evtdf)
+    ld = ld[ld.index.isin(topo_idx)]
+    if ld.empty:
         empty = pd.Index([])
         return empty, {k: np.array([]) for k in ['reco_ke', 'reco_costheta', 'reco_p']}, {}
-
-    li = ele[ke_c].groupby(level=il).idxmax().dropna()
-    if li.empty:
-        empty = pd.Index([])
-        return empty, {k: np.array([]) for k in ['reco_ke', 'reco_costheta', 'reco_p']}, {}
-
-    lmi = pd.MultiIndex.from_tuples(li.values, names=ele.index.names)
-    ld = ele.loc[lmi].copy()
-    ld.index = li.index
 
     sb = pd.Series(True, index=ld.index)
     vd_c = ('vertex_distance', '')
@@ -1675,7 +1676,7 @@ def livetime_scales(data_file, offbeam_file, intime_file,
     return out
  
  
-def load_intime_sample(intime_file, intime_scale, verbose=True):
+def load_intime_sample(intime_file, intime_scale, final_stage=None, verbose=True):
     """In-time CORSIKA MC: selection cut flow, reco at FV / topology / final, FV vertex."""
     import nue_selection as _nsel
     evtdf, _ = patch_vertex_cols(pd.read_hdf(intime_file, key='evt_0'))
@@ -1697,11 +1698,8 @@ def load_intime_sample(intime_file, intime_scale, verbose=True):
                 vertex[coord] = ri[cc].groupby(level=il).first().reindex(fv_idx).dropna().values
                 break
     out = dict(cut_flow=cf, il=il, vertex=vertex,
-               reco_final=extract_reco(evtdf, cf['vertex_distance']['inter_index'], il),
+               reco_final=extract_reco(evtdf, cf[_final_stage(final_stage)]['inter_index'], il),
                reco_topo=extract_reco(evtdf, cf['single_electron']['inter_index'], il),
                reco_fv=extract_reco(evtdf, fv_idx, il))
     del evtdf; gc.collect()
     return out
-
-
-

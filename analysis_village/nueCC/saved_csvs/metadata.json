@@ -1,0 +1,129 @@
+{
+ "created": "2026-10-27T18:00:30",
+ "production": "gen1_v2",
+ "cafpyana_git": "f341d03",
+ "files": {
+  "sel": "./nuecc_dfs/selected_nuecc_qual.df",
+  "mc": "/exp/sbnd/data/users/castalyf/nue_sel/production_files/gen1_v2/mc1e20_nueCC.df",
+  "dirt": "/exp/sbnd/data/users/castalyf/nue_sel/production_files/gen1_v2/mc1e20_lowE.df",
+  "intime": "/exp/sbnd/data/users/castalyf/nue_sel/production_files/gen1_v2/intime_cosmic.df",
+  "data": "/exp/sbnd/data/users/castalyf/nue_sel/production_files/gen1_v2/data_dev.df",
+  "offbeam": "/exp/sbnd/data/users/castalyf/nue_sel/production_files/gen1_v2/data_offbeamlight.df"
+ },
+ "target_pot": 6.6e+20,
+ "data_pot": 4.4759040289784463e+18,
+ "mc_sample_pot": 5.624547634588571e+20,
+ "scales": {
+  "mc_to_target": 1.173427700996399,
+  "mc_to_data": 0.007957802688794997,
+  "dirt_to_data": 0.01316629537672392,
+  "dirt_to_target": 1.941452473595839,
+  "offbeam_to_data": 0.010279475769649452,
+  "offbeam_to_target": 1.5157728950495575,
+  "intime_to_data": 0.008440973013279958,
+  "intime_to_target": 1.2446741826223369,
+  "beam_duty_fraction": 0.0725
+ },
+ "livetime": {
+  "onbeam_spills": 927556,
+  "offbeam_gates": 83691835,
+  "intime_ngenevt": 101920500
+ },
+ "ke_min_mev": 500.0,
+ "final_stage": "sel_start_dedx",
+ "cut_names": [
+  "precut",
+  "valid_flashmatch",
+  "fiducial",
+  "single_electron",
+  "electron_primary_score",
+  "electron_pid_score",
+  "vertex_distance",
+  "start_dedx"
+ ],
+ "thresholds": {
+  "CUT_LABELS": [
+   "No cut",
+   "Flash match",
+   "In FV",
+   "Final state topology"
+  ],
+  "CUT_LABELS_MORE": [
+   "No cut",
+   "Flash match",
+   "In FV",
+   "Final state topology",
+   "Electron primary score",
+   "Electron PID score",
+   "Conversion gap",
+   "Start dE/dx"
+  ],
+  "CUT_NAMES": [
+   "precut",
+   "valid_flashmatch",
+   "fiducial",
+   "single_electron"
+  ],
+  "CUT_NAMES_MORE": [
+   "precut",
+   "valid_flashmatch",
+   "fiducial",
+   "single_electron",
+   "electron_primary_score",
+   "electron_pid_score",
+   "vertex_distance",
+   "start_dedx"
+  ],
+  "ELECTRON_THRESHOLD_MEV": 500.0,
+  "MUON_THRESHOLD_MEV": 50.0,
+  "PHOTON_THRESHOLD_MEV": 25.0,
+  "PID_ELECTRON": 1,
+  "PID_MUON": 2,
+  "PID_PHOTON": 0,
+  "PID_PION": 3,
+  "PID_PROTON": 4,
+  "PION_THRESHOLD_MEV": 25.0,
+  "PROTON_THRESHOLD_MEV": 50.0,
+  "THRESH_AXIAL_SPREAD": 0.0,
+  "THRESH_DEDX": 7.9,
+  "THRESH_DIR_SPREAD": 0.5,
+  "THRESH_PID_SCORE": 0.91,
+  "THRESH_PRIMARY_SCORE": 0.995,
+  "THRESH_SB_DEDX_HI": 6.0,
+  "THRESH_SB_DEDX_LO": 3.0,
+  "THRESH_VERTEX_DIST": 3.45
+ },
+ "n_sig_presel": 9105,
+ "n_sig_truth_info": 10676,
+ "data_exported": true,
+ "data_blinded_below_mev": 500.0,
+ "csv_files": [
+  "cutflow.csv",
+  "data_pot_by_run.csv",
+  "events_data.csv",
+  "events_dirt.csv",
+  "events_intime.csv",
+  "events_mc.csv",
+  "events_offbeam.csv"
+ ],
+ "columns": {
+  "idx0, idx1, idx2": "interaction index (__ntuple, entry, rec.dlp index) \u2014 joins back to the HDF5 files",
+  "run, subrun, evt": "from hdr_* keys (use these to find the event in the SPINE HDF5 files / spinal-tap)",
+  "int_id, sh_id, e_id, trk_id": "SPINE reco interaction id and particle ids (what spinal-tap displays)",
+  "hdr_fno, hdr_proc, hdr_cluster": "grid-job bookkeeping from hdr, if present",
+  "sample": "mc | dirt | offbeam | intime | data",
+  "w_data": "weight to the on-beam data POT of DATA_FILE (data rows = 1)",
+  "w_target": "weight to TARGET_POT (off-beam/in-time scaled by TARGET_POT/data POT)",
+  "truth_cat": "0 \u03bde CC FV, 1 \u03bde CC out-FV, 2 \u03bd\u03bc CC \u03c00, 3 NC \u03c00, 4 other \u03bd\u03bc CC, 5 other NC, 6 cosmic (MC), 7 no truth; 8 off-beam, 10 in-time MC, -1 data",
+  "is_sig": "true signal (truth_cat 0)",
+  "sel_<stage>": "passes the cumulative selection stage <stage> (nue_selection.shower_qual_cuts)",
+  "sh_*": "leading e/\u03b3 shower (SPINE PID 0 or 1, max calo_ke)",
+  "e_*": "leading SPINE-electron (PID 1, max calo_ke) \u2014 what the signal selection cuts on",
+  "trk_*": "longest track (PID 2,3,4)",
+  "n_<pid>[_primary]": "reco particle multiplicities",
+  "vtx_x/y/z, int_*": "reco interaction vertex and interaction-level fields",
+  "ana_reco_ke/costheta/p": "leading-electron kinematics as stored in the selection df",
+  "true_ke/costheta/p": "true electron kinematics (signal)",
+  "ti_*": "numeric truth_info columns"
+ }
+}

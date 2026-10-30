@@ -347,7 +347,16 @@ def extract_reco(evtdf, stage_idx, il):
     }
 
 
-def load_onbeam_data(data_file, target_pot, pot_scale, verbose=True):
+def _final_stage(final_stage=None):
+    """Last cut of the selection (nue_selection.CUT_NAMES_MORE[-1], i.e. 'start_dedx')
+    unless a stage name is given explicitly. Accepts 'sel_start_dedx' or 'start_dedx'."""
+    if final_stage is None:
+        import nue_selection as _ns
+        final_stage = list(_ns.CUT_NAMES_MORE)[-1]
+    return final_stage[4:] if final_stage.startswith('sel_') else final_stage
+
+
+def load_onbeam_data(data_file, target_pot, pot_scale, final_stage=None, verbose=True):
     """Load on-beam data, patch vertex cols, run selection, extract reco.
 
     Returns dict with keys:
@@ -381,7 +390,7 @@ def load_onbeam_data(data_file, target_pot, pot_scale, verbose=True):
         for stage, d in cut_flow.items():
             print(f'  {stage:<30s}: {len(d["inter_index"]):>8,}')
 
-    final_stage = 'vertex_distance'
+    final_stage = _final_stage(final_stage)
     reco_final = extract_reco(evtdf, cut_flow[final_stage]['inter_index'], il)
     reco_topo = extract_reco(evtdf, cut_flow['single_electron']['inter_index'], il)
 
@@ -418,7 +427,7 @@ def _count_offbeam_parts(evtdf, idx, il, ptype):
     return mask.groupby(level=il).sum().reindex(idx, fill_value=0).values
 
 
-def load_offbeam_data(offbeam_file, data_file, verbose=True):
+def load_offbeam_data(offbeam_file, data_file, final_stage=None, verbose=True):
     """Load off-beam data, run selection, extract reco at all stages.
 
     Returns dict with keys:
@@ -448,7 +457,7 @@ def load_offbeam_data(offbeam_file, data_file, verbose=True):
             n = len(d['inter_index'])
             print(f'  {stage:<30s}: {n:>8,}  →  {n * scale:>7.1f}')
 
-    reco_final = extract_reco(evtdf, cut_flow['vertex_distance']['inter_index'], il)
+    reco_final = extract_reco(evtdf, cut_flow[_final_stage(final_stage)]['inter_index'], il)
     reco_topo = extract_reco(evtdf, cut_flow['single_electron']['inter_index'], il)
     reco_fv = extract_reco(evtdf, cut_flow['fiducial']['inter_index'], il)
 
@@ -497,7 +506,7 @@ def load_offbeam_data(offbeam_file, data_file, verbose=True):
 # 7.  lowE dirt loader
 # ══════════════════════════════════════════════════════════════════════════════
 
-def load_lowE_sample(lowe_file, target_pot, data_total_pot, verbose=True):
+def load_lowE_sample(lowe_file, target_pot, data_total_pot, final_stage=None, verbose=True):
     """Load lowE dirt sample, run selection, extract reco.
 
     Returns dict with keys:
@@ -527,6 +536,18 @@ def load_lowE_sample(lowe_file, target_pot, data_total_pot, verbose=True):
 
     il = list(range(evtdf.index.nlevels - 1))
 
+    # The dirt sample's cosmics are already predicted by the off-beam data and the
+    # main MC; keep only its neutrino interactions (dirt ν) to avoid counting them twice.
+    _tc = truth_info['truth_cat'].reindex(evtdf.groupby(level=il).size().index)
+    _cosmic = _tc.index[_tc.fillna(TRUTH_CAT_COSMIC) == TRUTH_CAT_COSMIC]
+    _row_inter = evtdf.index.droplevel(-1)
+    for stage, d in cut_flow.items():
+        d['inter_index'] = d['inter_index'].difference(_cosmic)
+        d['particle_mask'] = pd.Series(_row_inter.isin(d['inter_index']), index=evtdf.index)
+    evtdf = evtdf[~_row_inter.isin(_cosmic)]
+    if verbose:
+        print(f'LowE: dropped {len(_cosmic):,} cosmic interactions (predicted by off-beam + main MC)')
+
     if verbose:
         for stage, d in cut_flow.items():
             print(f'  {stage:<30s}: {len(d["inter_index"]):>8,}')
@@ -540,7 +561,7 @@ def load_lowE_sample(lowe_file, target_pot, data_total_pot, verbose=True):
     truth_cat = truth_info['truth_cat'].reindex(presel_inter)
 
     sel = pd.DataFrame(index=presel_inter)
-    sel['truth_cat'] = truth_cat.fillna(7).astype('int8')
+    sel['truth_cat'] = truth_cat.fillna(TRUTH_CAT_COSMIC).astype('int8')
     sel['is_sig'] = (sel['truth_cat'] == 0)
     sel['reco_ke'] = reco_ke.reindex(presel_inter).astype('float32')
     sel['reco_costheta'] = reco_cos.reindex(presel_inter).astype('float32')
@@ -557,7 +578,7 @@ def load_lowE_sample(lowe_file, target_pot, data_total_pot, verbose=True):
             'reco_p': reco_p.reindex(idx).dropna().values,
         }
 
-    final_idx = cut_flow['vertex_distance']['inter_index']
+    final_idx = cut_flow[_final_stage(final_stage)]['inter_index']
     topo_idx = cut_flow['single_electron']['inter_index']
 
     # Vertex at FV
@@ -596,19 +617,11 @@ def build_sideband_idx_and_reco(evtdf, topo_idx, il, extract_reco_fn):
     ke_c = ('ke', '') if ('ke', '') in rp.columns else 'ke'
     pi_c = ('pid', '') if ('pid', '') in rp.columns else 'pid'
 
-    ele = rp[rp.index.droplevel(-1).isin(topo_idx) & (rp[pi_c] == 1)]
-    if ele.empty:
+    ld = _ns.leading_primary_electron(evtdf)
+    ld = ld[ld.index.isin(topo_idx)]
+    if ld.empty:
         empty = pd.Index([])
         return empty, {k: np.array([]) for k in ['reco_ke', 'reco_costheta', 'reco_p']}, {}
-
-    li = ele[ke_c].groupby(level=il).idxmax().dropna()
-    if li.empty:
-        empty = pd.Index([])
-        return empty, {k: np.array([]) for k in ['reco_ke', 'reco_costheta', 'reco_p']}, {}
-
-    lmi = pd.MultiIndex.from_tuples(li.values, names=ele.index.names)
-    ld = ele.loc[lmi].copy()
-    ld.index = li.index
 
     sb = pd.Series(True, index=ld.index)
     vd_c = ('vertex_distance', '')
@@ -1018,16 +1031,19 @@ def annotate_chi2(ax, observed, expected, cov_matrix=None, stat_errors=None,
 
 CAT_COLORS = {
     0:  "#56B4E9",   1:  "#0072B2",   2:  "green",     3:  "#009E73",
-    4:  "#E69F00",   5:  "#CC79A7",   6:  "#F0E442",   7:  "#BDBDBD",
-    9:  "#BFB89A",  -1:  "#7F7F7F",
+    4:  "#E69F00",   5:  "#CC79A7",   6:  "#D55E00",   7:  "#F0E442",
+    8:  "#BDBDBD",   9:  "#BFB89A",  -1:  "#7F7F7F",
 }
 CAT_LABELS = {
     0:  r"$\nu_e$ CC (FV)",          1:  r"$\nu_e$ CC (out FV)",
     2:  r"$\nu_\mu$ CC $\pi^0$",     3:  r"$\nu$ NC $\pi^0$",
     4:  r"Other $\nu_\mu$ CC",       5:  r"Other $\nu$ NC",
-    6:  r"Cosmic",                   7:  r"Offbeam",
-    9:  r"Dirt $\nu$",              -1:  r"Unknown",
+    6:  r"Other $\nu$",              7:  r"Cosmic",
+    8:  r"Offbeam",                  9:  r"Dirt $\nu$",
+   -1:  r"Unknown",
 }
+# truth_cat 0-7 come from make_nueCC_df.py; 8 / 9 are the off-beam / dirt samples
+TRUTH_CAT_COSMIC = 7
 
 PID_PHOTON   = 0
 PID_ELECTRON = 1
@@ -1233,7 +1249,6 @@ try:
         plot_matrix_binned,
         plot_pid_fraction_vs_ke,
         save_plot,
-        plot_lynn_comparison,
         LYNN_KE_BINS_GEV,
         LYNN_KE_BINS_MEV,
         LYNN_COS_BINS,
@@ -1340,15 +1355,15 @@ def build_univ_hists(sel_df, stage_col, wgt_aligned, univ_cols,
     """Signal / background universe histograms (n_univ, n_bins) at one selection stage.
     fill_missing=True: neutrino events without a weight row (weight file built from a
     different file list) take the bin-average variation of matched events of the same
-    class (signal / ν background); cosmics (truth_cat 6+) and no-ν events keep weight 1."""
+    class (signal / ν background); cosmics (truth_cat 7) keep weight 1."""
     sel = sel_df[sel_df[stage_col]]
     nb, nu = len(bins) - 1, len(univ_cols)
     if sel.empty:
         return np.zeros((nu, nb)), np.zeros((nu, nb))
     tc   = sel['truth_cat'].values
     smk  = tc == 0
-    bmk  = (tc >= 1) & (tc <= 6)
-    nubk = (tc >= 1) & (tc <= 5)
+    bmk  = (tc >= 1) & (tc <= 7)          # every non-signal MC event (cosmics: weight 1)
+    nubk = (tc >= 1) & (tc <= 6)          # neutrino backgrounds
     reco = sel[var_col].clip(bins[0], bins[-1] - 1e-8).values
  
     nwl = wgt_aligned.index.nlevels
@@ -1630,7 +1645,7 @@ def load_mcnu_full_selected(weights_file, df_file, sel_topo, final_stage, verbos
         if um.any():
             vc = pd.Series(tc[um]).value_counts().sort_index()
             print("  unmatched ν events by truth_cat: " + ', '.join(f'{int(k)}:{v}' for k, v in vc.items())
-                  + "  → truth_cat 0–5 get the bin-average variation of matched events, others weight 1")
+                  + "  → truth_cat 0–6 get the bin-average variation of matched events, cosmics weight 1")
  
     wgt = pd.DataFrame(result, index=sel_idx, columns=pd.MultiIndex.from_tuples(full_cols))
     return wgt
@@ -1675,7 +1690,7 @@ def livetime_scales(data_file, offbeam_file, intime_file,
     return out
  
  
-def load_intime_sample(intime_file, intime_scale, verbose=True):
+def load_intime_sample(intime_file, intime_scale, final_stage=None, verbose=True):
     """In-time CORSIKA MC: selection cut flow, reco at FV / topology / final, FV vertex."""
     import nue_selection as _nsel
     evtdf, _ = patch_vertex_cols(pd.read_hdf(intime_file, key='evt_0'))
@@ -1697,11 +1712,8 @@ def load_intime_sample(intime_file, intime_scale, verbose=True):
                 vertex[coord] = ri[cc].groupby(level=il).first().reindex(fv_idx).dropna().values
                 break
     out = dict(cut_flow=cf, il=il, vertex=vertex,
-               reco_final=extract_reco(evtdf, cf['vertex_distance']['inter_index'], il),
+               reco_final=extract_reco(evtdf, cf[_final_stage(final_stage)]['inter_index'], il),
                reco_topo=extract_reco(evtdf, cf['single_electron']['inter_index'], il),
                reco_fv=extract_reco(evtdf, fv_idx, il))
     del evtdf; gc.collect()
     return out
-
-
-

@@ -507,11 +507,10 @@ def plot_stacked_hist(series_list, labels, colors, bins, weights=None,
                       data_label="Data", pot_label="",
                       invert_stack_order=False,
                       show_counts=True, show_percentage=True,
-                      chi2_info=None, n_mc_cats=7, **hist_kw):
+                      chi2_info=None, **hist_kw):
     """
-    n_mc_cats : int
-        Number of MC categories (cats 0-6 = 7). Used to compute purity
-        as signal / MC-only total, excluding dirt and offbeam.
+    Legend percentages are fractions of everything stacked (MC, dirt, off-beam),
+    so the signal percentage is the purity.
     """
     if ax is None:
         fig, ax = plt.subplots(figsize=(8, 6))
@@ -538,9 +537,8 @@ def plot_stacked_hist(series_list, labels, colors, bins, weights=None,
         h, _ = np.histogram(s, bins=bins_arr, weights=w)
         cat_totals.append(h.sum())
     grand_total = sum(cat_totals)
-    mc_only_total = sum(cat_totals[:n_mc_cats])
 
-    # Build annotated labels with MC-only purity for cats, grand_total for rest
+    # Build annotated labels: (events, fraction of everything stacked)
     annotated_labels = []
     for i, (lbl, tot) in enumerate(zip(labels, cat_totals)):
         parts = [lbl]
@@ -549,9 +547,8 @@ def plot_stacked_hist(series_list, labels, colors, bins, weights=None,
             if show_counts:
                 inner.append(f"{tot:.1f}")
             if show_percentage:
-                denom = mc_only_total if i < n_mc_cats else grand_total
-                if denom > 0:
-                    inner.append(f"{tot / denom:.1%}")
+                if grand_total > 0:
+                    inner.append(f"{tot / grand_total:.1%}")
             parts.append(f"({', '.join(inner)})")
         annotated_labels.append(" ".join(parts))
 
@@ -625,7 +622,7 @@ def plot_unblinding_var(mc_vals, data_vals, truth_cat, bins, xlabel,
                         display_cats=None, savefig_fn=None, filename=None,
                         cut_val=None, cut_dir=None, save_subdir='unblinding'):
     if display_cats is None:
-        display_cats = [0, 1, 2, 3, 4, 5, 6]
+        display_cats = [0, 1, 2, 3, 4, 5, 6, 7]
 
     bins_arr = np.asarray(bins, dtype=float)
     n_bins = len(bins_arr) - 1
@@ -693,7 +690,7 @@ def plot_unblinding_var(mc_vals, data_vals, truth_cat, bins, xlabel,
 
     if has_ob:
         ax_main.bar(bins_arr[:-1], ob_hist, width=bw, bottom=bottoms,
-                    align='edge', color=CAT_COLORS[7], edgecolor='none', linewidth=0)
+                    align='edge', color=CAT_COLORS[8], edgecolor='none', linewidth=0)
         bottoms += ob_hist
 
     frac = None
@@ -733,8 +730,8 @@ def plot_unblinding_var(mc_vals, data_vals, truth_cat, bins, xlabel,
         legend_labels.append(f"{CAT_LABELS[9]} ({dirt_total:.1f}, {pct})")
     if has_ob:
         pct = f"{ob_total / grand_total:.1%}" if grand_total > 0 else "0%"
-        legend_handles.append(mpatches.Patch(facecolor=CAT_COLORS[7], edgecolor='none'))
-        legend_labels.append(f"{CAT_LABELS[7]} ({ob_total:.1f}, {pct})")
+        legend_handles.append(mpatches.Patch(facecolor=CAT_COLORS[8], edgecolor='none'))
+        legend_labels.append(f"{CAT_LABELS[8]} ({ob_total:.1f}, {pct})")
     if has_data:
         legend_handles.append(mlines.Line2D([], [], color='black', marker='o',
                                             linestyle='None', markersize=4))
@@ -829,9 +826,9 @@ def plot_differential_slices(
         savefig_fn=None, filename=None,
         ncols=3):
     if display_cats is None:
-        display_cats = [0, 1, 2, 3, 4, 5, 6]
+        display_cats = [0, 1, 2, 3, 4, 5, 6, 7]
 
-    full_cats = list(display_cats) + [9, 7]
+    full_cats = list(display_cats) + [9, 8]
     n_slices = len(slice_edges)
     nrows = (n_slices + ncols - 1) // ncols
     fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 5 * nrows), squeeze=False)
@@ -868,8 +865,8 @@ def plot_differential_slices(
         mask = valid & (sv >= s_lo) & (sv < s_hi)
         stack_series.append(pv[mask])
         stack_weights.append(np.full(mask.sum(), offbeam_weight))
-        stack_labels.append(CAT_LABELS[7])
-        stack_colors.append(CAT_COLORS[7])
+        stack_labels.append(CAT_LABELS[8])
+        stack_colors.append(CAT_COLORS[8])
 
         n_stack = len(stack_series)
         n_mc = len(display_cats)
@@ -959,7 +956,7 @@ def plot_extra_selection_vars(mc_evtdf, data_evtdf, sel_topo,
                               dirt_weight=None):
     import nue_selection as _ns
     if display_cats is None:
-        display_cats = [0, 1, 2, 3, 4, 5, 6]
+        display_cats = [0, 1, 2, 3, 4, 5, 6, 7]
 
     def _mat(block):
         return block.get('cov', block) if isinstance(block, dict) else block
@@ -1544,7 +1541,7 @@ def plot_handscan_binning(sel_topo, stage_col, var_name,
     figsize : (width, height) of the figure. Original was (8, 7.5).
     """
     if display_cats is None:
-        display_cats = [0, 1, 2, 3, 4, 5, 6]
+        display_cats = [0, 1, 2, 3, 4, 5, 6, 7]
 
     # ── Pick binning ──────────────────────────────────────────────────────
     if var_name == 'reco_ke':
@@ -1640,7 +1637,6 @@ def plot_handscan_binning(sel_topo, stage_col, var_name,
 
     total_mc = sum(mc_hists) + dirt_hist + ob_hist
     grand_total = total_mc.sum()
-    mc_only_total = sum(mc_totals)
 
     # ── Auto-detect best legend side ──────────────────────────────────────
     mid = n_bins // 2
@@ -1660,7 +1656,7 @@ def plot_handscan_binning(sel_topo, stage_col, var_name,
     bw = np.diff(disp_edges)
     bottoms = np.zeros(n_bins)
 
-    # Stack: signal (bottom) → cosmic → dirt → offbeam (top)
+    # Stack: truth_cat 0 (bottom) → 7 (cosmic) → dirt → offbeam (top)
     for h, col in zip(mc_hists, mc_colors):
         ax_main.bar(disp_edges[:-1], h, width=bw, bottom=bottoms,
                     align='edge', color=col, edgecolor='none', linewidth=0)
@@ -1673,7 +1669,7 @@ def plot_handscan_binning(sel_topo, stage_col, var_name,
 
     if has_ob:
         ax_main.bar(disp_edges[:-1], ob_hist, width=bw, bottom=bottoms,
-                    align='edge', color=CAT_COLORS[7], edgecolor='none', linewidth=0)
+                    align='edge', color=CAT_COLORS[8], edgecolor='none', linewidth=0)
         bottoms += ob_hist
 
     # ── Syst band ─────────────────────────────────────────────────────────
@@ -1704,9 +1700,9 @@ def plot_handscan_binning(sel_topo, stage_col, var_name,
     # ── Legend ────────────────────────────────────────────────────────────
     legend_handles, legend_labels_list = [], []
 
-    # MC categories — purity = fraction of MC-only total
+    # MC categories — fraction of the full prediction (signal % = purity)
     for lbl, col, tot in zip(mc_labels, mc_colors, mc_totals):
-        pct = f"{tot / mc_only_total:.1%}" if mc_only_total > 0 else "0%"
+        pct = f"{tot / grand_total:.1%}" if grand_total > 0 else "0%"
         legend_handles.append(mpatches.Patch(facecolor=col, edgecolor='none'))
         legend_labels_list.append(f"{lbl} ({tot:.1f}, {pct})")
 
@@ -1717,8 +1713,8 @@ def plot_handscan_binning(sel_topo, stage_col, var_name,
         legend_labels_list.append(f"{CAT_LABELS[9]} ({dirt_total:.1f}, {pct})")
     if has_ob:
         pct = f"{ob_total / grand_total:.1%}" if grand_total > 0 else "0%"
-        legend_handles.append(mpatches.Patch(facecolor=CAT_COLORS[7], edgecolor='none'))
-        legend_labels_list.append(f"{CAT_LABELS[7]} ({ob_total:.1f}, {pct})")
+        legend_handles.append(mpatches.Patch(facecolor=CAT_COLORS[8], edgecolor='none'))
+        legend_labels_list.append(f"{CAT_LABELS[8]} ({ob_total:.1f}, {pct})")
 
     # Data
     if has_data:
