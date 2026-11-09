@@ -501,6 +501,14 @@ def _best_legend_side(series_list, weights_list, bins_arr):
     return 'right' if right_max <= left_max else 'left'
 
 
+# Common style of every data/MC stacked histogram (same as nue_syst §3.6):
+# main panel + Data/MC ratio panel in one (8, 7.5) figure, legend font 10, two columns.
+DATAMC_FIGSIZE = (8, 7.5)
+DATAMC_LEGEND_FS = 10
+DATAMC_TEXT_FS = 10          # gray info text (POT, totals, χ², Σ data/pred); legends have no frame
+DATAMC_HEADROOM = 1.6        # y-axis top = HEADROOM × max(prediction, data): room for the legend
+
+
 def plot_stacked_hist(series_list, labels, colors, bins, weights=None,
                       xlabel="", ylabel="Events / bin", title="",
                       density=False, ax=None, data_series=None,
@@ -586,8 +594,8 @@ def plot_stacked_hist(series_list, labels, colors, bins, weights=None,
         legend_labels_out.append(data_label)
 
     side = _best_legend_side([c[0] for c in clean], [c[1] for c in clean], bins_arr)
-    ax.legend(legend_handles, legend_labels_out, fontsize=9, ncol=1,
-              loc=f'upper {side}', frameon=True, framealpha=0.3, edgecolor="none")
+    ax.legend(legend_handles, legend_labels_out, fontsize=DATAMC_LEGEND_FS, ncol=1,
+              loc=f'upper {side}', frameon=False)
 
     ax.set_xlabel(xlabel, fontsize=12)
     ax.set_ylabel(ylabel, fontsize=12)
@@ -602,7 +610,7 @@ def plot_stacked_hist(series_list, labels, colors, bins, weights=None,
         info_lines.append(pot_label)
     info_lines.append(f"Total MC events: {grand_total:.0f}")
     ax.text(info_x, 0.98, "\n".join(info_lines), transform=ax.transAxes,
-            va="top", ha=info_ha, fontsize=10, color="gray", linespacing=1.15)
+            va="top", ha=info_ha, fontsize=DATAMC_TEXT_FS, color="gray", linespacing=1.15)
 
     if chi2_info is not None:
         annotate_chi2(ax, **chi2_info)
@@ -671,7 +679,7 @@ def plot_unblinding_var(mc_vals, data_vals, truth_cat, bins, xlabel,
     side = 'right' if right_max <= left_max else 'left'
 
     fig, (ax_main, ax_ratio) = plt.subplots(
-        2, 1, figsize=(8, 7.5),
+        2, 1, figsize=DATAMC_FIGSIZE,
         gridspec_kw={'height_ratios': [3.2, 1]}, sharex=True)
     plt.subplots_adjust(hspace=0.05)
 
@@ -744,11 +752,11 @@ def plot_unblinding_var(mc_vals, data_vals, truth_cat, bins, xlabel,
         legend_handles.append(mlines.Line2D([], [], color='red', ls='--', lw=1.5))
         legend_labels.append(f'Cut: {sym}{cut_val}')
 
-    ax_main.legend(legend_handles, legend_labels, fontsize=7, ncol=2,
-                   loc=f'upper {side}', frameon=True, framealpha=0.85, edgecolor='none')
+    ax_main.legend(legend_handles, legend_labels, fontsize=DATAMC_LEGEND_FS, ncol=2,
+                   loc=f'upper {side}', frameon=False)
 
     ymax = max(total_mc.max(), dc.max() if dc is not None else 0)
-    ax_main.set_ylim(bottom=0, top=ymax * 1.55)
+    ax_main.set_ylim(bottom=0, top=ymax * DATAMC_HEADROOM)
     ax_main.set_ylabel('Events / bin', fontsize=12)
     ax_main.set_title(fr'SBND $\nu_e$ CC Inclusive — {stage_name}', fontsize=12)
 
@@ -758,7 +766,7 @@ def plot_unblinding_var(mc_vals, data_vals, truth_cat, bins, xlabel,
 
     header = [f'Data POT: {data_pot:.2e}', f'Total MC events: {grand_total:.0f}']
     ax_main.text(info_x, 0.98, "\n".join(header),
-                 transform=ax_main.transAxes, fontsize=9, color='gray',
+                 transform=ax_main.transAxes, fontsize=DATAMC_TEXT_FS, color='gray',
                  va='top', ha=info_ha, linespacing=1.15)
 
     if has_data:
@@ -777,7 +785,7 @@ def plot_unblinding_var(mc_vals, data_vals, truth_cat, bins, xlabel,
                       f'$\\pm$ {sye:.2f} (syst.)\n'
                       f'$\\chi^2$/ndf = {c2:.1f}/{nd}, p = {pv:.2f}')
         ax_ratio.text(info_x, 0.98, stats_text,
-                      transform=ax_ratio.transAxes, fontsize=9, color='gray',
+                      transform=ax_ratio.transAxes, fontsize=DATAMC_TEXT_FS, color='gray',
                       va='top', ha=info_ha, linespacing=1.15)
         print(f"  {stage_name} / {xlabel}:")
         print(f"    Data/Pred = {dp:.3f} ± {se:.3f} (stat.) ± {sye:.3f} (syst.)")
@@ -918,7 +926,7 @@ def plot_differential_slices(
             # forward order already matches canonical: cats 0-6, dirt, offbeam
             ax.legend(handles_raw, labels_raw,
                       fontsize=7, ncol=2, loc='best',
-                      frameon=True, framealpha=0.8, edgecolor='none')
+                      frameon=False)
         else:
             leg = ax.get_legend()
             if leg:
@@ -1123,35 +1131,99 @@ def _mat(block):
     return block.get('cov', block) if isinstance(block, dict) else block
 
 
+# Common style of every uncertainty-breakdown plot (fracunc, dial, source, cosmic):
+# one figure size, legend outside the axes on the right (the axes shrink, the figure does not),
+# every legend entry carries its normalization uncertainty  sqrt(sum_ij V_ij) / sum_i N_i
+# (full covariance, the same "Normalization %" as nue_xsec.ipynb).
+UNC_FIGSIZE = (8, 4)
+UNC_LEGEND_FS = 9
+UNC_HEADROOM = 1.18          # y-axis room above the highest curve for the POT label
+
+
+UNC_AX_RECT = dict(left=0.095, right=0.665, bottom=0.14, top=0.90)   # fixed axes position (figure fraction)
+UNC_LEGEND_WRAP = 26                                                  # characters per legend line
+
+
+def _pct_of(label):
+    import re
+    m = re.search(r'\(([-\d.]+)%\)', label)
+    return float(m.group(1)) if m else -1.0
+
+
+def sort_legend_by_pct(handles, labels):
+    """Largest percentage first; 'Total …' entries keep their order at the end."""
+    items = list(zip(handles, labels))
+    tot = [it for it in items if it[1].lstrip().startswith('Total')]
+    rest = [it for it in items if not it[1].lstrip().startswith('Total')]
+    rest.sort(key=lambda it: -_pct_of(it[1]))
+    items = rest + tot
+    return [h for h, _ in items], [l for _, l in items]
+
+
+def unc_legend_right(ax, title=None, fontsize=UNC_LEGEND_FS, wrap=UNC_LEGEND_WRAP, **kw):
+    """Legend to the right of the axes, outside the plot area, sorted by percentage, long
+    entries wrapped onto several lines so the canvas does not depend on the label length."""
+    import textwrap
+    h, l = sort_legend_by_pct(*ax.get_legend_handles_labels())
+    l = [textwrap.fill(x, wrap, break_long_words=True, break_on_hyphens=False) if '$' not in x else x
+         for x in l]
+    return ax.legend(h, l, loc='upper left', bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0, frameon=False,
+                     fontsize=fontsize, title=title, title_fontsize=fontsize, **kw)
+
+
+def unc_fixed_canvas(fig):
+    """Same axes position in every breakdown plot (no tight_layout). An invisible full-figure
+    rectangle keeps savefig(bbox_inches='tight') from cropping to the legend width."""
+    from matplotlib.patches import Rectangle
+    fig.subplots_adjust(**UNC_AX_RECT)
+    fig.add_artist(Rectangle((0, 0), 1, 1, transform=fig.transFigure, fill=False,
+                             edgecolor='none', zorder=-10))
+
+
+def _int_frac(cov, cv):
+    """Normalization uncertainty sqrt(sum_ij V_ij) / sum_i N_i (full matrix; a 1-D input is
+    treated as a diagonal matrix)."""
+    cov = np.asarray(cov, dtype=float)
+    tot = cov.sum() if cov.ndim == 2 else np.clip(cov, 0, None).sum()
+    return float(np.sqrt(max(tot, 0.0)) / cv.sum()) if cv.sum() > 0 else 0.0
+
+
+def _unc_finish(ax, vcfg):
+    ax.set_xlim(vcfg.bins[0], vcfg.bins[-1])
+    ax.set_ylim(0, ax.get_ylim()[1] * UNC_HEADROOM)
+    ax.text(0.99, 0.97, vcfg.pot_label, transform=ax.transAxes,
+            ha='right', va='top', fontsize=10, color='gray')
+
+
 def plot_fracunc(vcfg, cv_arr, cov_results_var, block_key, categ,
                  title=r'SBND $\nu_e$ CC Inclusive'):
     import warnings
-    fig, ax = plt.subplots(figsize=(8, 4))
+    fig, ax = plt.subplots(figsize=UNC_FIGSIZE)
     total_var = np.zeros(len(vcfg.bin_centers))
+    total_cov = 0.0
     for src, covs in cov_results_var.items():
         with warnings.catch_warnings():
             warnings.simplefilter('ignore')
-            diag = np.diag(_mat(covs[block_key])).clip(0)
+            C = np.asarray(_mat(covs[block_key]), dtype=float)
+            total_cov = total_cov + C
+            diag = np.diag(C).clip(0)
             frac = np.where(cv_arr > 0, np.sqrt(diag) / cv_arr, 0.0)
         xe = np.append(vcfg.bins[:-1], vcfg.bins[-1])
         ye = np.append(frac, frac[-1])
-        ax.step(xe, ye, where='post', label=SRC_LABEL.get(src, src),
+        ax.step(xe, ye, where='post', label=f"{SRC_LABEL.get(src, src)} ({_int_frac(C, cv_arr)*100:.1f}%)",
                 color=COLORS.get(src, 'gray'), lw=1.8)
         total_var += diag
     tot = np.where(cv_arr > 0, np.sqrt(total_var) / cv_arr, 0.0)
     ax.step(np.append(vcfg.bins[:-1], vcfg.bins[-1]),
             np.append(tot, tot[-1]),
-            where='post', label='Total', color='black', lw=2.2, ls='--')
+            where='post', label=f'Total ({_int_frac(total_cov, cv_arr)*100:.1f}%)',
+            color='black', lw=2.2, ls='--')
     ax.set_xlabel(vcfg.var_plot_name, fontsize=12)
     ax.set_ylabel('Fractional uncertainty', fontsize=12)
-    ax.set_title(f'{title} - {categ}', fontsize=12)
-    ax.legend(fontsize=10, ncol=2)
-    ax.set_xlim(vcfg.bins[0], vcfg.bins[-1])
-    ax.set_ylim(bottom=0)
-    ax.grid(axis='y', alpha=0.3)
-    ax.text(0.99, 0.97, vcfg.pot_label, transform=ax.transAxes,
-            ha='right', va='top', fontsize=10, color='gray')
-    fig.tight_layout()
+    ax.set_title(f'{title} — {categ}', fontsize=12)
+    unc_legend_right(ax, title='Normalization %')
+    _unc_finish(ax, vcfg)
+    unc_fixed_canvas(fig)
     return fig
 
 
@@ -1187,10 +1259,9 @@ def plot_source_breakdown(sub_univ_dict, sig_cv, vcfg, categ='Signal',
             cov = _mat(get_cov_self(univ, sig_cv))
         diag = np.diag(cov).clip(0)
         frac = np.where(sig_cv > 0, np.sqrt(diag) / sig_cv, 0.0)
-        # rank metric: total fractional unc = sqrt(sum diag)/sum cv
-        total_frac = (np.sqrt(diag.sum()) / sig_cv.sum()
-                      if sig_cv.sum() > 0 else 0.0)
-        per_source[name] = dict(frac=frac, diag=diag, total=total_frac)
+        # rank metric: normalization uncertainty sqrt(sum V)/sum cv
+        per_source[name] = dict(frac=frac, diag=diag, cov=np.asarray(cov, float),
+                                total=_int_frac(cov, sig_cv))
 
     ranked = sorted(per_source.items(), key=lambda kv: kv[1]['total'],
                     reverse=True)
@@ -1199,12 +1270,11 @@ def plot_source_breakdown(sub_univ_dict, sig_cv, vcfg, categ='Signal',
     # Quadrature total over ALL sub-sources (not just top-N)
     total_diag = sum(v['diag'] for v in per_source.values())
     total_frac_bin = np.where(sig_cv > 0, np.sqrt(total_diag) / sig_cv, 0.0)
-    total_scalar = (np.sqrt(total_diag.sum()) / sig_cv.sum()
-                    if sig_cv.sum() > 0 else 0.0)
+    total_scalar = _int_frac(sum(v['cov'] for v in per_source.values()), sig_cv)
 
     # ── Plot ──────────────────────────────────────────────────────────────
     import matplotlib.cm as cm
-    fig, ax = plt.subplots(figsize=(8, 4.5))
+    fig, ax = plt.subplots(figsize=UNC_FIGSIZE)
     base = color or COLORS.get(group_label.lower(), 'tab:blue')
     shades = cm.get_cmap('viridis')(np.linspace(0.15, 0.85, len(top)))
 
@@ -1222,14 +1292,9 @@ def plot_source_breakdown(sub_univ_dict, sig_cv, vcfg, categ='Signal',
     ax.set_xlabel(vcfg.var_plot_name, fontsize=12)
     ax.set_ylabel('Fractional uncertainty', fontsize=12)
     ax.set_title(f'{title} — {group_label} breakdown ({categ})', fontsize=12)
-    ax.legend(fontsize=9, ncol=1, loc='best', title='Top sources',
-              framealpha=0.4)
-    ax.set_xlim(bins_arr[0], bins_arr[-1])
-    ax.set_ylim(bottom=0)
-    ax.grid(axis='y', alpha=0.3)
-    ax.text(0.99, 0.97, vcfg.pot_label, transform=ax.transAxes,
-            ha='right', va='top', fontsize=10, color='gray')
-    fig.tight_layout()
+    unc_legend_right(ax, title=f'Top {len(top)} sources (norm. %)')
+    _unc_finish(ax, vcfg)
+    unc_fixed_canvas(fig)
     if savefig_fn and filename:
         savefig_fn(fig, filename, save_subdir)
     return fig, ranked
@@ -1258,13 +1323,13 @@ def plot_dial_breakdown(vcfg, sig_cv, rankings, family,
         return None
 
     top = rankings[:top_n]
-    total_diag = sum(r[3] for r in rankings)
+    total_cov = sum(np.asarray(r[3], dtype=float) for r in rankings)   # full matrix or diagonal
+    total_diag = np.diag(total_cov).clip(0) if total_cov.ndim == 2 else total_cov
     total_frac = np.where(sig_cv > 0, np.sqrt(total_diag) / sig_cv, 0.0)
-    total_scalar = (np.sqrt(total_diag.sum()) / sig_cv.sum()
-                    if sig_cv.sum() > 0 else 0.0)
+    total_scalar = _int_frac(total_cov, sig_cv)
 
     family_label = FAMILY_LABELS.get(family, family)
-    fig, ax = plt.subplots(figsize=(8, 4.5))
+    fig, ax = plt.subplots(figsize=UNC_FIGSIZE)
     shades = cm.get_cmap('tab10')(np.linspace(0, 0.5, max(top_n, 3)))
 
     for (name, tot, frac, _), sh in zip(top, shades):
@@ -1281,14 +1346,9 @@ def plot_dial_breakdown(vcfg, sig_cv, rankings, family,
     ax.set_xlabel(vcfg.var_plot_name, fontsize=12)
     ax.set_ylabel('Fractional uncertainty', fontsize=12)
     ax.set_title(f'{title} — {family_label} breakdown (Signal)', fontsize=12)
-    ax.legend(fontsize=9, ncol=1, loc='best', framealpha=0.4,
-              title=f'top {top_n} sources')
-    ax.set_xlim(vcfg.bins[0], vcfg.bins[-1])
-    ax.set_ylim(bottom=0)
-    ax.grid(axis='y', alpha=0.3)
-    ax.text(0.99, 0.97, vcfg.pot_label, transform=ax.transAxes,
-            ha='right', va='top', fontsize=10, color='gray')
-    fig.tight_layout()
+    unc_legend_right(ax, title=f'Top {len(top)} sources (norm. %)')
+    _unc_finish(ax, vcfg)
+    unc_fixed_canvas(fig)
 
     if savefig_fn:
         savefig_fn(fig, f'{vcfg.name}_{family}_breakdown_signal', save_subdir)
@@ -1308,21 +1368,19 @@ def plot_cosmic_breakdown(vcfg, sig_cv, ob_h, it_h, total_mc,
     envelope = np.full(len(frac_diff), np.nanmax(frac_diff))
     scalar = np.nanmax(frac_diff)
 
-    fig, ax = plt.subplots(figsize=(8, 4.5))
+    fig, ax = plt.subplots(figsize=UNC_FIGSIZE)
     xe = np.append(vcfg.bins[:-1], vcfg.bins[-1])
+    _diff_int = abs((ob_h - it_h).sum()) / total_mc.sum() if total_mc.sum() > 0 else 0.0
     ax.step(xe, np.append(frac_diff, frac_diff[-1]), where='post', lw=1.7,
-            color='#E91E63', label='Per-bin |OB−intime|/MC')
+            color='#E91E63', label=f'Per-bin |OB−intime|/MC ({_diff_int*100:.1f}%)')
     ax.step(xe, np.append(envelope, envelope[-1]), where='post', lw=2.4,
             ls='--', color='black', label=f'Envelope ({scalar*100:.1f}%)')
     ax.set_xlabel(vcfg.var_plot_name, fontsize=12)
     ax.set_ylabel('Cosmic fractional uncertainty', fontsize=12)
     ax.set_title(f'{title} — Cosmic breakdown', fontsize=12)
-    ax.legend(fontsize=9, loc='best', framealpha=0.4)
-    ax.set_xlim(vcfg.bins[0], vcfg.bins[-1]); ax.set_ylim(bottom=0)
-    ax.grid(axis='y', alpha=0.3)
-    ax.text(0.99, 0.97, vcfg.pot_label, transform=ax.transAxes,
-            ha='right', va='top', fontsize=10, color='gray')
-    fig.tight_layout()
+    unc_legend_right(ax, title='Normalization %')
+    _unc_finish(ax, vcfg)
+    unc_fixed_canvas(fig)
     if savefig_fn:
         savefig_fn(fig, f'{vcfg.name}_cosmic_breakdown', save_subdir)
     return fig
@@ -1351,13 +1409,12 @@ def threshold_plots_cumulative(evtdf, cut_flow_result, cut_stage,
     -------
     dict  {metric_col: optimal_threshold}
     """
-    from nue_selection import PID_ELECTRON, classify_truth
+    from nue_selection import leading_primary_electron, classify_truth
 
     il = inter_levels(evtdf)
     presel_idx = cut_flow_result[cut_stage]["inter_index"]
     cat = (truth_categories if truth_categories is not None
            else classify_truth(evtdf, verbose=False))
-    rp_df = reco_particles(evtdf)._df
 
     _MULTI = {'pid_scores': ('pid_scores', 'I1'),
               'primary_scores': ('primary_scores', 'I1')}
@@ -1366,34 +1423,22 @@ def threshold_plots_cumulative(evtdf, cut_flow_result, cut_stage,
         if isinstance(mc, str) and mc in _MULTI:
             return _MULTI[mc]
         if isinstance(mc, str):
-            if mc in rp_df.columns:
+            if mc in lead.columns:
                 return mc
-            if (mc, '') in rp_df.columns:
+            if (mc, '') in lead.columns:
                 return (mc, '')
-            m = [c for c in rp_df.columns
+            m = [c for c in lead.columns
                  if (isinstance(c, tuple) and c[0] == mc) or c == mc]
             if not m:
                 raise KeyError(f"'{mc}' not found in reco_particles.")
             return m[0]
         return mc
 
-    ke_col = ('ke', '') if ('ke', '') in rp_df.columns else 'ke'
-    pid_col = ('pid', '') if ('pid', '') in rp_df.columns else 'pid'
-    in_presel = rp_df.index.droplevel(-1).isin(presel_idx)
-    ele_presel = rp_df[in_presel & (rp_df[pid_col] == PID_ELECTRON)]
-
-    # Build per-cut metric Series
-    metric_frames = {}
-    for (mc, *_) in shower_cuts:
-        ck = _resolve_col(mc)
-        tmp = pd.DataFrame({'ke': ele_presel[ke_col].to_numpy(dtype=float),
-                            'metric': ele_presel[ck].to_numpy(dtype=float)},
-                           index=ele_presel.index)
-
-        def _mke(g):
-            return g.loc[g['ke'].idxmax(), 'metric']
-
-        metric_frames[mc] = tmp.groupby(level=il).apply(_mke)
+    # cut variables from the leading PRIMARY reco electron above threshold — the same
+    # particle nue_selection.shower_qual_cuts applies the cuts to
+    lead = leading_primary_electron(evtdf)
+    lead = lead[lead.index.isin(presel_idx)]
+    metric_frames = {mc: lead[_resolve_col(mc)].astype(float) for (mc, *_) in shower_cuts}
 
     master = pd.DataFrame(metric_frames)
     master['is_signal'] = (cat.reindex(master.index).fillna(-1) == 0).values
@@ -1513,7 +1558,7 @@ def plot_handscan_binning(sel_topo, stage_col, var_name,
                           display_widths=None,
                           overflow_last_bin=None,
                           overflow_max=5000.0,
-                          figsize=(7.0, 7.5),
+                          figsize=DATAMC_FIGSIZE,
                           savefig_fn=None, filename=None,
                           save_subdir='designed_binning',
                           title=r'SBND $\nu_e$ CC Inclusive'):
@@ -1728,18 +1773,18 @@ def plot_handscan_binning(sel_topo, stage_col, var_name,
                                              alpha=0.25, hatch='///', linewidth=0))
         legend_labels_list.append('Syst. unc.')
 
-    ax_main.legend(legend_handles, legend_labels_list, fontsize=7, ncol=2,
-                   loc=f'upper {side}', frameon=True, framealpha=0.85, edgecolor='none')
+    ax_main.legend(legend_handles, legend_labels_list, fontsize=DATAMC_LEGEND_FS, ncol=2,
+                   loc=f'upper {side}', frameon=False)
 
     ymax = max(total_mc.max(), dc.max() if dc is not None else 0)
-    ax_main.set_ylim(bottom=0, top=ymax * 1.55)
+    ax_main.set_ylim(bottom=0, top=ymax * DATAMC_HEADROOM)
     ax_main.set_ylabel('Events / bin', fontsize=12)
     ax_main.set_title(f'{title}', fontsize=12)
 
     # ── Info text ─────────────────────────────────────────────────────────
     header = [f'Data POT: {data_pot:.2e}', f'Total MC events: {grand_total:.0f}']
     ax_main.text(info_x, 0.98, '\n'.join(header),
-                 transform=ax_main.transAxes, fontsize=9, color='gray',
+                 transform=ax_main.transAxes, fontsize=DATAMC_TEXT_FS, color='gray',
                  va='top', ha=info_ha, linespacing=1.15)
 
     # ── Stats in ratio panel ──────────────────────────────────────────────
@@ -1759,7 +1804,7 @@ def plot_handscan_binning(sel_topo, stage_col, var_name,
                       f'$\\pm$ {sye:.2f} (syst.)\n'
                       f'$\\chi^2$/ndf = {c2:.1f}/{nd}, p = {pv:.2f}')
         ax_ratio.text(info_x, 0.98, stats_text,
-                      transform=ax_ratio.transAxes, fontsize=9, color='gray',
+                      transform=ax_ratio.transAxes, fontsize=DATAMC_TEXT_FS, color='gray',
                       va='top', ha=info_ha, linespacing=1.15)
         print(f"  {var_name}:")
         print(f"    Data/Pred = {dp:.3f} ± {se:.3f} (stat.) ± {sye:.3f} (syst.)")

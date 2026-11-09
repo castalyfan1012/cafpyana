@@ -1,16 +1,19 @@
 """
-nue_xsec_helpers.py  (v4)
+nue_xsec_helpers.py  (v5)
 -------------------------
 Helpers for nue_xsec.ipynb (Wiener-SVD cross-section extraction).
 
-Changes over v3:
-  - Binning follows nue_syst.ipynb §0.2 (6 KE bins, 5 cosθ bins); old SYST_*_BINS removed
-  - N_targets counts nucleons (ρ·V·N_A = 4.88e31, technote Eq. 31) — v3 divided by M_Ar
-  - Covariances read from the per-family NPZs written by nue_syst.ipynb §2.11,
-    with shape checks so stale files (e.g. the old 7-bin detsys file) are skipped
-  - Response r_aμ = ε_μ Δ_aμ built from sel_topo with POT-scaled model (technote Eq. 32)
-  - FDT weights are pandas Series aligned to sel_topo (v3 truncated the truth weights)
-  - χ², norm/shape decomposition, unfolded-space covariance propagation
+Changes over v4:
+  - Serialized 2D binning (SerialBinning, PC2D): p in cosθ slices, one unique bin index per
+    (slice, p) cell, so the 2D measurement is unfolded as one 1D vector and bin migration
+    between slices is kept (MicroBooNE CC1p0π style). Columns reco_pc2d / true_pc2d hold the
+    index (+0.5), so the 1D machinery (response, universes, Wiener-SVD) is reused unchanged.
+  - Slice-aware plotting: serialized axes with slice separators, per-slice panels, per-slice
+    covariance blocks and χ² (slice_chi2), sub-blocks of the mega matrices
+  - Removed the unused KE-based NueCCBinning2D, LYNN_* constants and the unused OmniFold plots
+
+v4: binning follows nue_syst.ipynb §0.2; N_targets in nucleons; per-family NPZ covariances;
+    r_aμ = ε_μ Δ_aμ (technote Eq. 32); FDT weights aligned to sel_topo; χ² / norm-shape tools.
 """
 
 import os, warnings
@@ -40,9 +43,6 @@ N_TARGETS  = RHO_LAR * V_FV * N_AVOGADRO   # nucleons: 4.88e31
 # (The "5.43e10 cm⁻²" quoted in technote §5.1 does not reproduce those numbers.)
 FLUX_PER_POT = 9.65e-11
 
-# Back-compat aliases
-LYNN_RHO, LYNN_V_FV, LYNN_N_TARGETS, LYNN_FLUX = RHO_LAR, V_FV, N_TARGETS, FLUX_PER_POT
-
 
 def get_constants():
     """(N_targets [nucleons], Φ [cm⁻² / POT])"""
@@ -55,60 +55,160 @@ def get_constants():
 
 KE_MIN, KE_MAX = 500.0, 3000.0
 ANALYSIS_BINS = {
-    'reco_ke':       np.array([500, 750, 1050, 1350, 1800, 2250, 3000], dtype=float),
+    'reco_ke':       np.array([500, 700, 950, 1250, 1600, 2250, 3000], dtype=float),  
     'reco_costheta': np.array([-1.0, 0.5, 0.75, 0.85, 0.925, 1.0], dtype=float),
 }
-ANALYSIS_WIDTHS = {   # display widths (handscan style) — only used for drawing
-    'reco_ke':       np.array([5, 6, 6, 9, 9, 15], dtype=float),
+ANALYSIS_WIDTHS = {
+    'reco_ke':       np.array([4, 5, 6, 7, 13, 15], dtype=float),
     'reco_costheta': np.array([6, 6, 4, 3, 2], dtype=float),
 }
-TRUE_VAR = {'reco_ke': 'true_ke', 'reco_costheta': 'true_costheta'}
-
-LYNN_ENERGY_BINS_GEV = np.array([0.5, 0.7, 0.95, 1.25, 1.7, 2.5])
-LYNN_COS_BINS        = np.array([-1.0, 0.6, 0.75, 0.85, 0.925, 1.0])
-
-NUE_COSTHETA_BINS = np.array([-1.0, 0.0, 0.5, 0.75, 0.85, 0.95, 1.001])
-NUE_KE_BINS_2D = np.array([
-    [0, 300, 700, 1200, 2000.],
-    [0, 200, 500, 1000, 2000.],
-    [0, 200, 500, 1000, 2000.],
-    [0, 150, 400,  900, 2000.],
-    [0, 150, 400,  900, 2000.],
-    [0, 150, 400,  900, 2000.],
-], dtype=float)
+TRUE_VAR = {'reco_ke': 'true_ke', 'reco_costheta': 'true_costheta', 'reco_pc2d': 'true_pc2d'}
 
 
-class NueCCBinning2D:
-    def __init__(self, costheta_bins=None, ke_bins_2d=None):
-        self.diff_costheta_bins = np.array(costheta_bins or NUE_COSTHETA_BINS)
-        self.diff_momentum_bins_2d = np.array(ke_bins_2d or NUE_KE_BINS_2D, dtype=float)
-        self.n_costheta_bins = len(self.diff_costheta_bins) - 1
+# =============================================================================
+# Serialized 2D binning: p in cosθ slices, one unique bin index per (slice, p) cell
+# =============================================================================
+
+class SerialBinning:
+    """Unique (serialized) bin index for a 2D measurement.
+
+    The 2D phase space is cut into slices of `slice_var`; slice i has its own edges x_edges[i]
+    in `x_var`. Global bin index = offset of the slice + local x bin, so the true → reco
+    response, the universes and the unfolding all act on ONE vector and bin migration between
+    slices is kept. Under/overflow go to the first/last slice and to the first/last x bin of
+    that slice (same convention as the 1D binning).
+    """
+
+    def __init__(self, slice_edges, x_edges, slice_var='costheta', x_var='p',
+                 slice_tex=r'$\cos\theta$', x_tex=r'$p$', x_unit='GeV/c', x_scale=1e-3):
+        self.slice_edges = np.asarray(slice_edges, dtype=float)
+        self.x_edges = [np.asarray(e, dtype=float) for e in x_edges]
+        assert len(self.x_edges) == len(self.slice_edges) - 1, 'one x binning per slice'
+        self.slice_var, self.x_var = slice_var, x_var
+        self.slice_tex, self.x_tex = slice_tex, x_tex
+        self.x_unit, self.x_scale = x_unit, x_scale       # x_scale: stored unit → displayed unit
+        self.n_slices = len(self.x_edges)
+        self.n_x = np.array([len(e) - 1 for e in self.x_edges])
+        self.offsets = np.concatenate([[0], np.cumsum(self.n_x)])
+        self.n_bins = int(self.offsets[-1])
+        self.edges = np.arange(self.n_bins + 1, dtype=float)          # serialized axis
+        self.slice_of = np.repeat(np.arange(self.n_slices), self.n_x)
+        self.local_of = np.concatenate([np.arange(n) for n in self.n_x])
+
+    def block(self, i):
+        """Global index range of slice i (use as M[b, b])."""
+        return slice(int(self.offsets[i]), int(self.offsets[i + 1]))
+
+    def index(self, s, x):
+        """Global bin index per event; -1 where s or x is NaN. float64 cast first: float32
+        values clipped at edge−1e-9 round back onto the edge."""
+        s = np.asarray(s, dtype=np.float64)
+        x = np.asarray(x, dtype=np.float64)
+        out = np.full(s.shape, -1, dtype=int)
+        ok = np.isfinite(s) & np.isfinite(x)
+        se = self.slice_edges
+        i = np.clip(np.searchsorted(se, s[ok], side='right') - 1, 0, self.n_slices - 1)
+        j = np.empty_like(i)
+        for k in range(self.n_slices):
+            m = i == k
+            e = self.x_edges[k]
+            j[m] = np.clip(np.searchsorted(e, x[ok][m], side='right') - 1, 0, len(e) - 2)
+        out[ok] = self.offsets[i] + j
+        return out
+
+    def value(self, s, x):
+        """Column value for the 1D machinery: index + 0.5 (NaN where undefined)."""
+        idx = self.index(s, x)
+        return np.where(idx >= 0, idx + 0.5, np.nan)
+
+    def widths(self, x_scale=None):
+        """Δslice · Δx per global bin (x in displayed units unless x_scale is given)."""
+        xs = self.x_scale if x_scale is None else x_scale
+        ds = np.diff(self.slice_edges)
+        return np.concatenate([ds[k] * np.diff(e) * xs for k, e in enumerate(self.x_edges)])
+
+    def slice_label(self, i, tex=True):
+        lo, hi = self.slice_edges[i], self.slice_edges[i + 1]
+        name = self.slice_tex if tex else self.slice_var
+        return f'{lo:g} ≤ {name} < {hi:g}'
+
+    def x_disp_edges(self, i):
+        return self.x_edges[i] * self.x_scale
 
     @property
-    def costheta_labels(self):
-        lo = self.diff_costheta_bins[:-1]
-        hi = np.minimum(self.diff_costheta_bins[1:], 1.0)
-        return [f'${l:.2f} < \\cos\\theta_e < {h:.2f}$' for l, h in zip(lo, hi)]
+    def x_label(self):
+        return f'{self.x_tex} [{self.x_unit}]' if self.x_unit else self.x_tex
 
-def make_nuecc_binning2d(costheta_bins=None, ke_bins_2d=None):
-    return NueCCBinning2D(costheta_bins=costheta_bins, ke_bins_2d=ke_bins_2d)
+    def bin_table(self):
+        """One row per global bin: slice range and x range (stored units)."""
+        lo_s = self.slice_edges[:-1][self.slice_of]
+        hi_s = self.slice_edges[1:][self.slice_of]
+        lo_x = np.concatenate([e[:-1] for e in self.x_edges])
+        hi_x = np.concatenate([e[1:] for e in self.x_edges])
+        return pd.DataFrame({'bin': np.arange(self.n_bins), 'slice': self.slice_of,
+                             f'{self.slice_var}_lo': lo_s, f'{self.slice_var}_hi': hi_s,
+                             f'{self.x_var}_lo': lo_x, f'{self.x_var}_hi': hi_x})
 
 
-# =============================================================================
-# Categories
-# =============================================================================
+def design_slice_edges(slice_vals, x_vals, weights, slice_edges, x_candidates, min_count):
+    """Per-slice x edges: start from the candidate edges and merge from the high-x end until
+    every bin holds ≥ min_count (weighted) events; a low-x remainder below min_count is merged
+    into its neighbour. Overflow above the last edge counts in the last bin.
+    Returns (list of edge arrays, list of per-bin counts)."""
+    s = np.asarray(slice_vals, np.float64)
+    x = np.clip(np.asarray(x_vals, np.float64), x_candidates[0], x_candidates[-1] - 1e-6)
+    w = np.broadcast_to(np.asarray(weights, np.float64), s.shape)
+    out_e, out_n = [], []
+    for k in range(len(slice_edges) - 1):
+        lo, hi = slice_edges[k], slice_edges[k + 1]
+        m = (s >= lo) & ((s < hi) if k < len(slice_edges) - 2 else (s <= hi))
+        n = np.histogram(x[m], bins=x_candidates, weights=w[m])[0]
+        edges, counts, acc = [x_candidates[-1]], [], 0.0
+        for b in range(len(n) - 1, -1, -1):           # high x → low x
+            acc += n[b]
+            if acc >= min_count:
+                edges.append(x_candidates[b]); counts.append(acc); acc = 0.0
+        if acc > 0 or edges[-1] != x_candidates[0]:   # remainder at low x
+            if counts:
+                edges[-1] = x_candidates[0]; counts[-1] += acc
+            else:
+                edges.append(x_candidates[0]); counts.append(acc)
+        out_e.append(np.array(edges[::-1])); out_n.append(np.array(counts[::-1]))
+    return out_e, out_n
 
-CAT_LABELS = {
-    0: r"$\nu_e$ CC (FV)", 1: r"$\nu_e$ CC (out FV)",
-    2: r"$\nu_\mu$ CC $\pi^0$", 3: r"$\nu$ NC $\pi^0$",
-    4: r"Other $\nu_\mu$ CC", 5: r"Other $\nu$ NC",
-    6: r"Other $\nu$", 7: r"Cosmic", 8: r"Offbeam", 9: r"Dirt $\nu$", -1: r"Unknown",
-}
-CAT_COLORS = {
-    0: "#56B4E9", 1: "#0072B2", 2: "green", 3: "#009E73",
-    4: "#E69F00", 5: "#CC79A7", 6: "#D55E00", 7: "#F0E442",
-    8: "#BDBDBD", 9: "#D2691E", -1: "#7F7F7F",
-}
+
+# Frozen 2D binning. cosθ slices = 1D analysis bins; p candidates = 1D KE edges in MeV/c
+# (p = KE + 0.511 MeV, negligible). Derived in nue_xsec.ipynb §1.1 with design_slice_edges
+# (≥ PC2D_MIN_SIG selected signal per bin at 6.6e20 POT); §1.1 warns if the current selection
+# would give different edges. nue_syst.ipynb uses this to build the 2D covariances.
+PC2D_MIN_SIG = 50.0
+PC2D_P_CANDIDATES = ANALYSIS_BINS['reco_ke'].copy()
+PC2D = SerialBinning(
+    ANALYSIS_BINS['reco_costheta'],
+    [[500, 700, 3000],
+     [500, 700, 950, 3000],
+     [500, 700, 950, 1250, 3000],
+     [500, 700, 950, 1250, 1600, 3000],
+     [500, 700, 950, 1250, 1600, 2250, 3000]])
+
+
+def add_serial_columns(df, binning=PC2D, name='pc2d',
+                       reco=('reco_costheta', 'reco_p'), true=('true_costheta', 'true_p')):
+    """Add reco_<name> / true_<name> (serialized index + 0.5) to a DataFrame, in place.
+    Pairs whose columns are missing (e.g. no truth in data) are skipped."""
+    for kind, (sc, xc) in (('reco', reco), ('true', true)):
+        if sc in df.columns and xc in df.columns:
+            df[f'{kind}_{name}'] = binning.value(df[sc].to_numpy(), df[xc].to_numpy())
+    return df
+
+
+def add_serial_to_reco(reco, binning=PC2D, name='pc2d', s_key='reco_costheta', x_key='reco_p'):
+    """Same for the {var: array} dicts of data / off-beam / in-time (arrays must be row-aligned)."""
+    s, x = np.asarray(reco.get(s_key, [])), np.asarray(reco.get(x_key, []))
+    if len(s) != len(x):
+        raise ValueError(f'{s_key} ({len(s)}) and {x_key} ({len(x)}) are not row-aligned')
+    reco[f'reco_{name}'] = binning.value(s, x)
+    return reco
 
 
 # =============================================================================
@@ -116,9 +216,14 @@ CAT_COLORS = {
 # =============================================================================
 
 class VariableConfig:
+    """serial : SerialBinning → `bins` is the serialized index axis 0..n_bins and every axis
+    drawn with set_xaxis / plot_matrix gets slice separators and slice labels."""
     def __init__(self, name, bins, xlabel, xlabel_reco=None, xlabel_true=None,
-                 unit='', save_name=None, disp_widths=None):
+                 unit='', save_name=None, disp_widths=None, serial=None):
         self.name        = name
+        self.serial      = serial
+        if serial is not None:
+            bins = serial.edges
         self.bins        = np.asarray(bins, dtype=float)
         self.n_bins      = len(self.bins) - 1
         self.bin_centers = 0.5 * (self.bins[:-1] + self.bins[1:])
@@ -137,13 +242,94 @@ class VariableConfig:
     def edge_labels(self):
         return [f'{int(e)}' if e == int(e) else f'{e:g}' for e in self.bins]
 
-    def set_xaxis(self, ax, label=None, fontsize=9):
-        """Ticks at display edges, labelled with the real bin edges."""
-        ax.set_xticks(self.disp_edges)
-        ax.set_xticklabels(self.edge_labels(), fontsize=fontsize)
-        ax.set_xlim(self.disp_edges[0], self.disp_edges[-1])
+    def set_xaxis(self, ax, label=None, fontsize=9, slice_labels=True):
+        """Ticks at display edges, labelled with the real bin edges.
+        Serialized variable: one tick per bin (bin index), slice separators (+ slice labels;
+        slice_labels=False for a ratio panel under a main panel that already has them)."""
+        if self.serial is not None:
+            ax.set_xticks(self.disp_centers)
+            ax.set_xticklabels([str(i) for i in range(self.n_bins)], fontsize=fontsize)
+            ax.set_xlim(self.disp_edges[0], self.disp_edges[-1])
+            draw_slice_separators(ax, self.serial, self.disp_edges, axis='x', labels=slice_labels)
+        else:
+            ax.set_xticks(self.disp_edges)
+            ax.set_xticklabels(self.edge_labels(), fontsize=fontsize)
+            ax.set_xlim(self.disp_edges[0], self.disp_edges[-1])
         if label is not None:
             ax.set_xlabel(label)
+
+
+SLICE_LABEL_FS = 11      # slice ranges inside bin-index histograms (≈ axis-label size)
+LEGEND_FS      = 11      # legends drawn above bin-index histograms (legend_top)
+
+
+def draw_slice_separators(ax, binning, disp_edges=None, axis='x', labels=True, color='gray',
+                          inside=True, fontsize=None, ls='--', lw=0.9):
+    """Dashed lines between slices of a serialized axis; slice ranges written along the top
+    (axis='x': inside the axes, or just above it with inside=False — matrices) or right edge
+    (axis='y'). Labels of the first call on an Axes only."""
+    if fontsize is None:
+        fontsize = SLICE_LABEL_FS if inside and axis == 'x' else 7
+    e = binning.edges if disp_edges is None else np.asarray(disp_edges)
+    cuts = e[binning.offsets]
+    line = ax.axvline if axis == 'x' else ax.axhline
+    for c in cuts[1:-1]:
+        line(c, color=color, ls=ls, lw=lw, zorder=6)
+    flag = f'_slice_labels_drawn_{axis}'          # once per axis direction of an Axes
+    if not labels or getattr(ax, flag, False):
+        return
+    setattr(ax, flag, True)
+    import matplotlib.transforms as mtrans
+    txts = [f'[{binning.slice_edges[i]:g}, {binning.slice_edges[i + 1]:g})' for i in range(binning.n_slices)]
+    if axis == 'x':      # one size for all labels: the largest that fits every slice (~0.55 em per char)
+        x0, x1 = ax.get_xlim()
+        w_pt = ax.get_window_extent().width * 72.0 / ax.figure.dpi / max(abs(x1 - x0), 1e-9)
+        fit = min(0.9 * (cuts[i + 1] - cuts[i]) * w_pt / (0.55 * len(t)) for i, t in enumerate(txts))
+        fontsize = max(min(fontsize, fit), 5)
+    for i, txt in enumerate(txts):
+        mid = 0.5 * (cuts[i] + cuts[i + 1])
+        if axis == 'x':
+            tr = mtrans.blended_transform_factory(ax.transData, ax.transAxes)
+            ax.text(mid, 0.985 if inside else 1.005, txt, transform=tr, ha='center',
+                    va='top' if inside else 'bottom', fontsize=fontsize, color='dimgray')
+        else:
+            tr = mtrans.blended_transform_factory(ax.transAxes, ax.transData)
+            ax.text(1.005, mid, txt, transform=tr, ha='left', va='center', fontsize=min(fontsize, 6),
+                    color='dimgray', rotation=90)
+
+
+def legend_top(ax, handles=None, labels=None, ncol=None, fontsize=LEGEND_FS, **kw):
+    """Legend above the plot area (MicroBooNE style), so it never covers the slice labels or the
+    data. An existing axes title is pushed above the legend. Call after set_title, before
+    tight_layout; the figure size is not changed (the axes shrink instead)."""
+    if handles is None:
+        handles, labels = ax.get_legend_handles_labels()
+    ncol = ncol or min(len(labels), 3)
+    leg = ax.legend(handles, labels, loc='lower center', bbox_to_anchor=(0.5, 1.0), ncol=ncol,
+                    frameon=False, fontsize=fontsize, borderaxespad=0.2, columnspacing=1.2,
+                    **({'title_fontsize': fontsize} | kw))
+    if ax.get_title():
+        fig = ax.figure
+        fig.canvas.draw()
+        h = leg.get_window_extent().height * 72.0 / fig.dpi          # legend height [pt]
+        ax.set_title(ax.get_title(), pad=h + 6, fontsize=ax.title.get_fontsize())
+    return leg
+
+
+UNC_FIGSIZE = (8, 4)          # same as nue_plotter.plot_fracunc: one size for every breakdown plot
+
+
+def legend_right(ax, title=None, fontsize=9, **kw):
+    """Legend outside the axes, on the right (non-serialized breakdown plots), entries sorted by
+    their (x.x%) value, largest first, 'Total …' last. The figure size is kept; tight_layout
+    shrinks the axes to make room. Call before tight_layout."""
+    import re
+    h, l = ax.get_legend_handles_labels()
+    pct = lambda t: float(m.group(1)) if (m := re.search(r'\(([-\d.]+)%\)', t)) else -1.0
+    items = sorted([it for it in zip(h, l) if not it[1].startswith('Total')], key=lambda it: -pct(it[1]))
+    items += [it for it in zip(h, l) if it[1].startswith('Total')]
+    return ax.legend([i[0] for i in items], [i[1] for i in items], loc='upper left', bbox_to_anchor=(1.01, 1.0),
+                     borderaxespad=0.0, frameon=False, fontsize=fontsize, title=title, title_fontsize=fontsize, **kw)
 
 
 # =============================================================================
@@ -201,6 +387,32 @@ def load_family_covs(syst_dir, var_name, n_bins, exclude=('total',), verbose=Tru
     return covs, ref, skipped
 
 
+def check_saved_binning(syst_dir, var_name, vcfg):
+    """Raise if saved_syst/<var> was made with other bins than vcfg (nue_syst.ipynb §2.11 stores
+    them in every NPZ). Also catches a changed 2D layout with the same number of bins."""
+    f = os.path.join(syst_dir, var_name, 'total_cov_matrices.npz')
+    if not os.path.exists(f):
+        raise FileNotFoundError(f'{f} missing — run nue_syst.ipynb (Restart & Run All)')
+    d = np.load(f)
+    if 'bins' not in d:
+        raise ValueError(f'{f} has no stored bins (made before the binning check existed) — '
+                         're-run nue_syst.ipynb (Restart & Run All)')
+    bad = []
+    if not np.array_equal(d['bins'], vcfg.bins):
+        bad.append(f"bins {d['bins']} ≠ {vcfg.bins}")
+    b = vcfg.serial
+    if b is not None:
+        if 'pc2d_x_edges' not in d:
+            bad.append('no 2D layout stored')
+        elif not (np.array_equal(d['pc2d_slice_edges'], b.slice_edges) and np.array_equal(d['pc2d_n_x'], b.n_x)
+                  and np.array_equal(d['pc2d_x_edges'], np.concatenate(b.x_edges))):
+            bad.append(f"2D layout {d['pc2d_n_x']} / p edges {d['pc2d_x_edges']} ≠ xh.PC2D")
+    if bad:
+        raise ValueError(f'[{var_name}] saved covariances use a different binning: ' + '; '.join(bad)
+                         + ' → re-run nue_syst.ipynb with Restart & Run All')
+    return str(d['signal_mode']) if 'signal_mode' in d else 'rate'
+
+
 def full_pred_cov(blocks):
     """Covariance of the total prediction S+B (signal, background and their correlation)."""
     return sum(blocks[k] for k in COV_BLOCKS)
@@ -215,15 +427,19 @@ def _clip(x, bins, eps=1e-8):
 
 
 def build_response(sel_topo, final_stage, reco_col, true_col, bins, pot_scale,
-                   sig_col='is_sig'):
+                   sig_col='is_sig', truth_df=None):
     """Response / migration / efficiency from the selection DataFrame.
 
+    truth_df : true-signal table (one row per true signal ν, incl. ν lost before
+               preselection; nh.load_true_signal).  It is the efficiency
+               denominator — without it only preselected signal is counted and
+               the efficiency misses the flash-match / FV / reconstruction losses.
     Under/overflow in both reco and true go to the first/last bin (as in nue_syst).
     The model (true signal) and the selected-signal reco CV are POT-scaled with
     pot_scale, so  response @ model == sig_reco  exactly.
     """
     sig = sel_topo[sel_topo[sig_col].astype(bool)]
-    t_all = sig[true_col].dropna()
+    t_all = (truth_df if truth_df is not None else sig)[true_col].dropna()
     truth_raw = np.histogram(_clip(t_all, bins), bins=bins)[0].astype(float)
 
     m = sig[final_stage].astype(bool) & sig[reco_col].notna() & sig[true_col].notna()
@@ -277,6 +493,17 @@ def chi2_cov(obs, exp, cov):
     return c2, ndf, float(scipy_chi2.sf(c2, ndf))
 
 
+def slice_chi2(obs, exp, cov, binning):
+    """χ² per slice with that slice's covariance block only (correlations to the other slices
+    omitted, as in the per-slice MicroBooNE panels) and over all bins with the full matrix.
+    Returns {slice i: (χ², ndf, p), 'all': (χ², ndf, p)}."""
+    obs, exp = np.asarray(obs, float), np.asarray(exp, float)
+    out = {i: chi2_cov(obs[binning.block(i)], exp[binning.block(i)],
+                       cov[binning.block(i), binning.block(i)]) for i in range(binning.n_slices)}
+    out['all'] = chi2_cov(obs, exp, cov)
+    return out
+
+
 def frac_cov(cov, cv):
     cv = np.asarray(cv, float)
     den = np.outer(cv, cv)
@@ -285,8 +512,11 @@ def frac_cov(cov, cv):
 
 
 def corr_from_cov(cov):
-    d = np.sqrt(np.clip(np.diag(cov), 1e-30, None))
-    return cov / np.outer(d, d)
+    """Correlation matrix; scale-free (xsec covariances are ~1e-78 cm⁴, so no absolute floor)."""
+    d = np.sqrt(np.clip(np.diag(cov), 0, None))
+    den = np.outer(d, d)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        return np.where(den > 0, cov / np.where(den > 0, den, 1.0), 0.0)
 
 
 def norm_frac(cov, cv):
@@ -313,9 +543,45 @@ def matrix_decomp(model, cov):
 # Wiener-SVD wrapper
 # =============================================================================
 
-def unfold(WienerSVD_fn, response, model, measured, cov, C_type=2, Norm_type=0):
-    """Run Wiener-SVD and attach the A_C-smeared model and its χ² (technote Eq. 55)."""
-    uf = WienerSVD_fn(response, model, measured, cov, C_type, Norm_type)
+def block_c_matrix(binning, C_type):
+    """Smoothness matrix for a serialized vector: Matrix_C(n_slice, C_type) on each slice block,
+    zero between slices, so the regularization never couples the last p bin of one cosθ slice
+    to the first p bin of the next."""
+    from analysis_village.unfolding.wienersvd import Matrix_C
+    C = np.zeros((binning.n_bins, binning.n_bins))
+    for i in range(binning.n_slices):
+        b = binning.block(i)
+        C[b, b] = Matrix_C(int(binning.n_x[i]), C_type)
+    return C
+
+
+def wiener_svd_c(Response, Signal, Measure, Covariance, C, Norm_type):
+    """analysis_village.unfolding.wienersvd.WienerSVD with an explicit smoothness matrix C
+    (same algorithm and outputs; WienerSVD itself only takes an integer C_type)."""
+    m, n = Response.shape
+    _, s_cov, Vh_cov = np.linalg.svd(Covariance)
+    Q = np.diag(np.where(s_cov != 0, 1 / np.sqrt(np.where(s_cov != 0, s_cov, 1)), 0)) @ Vh_cov
+    M_trans, R = Q @ Measure, Q @ Response
+    C = np.asarray(C, float) @ np.diag(1.0 / np.asarray(Signal, float) ** Norm_type)
+    C_inv = np.linalg.inv(C)
+    Signal_mod = C @ Signal
+    U, D, Vh = np.linalg.svd(R @ C_inv, full_matrices=False)
+    D_t = np.zeros((n, m)); D_t[np.arange(min(n, m)), np.arange(min(n, m))] = D
+    S_vec = Vh @ Signal_mod
+    W = np.diag(S_vec ** 2 / (D ** 2 * S_vec ** 2 + 1))
+    WF = D ** 2 * np.diag(W)
+    rot = C_inv @ Vh.T @ W @ D_t @ U.T @ Q
+    return {'unfold': rot @ Measure, 'AddSmear': C_inv @ Vh.T @ np.diag(WF) @ Vh @ C, 'WF': WF,
+            'UnfoldCov': rot @ Covariance @ rot.T, 'CovRotation': rot}
+
+
+def unfold(WienerSVD_fn, response, model, measured, cov, C_type=2, Norm_type=0, serial=None):
+    """Run Wiener-SVD and attach the A_C-smeared model and its χ² (technote Eq. 55).
+    serial : SerialBinning → block-diagonal smoothness matrix (regularize within slices only)."""
+    if serial is None:
+        uf = WienerSVD_fn(response, model, measured, cov, C_type, Norm_type)
+    else:
+        uf = wiener_svd_c(response, model, measured, cov, block_c_matrix(serial, C_type), Norm_type)
     uf['model_smeared'] = uf['AddSmear'] @ model
     uf['chi2'], uf['ndf'], uf['p'] = chi2_cov(uf['unfold'], uf['model_smeared'], uf['UnfoldCov'])
     return uf
@@ -371,7 +637,7 @@ def fdt_weights(sel_topo, pi0_scale=1.0, tilt=None, low_e=None, sig_col='is_sig'
 
 def run_fdt(sel_topo, final_stage, reco_col, true_col, bins, pot_scale, weights,
             resp, bkg_cv, extra_bkg, V_syst, WienerSVD_fn, C_type=2, Norm_type=0,
-            sig_col='is_sig'):
+            sig_col='is_sig', truth_df=None, truth_w=None, serial=None):
     """One fake-data test (technote §5.3.2, without the CCBC).
 
     fake data  D = Σ w·pot_scale over selected MC + unchanged dirt/off-beam
@@ -382,23 +648,58 @@ def run_fdt(sel_topo, final_stage, reco_col, true_col, bins, pot_scale, weights,
                                  weights=weights, sig_col=sig_col)
     D_fake = sum(by_cat.values()) + extra_bkg
     n_cv = resp['sig_reco'] + bkg_cv
-    sig_mask = sel_topo[sig_col].astype(bool)
-    t = sel_topo.loc[sig_mask, true_col].to_numpy(float)
-    ws = weights[sig_mask].to_numpy(float)
+    if truth_df is not None:          # alternative truth over ALL true signal (same as resp['model'])
+        t = truth_df[true_col].to_numpy(float)
+        ws = (np.ones(len(t)) if truth_w is None else np.asarray(truth_w, dtype=float))
+    else:
+        sig_mask = sel_topo[sig_col].astype(bool)
+        t = sel_topo.loc[sig_mask, true_col].to_numpy(float)
+        ws = weights[sig_mask].to_numpy(float)
     ok = np.isfinite(t)
     alt_truth = np.histogram(_clip(t[ok], bins), bins=bins, weights=ws[ok] * pot_scale)[0]
 
     c2_pre = chi2_cov(D_fake, n_cv, V_syst + np.diag(np.clip(n_cv, 1e-9, None)))
     cov = V_syst + np.diag(np.clip(D_fake, 1e-9, None))
     uf = unfold(WienerSVD_fn, resp['response'], resp['model'], D_fake - bkg_cv, cov,
-                C_type, Norm_type)
+                C_type, Norm_type, serial=serial)
     ms_alt = uf['AddSmear'] @ alt_truth
     c2_alt = chi2_cov(uf['unfold'], ms_alt, uf['UnfoldCov'])
-    return dict(unfold=uf, D_fake=D_fake, n_cv=n_cv, by_cat=by_cat, alt_truth=alt_truth,
-                ms_nom=uf['model_smeared'], ms_alt=ms_alt,
-                c2_rate=c2_pre[0], p_rate=c2_pre[2],
-                c2_nom=uf['chi2'], p_nom=uf['p'], c2_mod=c2_alt[0], p_mod=c2_alt[2],
-                ndf=uf['ndf'])
+    out = dict(unfold=uf, D_fake=D_fake, n_cv=n_cv, by_cat=by_cat, alt_truth=alt_truth,
+               ms_nom=uf['model_smeared'], ms_alt=ms_alt,
+               c2_rate=c2_pre[0], p_rate=c2_pre[2],
+               c2_nom=uf['chi2'], p_nom=uf['p'], c2_mod=c2_alt[0], p_mod=c2_alt[2],
+               ndf=uf['ndf'])
+    if serial is not None:            # per-slice χ² (slice covariance block only)
+        out['slice_nom'] = slice_chi2(uf['unfold'], uf['model_smeared'], uf['UnfoldCov'], serial)
+        out['slice_mod'] = slice_chi2(uf['unfold'], ms_alt, uf['UnfoldCov'], serial)
+    return out
+
+
+def fdt_toys(res, resp, bkg_cv, V_syst, WienerSVD_fn, C_type=2, Norm_type=0, serial=None,
+             n_toys=200, seed=12345):
+    """Statistically fluctuated version of one fake-data test (output of run_fdt).
+    Each toy: D_toy ~ Poisson(D_fake), unfolded exactly like the Asimov fake data, then compared
+    with A_C(x)baseline and A_C(x)modified truth (each toy's own A_C).
+    Returns dict(c2_nom, c2_mod (arrays, one per toy), ndf). With correct coverage chi2_mod follows
+    chi2(ndf) and ~5% of the toys have p_mod < 0.05; the fraction with dchi2 = chi2_nom - chi2_mod > 0
+    shows how often the test tells the modified model from the baseline."""
+    rng = np.random.default_rng(seed)
+    D = np.clip(np.asarray(res['D_fake'], float), 0, None)
+    c2n, c2m = np.full(n_toys, np.nan), np.full(n_toys, np.nan)
+    for k in range(n_toys):
+        Dt = rng.poisson(D).astype(float)
+        cov = V_syst + np.diag(np.clip(Dt, 1e-9, None))
+        try:
+            uf = unfold(WienerSVD_fn, resp['response'], resp['model'], Dt - bkg_cv, cov,
+                        C_type, Norm_type, serial=serial)
+        except np.linalg.LinAlgError:
+            continue
+        c2n[k] = uf['chi2']
+        c2m[k] = chi2_cov(uf['unfold'], uf['AddSmear'] @ res['alt_truth'], uf['UnfoldCov'])[0]
+    ok = np.isfinite(c2n) & np.isfinite(c2m)
+    if (~ok).any():
+        warnings.warn(f'fdt_toys: {(~ok).sum()} of {n_toys} toys failed to unfold and were dropped')
+    return dict(c2_nom=c2n[ok], c2_mod=c2m[ok], ndf=res['ndf'])
 
 
 # =============================================================================
@@ -431,21 +732,49 @@ def ccbc_constrain(B_S_cv, phi_S_cv, n_C_cv, D_C,
 # Plotting
 # =============================================================================
 
+_DARK_CMAPS = ('viridis', 'magma', 'inferno', 'plasma', 'cividis', 'turbo')
+
+
+def _sep_color(cmap):
+    """Slice-separator colour that stays visible: white on dark colour maps, dark grey on light ones
+    (Blues, RdBu, ... whose low / central values are white)."""
+    name = cmap if isinstance(cmap, str) else getattr(cmap, 'name', '')
+    return 'white' if name.split('_')[0] in _DARK_CMAPS else '0.2'
+
+
+def _matrix_axis(ax, cfg, n, axis, sep_color='0.2'):
+    """Ticks of one matrix axis: real bin edges (1D) or bin index + slice separators (serial).
+    Serial axes: gray dashed lines at every cosθ-slice boundary (vertical for x, horizontal for y) and the
+    slice ranges along the top (x) and the right edge (y), so each block of the matrix is labelled."""
+    set_t, set_l = (ax.set_xticks, ax.set_xticklabels) if axis == 'x' else (ax.set_yticks, ax.set_yticklabels)
+    if cfg.serial is not None:
+        set_t(np.arange(n) + 0.5); set_l([str(i) for i in range(n)], fontsize=6)
+        draw_slice_separators(ax, cfg.serial, axis=axis, color='gray', labels=True, inside=False,
+                              ls='--', lw=1.0)
+    else:
+        set_t(np.arange(n + 1)); set_l(cfg.edge_labels(), fontsize=8)
+
+
 def plot_matrix(ax, M, vcfg, ylabel_cfg=None, cmap='viridis', vmin=None, vmax=None,
                 fmt='{:.2f}', title='', cbar_label='', xlabel=None, ylabel=None,
-                annotate=True, fontsize=8):
-    """Bin-index heatmap with real bin edges as tick labels (x = columns, y = rows)."""
+                annotate=None, fontsize=8):
+    """Bin-index heatmap with real bin edges as tick labels (x = columns, y = rows).
+    Serialized configs get bin-index ticks and slice separators; annotate=None → only if ≤ 12 bins."""
     ycfg = ylabel_cfg or vcfg
     n_r, n_c = M.shape
     im = ax.imshow(M, origin='lower', cmap=cmap, vmin=vmin, vmax=vmax, aspect='auto',
                    extent=[0, n_c, 0, n_r])
-    cb = plt.colorbar(im, ax=ax)
+    serial = vcfg.serial is not None or ycfg.serial is not None
+    cb = plt.colorbar(im, ax=ax, pad=0.07 if serial else 0.05)      # room for the y slice labels
     if cbar_label:
         cb.set_label(cbar_label)
-    ax.set_xticks(np.arange(n_c + 1)); ax.set_xticklabels(vcfg.edge_labels(), fontsize=8)
-    ax.set_yticks(np.arange(n_r + 1)); ax.set_yticklabels(ycfg.edge_labels(), fontsize=8)
+    sc = _sep_color(cmap)
+    _matrix_axis(ax, vcfg, n_c, 'x', sc)
+    _matrix_axis(ax, ycfg, n_r, 'y', sc)
     ax.set_xlabel(xlabel or vcfg.xlabel); ax.set_ylabel(ylabel or ycfg.xlabel)
-    ax.set_title(title, fontsize=11)
+    ax.set_title(title, fontsize=11, pad=16 if vcfg.serial is not None else 6)   # room for slice labels
+    if annotate is None:
+        annotate = max(n_r, n_c) <= 12
     if annotate:
         cm = plt.get_cmap(cmap)
         for i in range(n_r):
@@ -463,6 +792,12 @@ def plot_designed_matrix(M, vcfg, ylabel, title, vmin=0, vmax=1, cmap='Blues', f
                          cbar_label='Probability', figsize=(7, 6)):
     """Same format as the old nue_syst.ipynb §6.5 response plot: rows = true bins, columns = reco
     bins, designed display widths on both axes, real bin edges as tick labels."""
+    if vcfg.serial is not None:                      # 20×20: bin-index axes, no numbers
+        fig, ax = plt.subplots(figsize=(figsize[0] * 1.25, figsize[1] * 1.2))
+        plot_matrix(ax, M, vcfg, cmap=cmap, vmin=vmin, vmax=vmax, title=title,
+                    cbar_label=cbar_label, ylabel=ylabel, annotate=False)
+        fig.tight_layout()
+        return fig, ax
     fig, ax = plt.subplots(figsize=figsize)
     de, c = vcfg.disp_edges, vcfg.disp_centers
     pm = ax.pcolormesh(de, de, M, cmap=cmap, vmin=vmin, vmax=vmax)
@@ -485,6 +820,196 @@ def plot_designed_matrix(M, vcfg, ylabel, title, vmin=0, vmax=1, cmap='Blues', f
 def step(ax, edges, y, **kw):
     y = np.asarray(y, float)
     return ax.step(edges, np.append(y, y[-1]), where='post', **kw)
+
+
+# =============================================================================
+# Serialized 2D: per-slice views (x = the physical variable) and sub-blocks
+# =============================================================================
+
+def chi2_text(c):
+    c2, ndf, p = c
+    return rf'$\chi^2$/dof = {c2:.1f}/{ndf}, $p$ = {p:.2f}'
+
+
+def slice_grid(binning, ncols=3, panel=(5.0, 3.8), ratio=False):
+    """Figure with one panel per slice (+ an optional ratio panel below each)."""
+    nrows = int(np.ceil(binning.n_slices / ncols))
+    fig = plt.figure(figsize=(panel[0] * ncols, panel[1] * nrows * (1.3 if ratio else 1.0)))
+    gs = fig.add_gridspec(nrows, ncols, hspace=0.45, wspace=0.28)
+    axes = []
+    for i in range(binning.n_slices):
+        r, c = divmod(i, ncols)
+        if ratio:
+            inner = gs[r, c].subgridspec(2, 1, height_ratios=[3, 1], hspace=0.05)
+            ax = fig.add_subplot(inner[0]); ar = fig.add_subplot(inner[1], sharex=ax)
+            plt.setp(ax.get_xticklabels(), visible=False)
+            axes.append((ax, ar))
+        else:
+            axes.append(fig.add_subplot(gs[r, c]))
+    return fig, axes
+
+
+def plot_slices(binning, steps=(), points=None, bands=(), chi2=None, ylabel='', title='',
+                ncols=3, ratio_to=None, legend_slice=0):
+    """Fig. 16-style panels: slice i drawn against its own x edges (displayed units).
+
+    steps  : [(values on the serialized bins, step kwargs incl. label), …]
+    points : (values, yerr_inner, yerr_outer or None, kwargs) — e.g. stat. and stat.⊕syst.
+    bands  : [(values, half-width, bar kwargs incl. label), …] — e.g. norm. syst. at 0
+    chi2   : slice_chi2() output → written in each panel and in the suptitle ('all')
+    ratio_to : values to divide by in a ratio panel under each slice (None → no ratio panel)
+    """
+    fig, axes = slice_grid(binning, ncols=ncols, ratio=ratio_to is not None)
+    for i in range(binning.n_slices):
+        ax, ar = axes[i] if ratio_to is not None else (axes[i], None)
+        b, e = binning.block(i), binning.x_disp_edges(i)
+        ctr = 0.5 * (e[1:] + e[:-1])
+        for vals, hw, kw in bands:
+            ax.bar(e[:-1], 2 * np.asarray(hw)[b], bottom=np.asarray(vals)[b] - np.asarray(hw)[b],
+                   width=np.diff(e), align='edge', **kw)
+        for vals, kw in steps:
+            step(ax, e, np.asarray(vals)[b], **kw)
+        top = max([np.max(np.asarray(v)[b]) for v, _ in steps] + [0])
+        if points is not None:
+            v, inner, outer, kw = points
+            v = np.asarray(v)[b]
+            if outer is not None:
+                ax.errorbar(ctr, v, yerr=np.asarray(outer)[b], fmt='none', ecolor=kw.get('color', 'k'),
+                            capsize=3, lw=1)
+                top = max(top, np.max(v + np.asarray(outer)[b]))
+            ax.errorbar(ctr, v, yerr=np.asarray(inner)[b], **{'fmt': 'ko', 'ms': 4, 'capsize': 0,
+                                                              'lw': 2, **kw})
+            top = max(top, np.max(v + np.asarray(inner)[b]))
+        ax.set_xlim(e[0], e[-1]); ax.set_ylim(0, top * 1.45 if top > 0 else 1)
+        ax.set_title(binning.slice_label(i), fontsize=10)
+        if i % ncols == 0:
+            ax.set_ylabel(ylabel, fontsize=9)
+        ax.ticklabel_format(axis='y', style='sci', scilimits=(-2, 3))
+        if chi2 is not None:
+            ax.text(0.97, 0.95, chi2_text(chi2[i]), transform=ax.transAxes, ha='right', va='top', fontsize=8)
+        if i == legend_slice:
+            ax.legend(fontsize=7, frameon=False, loc='upper left')
+        xa = ar if ar is not None else ax
+        xa.set_xlabel(binning.x_label, fontsize=9)
+        if ar is not None and points is not None:
+            ref = np.asarray(ratio_to)[b]
+            with np.errstate(divide='ignore', invalid='ignore'):
+                ar.errorbar(ctr, v / ref, yerr=np.asarray(outer if outer is not None else inner)[b] / ref,
+                            fmt='ko', ms=3, capsize=2)
+            ar.axhline(1, color='gray', ls='--', lw=1); ar.set_ylim(0.5, 1.5)
+            ar.set_ylabel('Ratio', fontsize=8)
+    sup = title + (f"   (all slices, full covariance: {chi2_text(chi2['all'])})" if chi2 is not None else '')
+    fig.suptitle(sup, fontsize=12, y=1.0)
+    return fig, axes
+
+
+def plot_serial(ax, vcfg, steps=(), points=None, bands=(), chi2=None, ylabel='', logy=False):
+    """Fig. 17-style: every slice on one bin-index axis; per-slice χ² under the slice labels.
+    logy: d²σ/dp dcosθ spans orders of magnitude between the backward and forward slices."""
+    e, c = vcfg.disp_edges, vcfg.disp_centers
+    for vals, hw, kw in bands:
+        ax.bar(e[:-1], 2 * np.asarray(hw), bottom=np.asarray(vals) - np.asarray(hw), width=np.diff(e),
+               align='edge', **kw)
+    for vals, kw in steps:
+        step(ax, e, vals, **kw)
+    top = max([np.max(v) for v, _ in steps] + [0])
+    if points is not None:
+        v, inner, outer, kw = points
+        if outer is not None:
+            ax.errorbar(c, v, yerr=outer, fmt='none', ecolor=kw.get('color', 'k'), capsize=3, lw=1)
+            top = max(top, np.max(np.asarray(v) + outer))
+        ax.errorbar(c, v, yerr=inner, **{'fmt': 'ko', 'ms': 4, 'capsize': 0, 'lw': 2, **kw})
+        top = max(top, np.max(np.asarray(v) + inner))
+    if logy:
+        pos = [np.min(np.asarray(v)[np.asarray(v) > 0]) for v, _ in steps if np.any(np.asarray(v) > 0)]
+        ax.set_yscale('log'); ax.set_ylim(min(pos) * 0.3 if pos else 1e-3, top * 15 if top > 0 else 1)
+    else:
+        ax.set_ylim(0, top * 1.6 if top > 0 else 1)
+    ax.set_ylabel(ylabel)
+    vcfg.set_xaxis(ax, vcfg.xlabel)
+    b = vcfg.serial
+    if chi2 is not None:
+        import matplotlib.transforms as mtrans
+        tr = mtrans.blended_transform_factory(ax.transData, ax.transAxes)
+        for i in range(b.n_slices):
+            mid = 0.5 * (e[b.offsets[i]] + e[b.offsets[i + 1]])
+            c2, ndf, _ = chi2[i]
+            ax.annotate(f'χ² {c2:.1f}/{ndf}', (mid, 0.985), xycoords=tr, xytext=(0, -1.5 * SLICE_LABEL_FS),
+                        textcoords='offset points', ha='center', va='top', fontsize=SLICE_LABEL_FS - 1,
+                        color='dimgray')
+    return ax
+
+
+def plot_cov_slices(cov, cv, binning, vcfg, chi2=None, unit='', title=''):
+    """Figs. 79–83 style: total covariance, fractional covariance and correlation.
+    Returns (grouped figure over all slices, figure with one row per slice: that slice's block).
+    The per-slice block is the matrix used for that slice's χ² (chi2 → written in the titles)."""
+    cov, cv = np.asarray(cov, float), np.asarray(cv, float)
+    mats = [(cov, f'Covariance {unit}', 'viridis', None, None),
+            (frac_cov(cov, cv), 'Fractional covariance', 'viridis', None, None),
+            (corr_from_cov(cov), 'Correlation', 'RdBu_r', -1, 1)]
+    fig_all, axes = plt.subplots(1, 3, figsize=(20, 5.6))
+    for ax, (M, lab, cmap, lo, hi) in zip(axes, mats):
+        plot_matrix(ax, M, vcfg, cmap=cmap, vmin=lo, vmax=hi, title=lab, annotate=False,
+                    xlabel=vcfg.xlabel_true, ylabel=vcfg.xlabel_true)
+    fig_all.suptitle(title + (f"   ({chi2_text(chi2['all'])})" if chi2 is not None else ''), y=1.03)
+    fig_all.tight_layout()
+
+    fig_sl, axs = plt.subplots(binning.n_slices, 3, figsize=(16, 3.9 * binning.n_slices))
+    for i in range(binning.n_slices):
+        b = binning.block(i)
+        e = binning.x_disp_edges(i)
+        lab = [f'{x:g}' for x in e]
+        for j, (M, name, cmap, lo, hi) in enumerate(mats):
+            ax = axs[i, j]
+            Mb = M[b, b]
+            im = ax.imshow(Mb, origin='lower', cmap=cmap, vmin=lo, vmax=hi, aspect='auto',
+                           extent=[0, Mb.shape[1], 0, Mb.shape[0]])
+            plt.colorbar(im, ax=ax)
+            n = Mb.shape[0]
+            ax.set_xticks(np.arange(n + 1)); ax.set_xticklabels(lab, fontsize=8)
+            ax.set_yticks(np.arange(n + 1)); ax.set_yticklabels(lab, fontsize=8)
+            ax.set_xlabel(binning.x_label, fontsize=9); ax.set_ylabel(binning.x_label, fontsize=9)
+            fmt = '{:.2f}' if j == 2 else '{:.1e}' if j == 0 else '{:.3f}'
+            cm = plt.get_cmap(cmap)
+            for r in range(n):
+                for c in range(n):
+                    r_, g_, b_, _ = cm(im.norm(Mb[r, c]))
+                    ax.text(c + 0.5, r + 0.5, fmt.format(Mb[r, c]), ha='center', va='center', fontsize=7,
+                            color='black' if 0.299 * r_ + 0.587 * g_ + 0.114 * b_ > 0.5 else 'white')
+            t = f'{binning.slice_label(i)} — {name}'
+            if chi2 is not None and j == 0:
+                t += f'\n{chi2_text(chi2[i])}'
+            ax.set_title(t, fontsize=9)
+    fig_sl.tight_layout()
+    return fig_all, fig_sl
+
+
+def plot_block(ax, M, binning, i, j=None, cmap='viridis', vmin=None, vmax=None, title='',
+               fmt='{:.2f}', annotate=True):
+    """Fig. 111 style: block (slice i rows, slice j columns) of a serialized matrix.
+    y = global bin ID of slice i, x = true variable of slice j (real edges)."""
+    j = i if j is None else j
+    bi, bj = binning.block(i), binning.block(j)
+    Mb = np.asarray(M)[bi, bj]
+    nr, nc = Mb.shape
+    im = ax.imshow(Mb, origin='lower', cmap=cmap, vmin=vmin, vmax=vmax, aspect='auto',
+                   extent=[0, nc, 0, nr])
+    plt.colorbar(im, ax=ax)
+    ex = binning.x_disp_edges(j)
+    ax.set_xticks(np.arange(nc + 1)); ax.set_xticklabels([f'{x:g}' for x in ex], fontsize=8)
+    ax.set_yticks(np.arange(nr) + 0.5)
+    ax.set_yticklabels([str(k) for k in range(bi.start, bi.stop)], fontsize=8)
+    ax.set_xlabel(f'True {binning.x_label}', fontsize=9); ax.set_ylabel('Bin ID #', fontsize=9)
+    ax.set_title(title or binning.slice_label(i), fontsize=9)
+    if annotate:
+        cm = plt.get_cmap(cmap)
+        for r in range(nr):
+            for c in range(nc):
+                r_, g_, b_, _ = cm(im.norm(Mb[r, c]))
+                ax.text(c + 0.5, r + 0.5, fmt.format(Mb[r, c]), ha='center', va='center', fontsize=7,
+                        color='black' if 0.299 * r_ + 0.587 * g_ + 0.114 * b_ > 0.5 else 'white')
+    return im
 
 
 # =============================================================================
@@ -550,36 +1075,6 @@ def print_comparison_metrics(metrics, var_name):
     print(f"  Shape-only unc [%]:")
     print(f"    Wiener-SVD: {np.round(m['w_shape'], 1)}")
     print(f"    OmniFold:   {np.round(m['of_shape'], 1)}")
-
-
-def plot_comparison_frac_unc(metrics, true_label, save_path=None):
-    n = len(metrics['w_frac'])
-    x = np.arange(n)
-    fig, ax = plt.subplots(figsize=(5, 3.5))
-    ax.bar(x - 0.18, metrics['w_frac']*100, 0.35, label='Wiener-SVD', color='steelblue', alpha=0.8)
-    ax.bar(x + 0.18, metrics['of_frac']*100, 0.35, label='OmniFold', color='crimson', alpha=0.8)
-    ax.set_xlabel('True bin index'); ax.set_ylabel('Frac. unc. [%]')
-    ax.set_title(f'Per-bin uncertainty: {true_label}', fontsize=10)
-    ax.legend(fontsize=9); ax.set_xticks(x)
-    plt.tight_layout()
-    if save_path:
-        fig.savefig(save_path, bbox_inches='tight', dpi=150)
-    return fig, ax
-
-
-def plot_eigenspectrum(metrics, var_name, save_path=None):
-    fig, ax = plt.subplots(figsize=(5, 3.5))
-    w_e = metrics['w_eig']; of_e = metrics['of_eig']
-    ax.semilogy(range(1, len(w_e)+1), w_e/w_e[0], 'o-', color='steelblue', ms=5, lw=1.5, label='Wiener-SVD')
-    ax.semilogy(range(1, len(of_e)+1), of_e/of_e[0], 's-', color='crimson', ms=5, lw=1.5, label='OmniFold')
-    ax.set_xlabel('Eigenvalue index'); ax.set_ylabel('Normalized eigenvalue')
-    ax.set_title(f'Covariance eigenspectrum: {var_name}', fontsize=10)
-    ax.legend(fontsize=9); ax.grid(alpha=0.2, ls='--')
-    ax.axhline(0.01, color='gray', ls=':', lw=1)
-    plt.tight_layout()
-    if save_path:
-        fig.savefig(save_path, bbox_inches='tight', dpi=150)
-    return fig, ax
 
 
 # =============================================================================

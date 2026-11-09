@@ -83,19 +83,25 @@ def load_sel_topo(sel_file, df_file=None, verbose=True):
         sel_topo = sel_topo[~sel_topo.index.duplicated(keep='first')]
 
     pot_scale = float(sel_topo['pot_scale'].iloc[0])
-    n_true_signal = int(sel_topo['is_sig'].sum())
+    # efficiency denominator: one row per true signal ν (incl. ν lost before
+    # preselection) from the table nue_selection.ipynb writes next to sel_file;
+    # sel_topo itself only holds preselected interactions.
+    true_sig = load_true_signal(true_signal_path(sel_file), verbose=verbose)
+    n_true_signal = (len(true_sig) if true_sig is not None
+                     else int(sel_topo['is_sig'].sum()))
 
     if verbose:
         print(f'sel_topo shape : {sel_topo.shape}')
         print(f'pot_scale      : {pot_scale:.4f}')
-        print(f'n_true_signal  : {n_true_signal:,}')
+        print(f'n_true_signal  : {n_true_signal:,}'
+              + ('' if true_sig is not None else '  (preselected signal only)'))
         for col in [c for c in sel_topo.columns if c.startswith('sel_')]:
             n_sig = int((sel_topo[col] & sel_topo['is_sig']).sum())
             n_tot = int(sel_topo[col].sum())
             print(f'  {col:<35} sig={n_sig:>6,}  total={n_tot:>9,}')
 
     out = dict(sel_topo=sel_topo, pot_scale=pot_scale,
-               n_true_signal=n_true_signal)
+               n_true_signal=n_true_signal, true_sig=true_sig)
 
     if df_file is not None:
         out['histpotdf'] = load_hdf_key(df_file, 'histpotdf')
@@ -432,7 +438,7 @@ def load_offbeam_data(offbeam_file, data_file, final_stage=None, verbose=True):
 
     Returns dict with keys:
         scale, cut_flow, reco_final, reco_topo, reco_fv,
-        vertex, mult, shower_vars, sb_idx, sb_reco, sb_shower_vars
+        vertex, flash_pe / flash_ratio (total/hypo PE) {stage: values}, mult, shower_vars, sb_idx, sb_reco, sb_shower_vars
     """
     import nue_selection as nue_sel
     import nue_helpers as nh
@@ -443,8 +449,8 @@ def load_offbeam_data(offbeam_file, data_file, final_stage=None, verbose=True):
     scale = (1 - BEAM_DUTY_FRACTION) * n_gates_on / n_gates_off
 
     if verbose:
-        print(f'Offbeam: {evtdf.shape}  gates on={n_gates_on} '
-              f'off={n_gates_off}  scale={scale:.6f}')
+        print(f'Offbeam: {evtdf.shape}  (provisional scale {scale:.6f} from file-level gate counts; '
+              'replaced by livetime_scales below)')
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -474,6 +480,14 @@ def load_offbeam_data(offbeam_file, data_file, final_stage=None, verbose=True):
                 vertex[coord] = vals.values
                 break
 
+    # Flash total PE and observed / hypothesis PE at FV and topology (evtdf is freed below)
+    flash_pe, flash_ratio = {}, {}
+    for st in ('fiducial', 'single_electron'):
+        idx = cut_flow[st]['inter_index']
+        pe = interaction_var(evtdf, 'flash_total_pe', idx, il)
+        flash_pe[st] = pe.values
+        flash_ratio[st] = (pe / interaction_var(evtdf, 'flash_hypo_pe', idx, il)).dropna().values
+
     # Multiplicity at FV
     mult = {
         'shower': _count_offbeam_parts(evtdf, fv_idx, il, 'shower'),
@@ -496,7 +510,8 @@ def load_offbeam_data(offbeam_file, data_file, final_stage=None, verbose=True):
 
     return dict(scale=scale, cut_flow=cut_flow,
                 reco_final=reco_final, reco_topo=reco_topo,
-                reco_fv=reco_fv, vertex=vertex, mult=mult,
+                reco_fv=reco_fv, vertex=vertex, flash_pe=flash_pe,
+                flash_ratio=flash_ratio, mult=mult,
                 shower_vars=shower_vars,
                 sb_idx=sb_idx, sb_reco=sb_reco,
                 sb_shower_vars=sb_shower_vars)
@@ -1103,6 +1118,16 @@ def reco_interactions(evtdf) -> InteractionView: return InteractionView(evtdf["r
 def true_interactions(evtdf) -> InteractionView: return InteractionView(evtdf["rec"]["dlp_true"])
 
 
+def interaction_var(evtdf, field, idx, il):
+    """Reco-interaction field (e.g. 'flash_total_pe') per interaction in idx (first row of each
+    interaction; NaN dropped). Empty Series if the field is not in evtdf."""
+    ri = evtdf["rec"]["dlp"]
+    col = next((c for c in ri.columns if (c[0] if isinstance(c, tuple) else c) == field), None)
+    if col is None:
+        return pd.Series(dtype=float)
+    return ri[col].groupby(level=il).first().reindex(idx).dropna()
+
+
 # ============================================================
 # POT / index utilities
 # ============================================================
@@ -1127,7 +1152,7 @@ _SEL_HDF_KEY = "sel_0"
 def build_and_save_selection(path, presel_inter, truth_cat_presel,
                               reco_ke, reco_cos, true_ke, true_cos,
                               stage_idx_dict, cut_names, pot_scale,
-                              reco_p=None, true_p=None):
+                              reco_p=None, true_p=None, extra_cols=None):
     import os, warnings
     sel = pd.DataFrame(index=presel_inter)
     sel["truth_cat"]    = truth_cat_presel.reindex(presel_inter).astype("int8")
@@ -1147,6 +1172,8 @@ def build_and_save_selection(path, presel_inter, truth_cat_presel,
             sel[f"sel_{name}"] = presel_inter.isin(stage_idx_dict[name])
         else:
             warnings.warn(f"build_and_save_selection: stage {name!r} missing")
+    for name, ser in (extra_cols or {}).items():
+        sel[name] = ser.reindex(presel_inter)
     sel["pot_scale"] = np.float32(pot_scale)
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     sel.to_hdf(path, key=_SEL_HDF_KEY, mode="w", complevel=1, complib="blosc")
@@ -1156,6 +1183,36 @@ def build_and_save_selection(path, presel_inter, truth_cat_presel,
 
 def load_selection(path):
     return pd.read_hdf(path, key=_SEL_HDF_KEY)
+
+
+_TRUE_SIG_HDF_KEY = "true_signal"
+
+def true_signal_path(sel_file):
+    """True-signal table written next to a selection file
+    (nuecc_dfs/selected_nuecc_qual.df → nuecc_dfs/true_signal_nuecc.df)."""
+    import os
+    return os.path.join(os.path.dirname(os.path.abspath(sel_file)), "true_signal_nuecc.df")
+
+def save_true_signal(path, table, pot_scale):
+    """Save nue_selection.true_signal_table (one row per true signal ν: the
+    efficiency / response denominator, incl. ν lost before preselection)."""
+    import os
+    t = table.copy()
+    t["pot_scale"] = np.float32(pot_scale)
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    t.to_hdf(path, key=_TRUE_SIG_HDF_KEY, mode="w", complevel=1, complib="blosc")
+    print(f"Saved true-signal table → {path}  shape={t.shape}")
+    return t
+
+def load_true_signal(path, verbose=True):
+    """Load the true-signal table; None (with a warning) if it does not exist."""
+    import os
+    if not os.path.exists(path):
+        if verbose:
+            print(f"WARNING: {path} not found — efficiency falls back to preselected "
+                  "signal only (re-run nue_selection.ipynb)")
+        return None
+    return pd.read_hdf(path, key=_TRUE_SIG_HDF_KEY)
 
 
 # ============================================================
@@ -1351,15 +1408,20 @@ def _fill_missing_weights(w, reco, bins, cls_masks):
  
  
 def build_univ_hists(sel_df, stage_col, wgt_aligned, univ_cols,
-                     var_col, bins, ps, clip=10.0, fill_missing=True):
+                     var_col, bins, ps, clip=10.0, fill_missing=True, xsec=None):
     """Signal / background universe histograms (n_univ, n_bins) at one selection stage.
     fill_missing=True: neutrino events without a weight row (weight file built from a
     different file list) take the bin-average variation of matched events of the same
-    class (signal / ν background); cosmics (truth_cat 7) keep weight 1."""
+    class (signal / ν background); cosmics (truth_cat 7) keep weight 1.
+    xsec: (true_col, true_bins, ratio) from xsec_signal_ratio → also return the signal in
+    'xsec' mode: each selected signal event is further multiplied by ratio[u, true bin] =
+    φ_CV/φ_u, so that universe is R_u·φ_CV (only efficiency / migration vary; the signal
+    cross section itself, i.e. what is measured, is not an uncertainty).
+    Returns (sig, bkg), or (sig, bkg, sig_xsec) when xsec is given."""
     sel = sel_df[sel_df[stage_col]]
     nb, nu = len(bins) - 1, len(univ_cols)
     if sel.empty:
-        return np.zeros((nu, nb)), np.zeros((nu, nb))
+        return (np.zeros((nu, nb)),) * (2 if xsec is None else 3)
     tc   = sel['truth_cat'].values
     smk  = tc == 0
     bmk  = (tc >= 1) & (tc <= 7)          # every non-signal MC event (cosmics: weight 1)
@@ -1374,7 +1436,7 @@ def build_univ_hists(sel_df, stage_col, wgt_aligned, univ_cols,
     else:
         warnings.warn(f"build_univ_hists: sel has {sel.index.nlevels} index levels, "
                       f"weights have {nwl}")
-        return np.zeros((nu, nb)), np.zeros((nu, nb))
+        return (np.zeros((nu, nb)),) * (2 if xsec is None else 3)
  
     wgt_sub = wgt_aligned[univ_cols]
     if wgt_sub.index.duplicated().any():
@@ -1382,7 +1444,14 @@ def build_univ_hists(sel_df, stage_col, wgt_aligned, univ_cols,
     wmat = wgt_sub.reindex(sidx).values.astype(np.float64)
     wmat = np.where(np.isfinite(wmat), np.clip(wmat, 0.0, clip), np.nan)
  
-    su, bu = np.zeros((nu, nb)), np.zeros((nu, nb))
+    tb = None
+    if xsec is not None:
+        true_col, true_bins, ratio = xsec
+        assert ratio.shape[0] == nu, f'xsec ratio has {ratio.shape[0]} universes, weights {nu}'
+        tv = sel[true_col].to_numpy(float)
+        tb = np.clip(np.digitize(np.nan_to_num(tv, nan=true_bins[0]), true_bins) - 1, 0, len(true_bins) - 2)
+        tok = np.isfinite(tv)
+    su, bu, sx = np.zeros((nu, nb)), np.zeros((nu, nb)), np.zeros((nu, nb))
     for u in range(nu):
         w = wmat[:, u]
         w = _fill_missing_weights(w, reco, bins, [smk, nubk]) if fill_missing \
@@ -1390,20 +1459,69 @@ def build_univ_hists(sel_df, stage_col, wgt_aligned, univ_cols,
         w = w * ps
         su[u], _ = np.histogram(reco[smk], bins=bins, weights=w[smk])
         bu[u], _ = np.histogram(reco[bmk], bins=bins, weights=w[bmk])
-    return su, bu
+        if tb is not None:
+            wx = w.copy()
+            m = smk & tok
+            wx[m] = wx[m] * ratio[u, tb[m]]
+            sx[u], _ = np.histogram(reco[smk], bins=bins, weights=wx[smk])
+    return (su, bu) if tb is None else (su, bu, sx)
  
  
-def fill_univ_results(sources, wgt, sel_df, stage_col, var_cfgs, ps, target, desc=''):
-    """target[var][key] = {'sig','bkg'} universe histograms for every source."""
+def fill_univ_results(sources, wgt, sel_df, stage_col, var_cfgs, ps, target, desc='',
+                      xsec_mode=None):
+    """target[var][key] = {'sig','bkg'} universe histograms for every source.
+    xsec_mode: dict(families, true_sig, true_wgt, true_var, true_bins) → sources whose
+    family is in `families` also get 'sig_xsec', the signal in 'xsec' mode (see
+    build_univ_hists). 'sig' stays the event-rate signal (data/MC plots); xsec_source_covs
+    swaps in 'sig_xsec' for the cross-section covariances."""
     for vcfg in var_cfgs:
         target.setdefault(vcfg.name, {})
         for key, s in _tqdm_txt(sources.items(), desc=f'{desc}{vcfg.name}', leave=False):
             W = knob_weights(wgt, s)
+            xs = None
+            if xsec_mode is not None and s['family'] in xsec_mode['families']:
+                tcol, tbins = xsec_mode['true_var'][vcfg.name], xsec_mode['true_bins'][vcfg.name]
+                Wt = knob_weights(xsec_mode['true_wgt'], s)
+                xs = (tcol, tbins, xsec_signal_ratio(xsec_mode['true_sig'], Wt, tcol, tbins))
             target[vcfg.name][key] = dict(zip(
-                ('sig', 'bkg'),
+                ('sig', 'bkg', 'sig_xsec'),
                 build_univ_hists(sel_df, stage_col, W, list(W.columns),
-                                 vcfg.name, vcfg.bins, ps)))
+                                 vcfg.name, vcfg.bins, ps, xsec=xs)))
     return target
+
+
+def xsec_source_covs(cov_results, univ_results, cv_results):
+    """Copy of cov_results (from build_source_covs) where every source with an 'xsec'-mode
+    signal ('sig_xsec', see fill_univ_results) has its covariance recomputed with it.
+    Background blocks are unchanged (rate mode). Used for the NPZ read by nue_xsec.ipynb."""
+    out = {}
+    for vn, by_src in cov_results.items():
+        out[vn] = dict(by_src)
+        cv = cv_results[vn]
+        for src, ud in univ_results.get(vn, {}).items():
+            if 'sig_xsec' in ud and src in by_src:
+                out[vn][src] = compute_covs(ud['sig_xsec'], ud['bkg'], cv['sig_cv'], cv['bkg_cv'])
+    return out
+
+
+def xsec_signal_ratio(true_sig, true_wgt, true_col, true_bins, clip=10.0):
+    """φ_CV / φ_u per universe and true bin, (n_univ, n_true_bins).
+    φ = all true signal ν (efficiency denominator, incl. ν lost before preselection) in
+    true_col bins, with weight 1 (CV) or the universe weight. Only ν that have a weight row
+    enter both φ_CV and φ_u, so the ratio is the relative variation of the matched sample."""
+    tv = true_sig[true_col].to_numpy(float)
+    w = true_wgt.to_numpy(dtype=np.float64)
+    ok = np.isfinite(tv) & np.isfinite(w).all(axis=1)
+    if not ok.any():
+        warnings.warn('xsec_signal_ratio: no true signal ν with weights → ratio = 1 (rate mode)')
+        return np.ones((w.shape[1], len(true_bins) - 1))
+    x = np.clip(tv[ok], true_bins[0], true_bins[-1] - 1e-8)
+    cv, _ = np.histogram(x, bins=true_bins)
+    out = np.ones((w.shape[1], len(true_bins) - 1))
+    for u in range(w.shape[1]):
+        h, _ = np.histogram(x, bins=true_bins, weights=np.clip(w[ok, u], 0.0, clip))
+        out[u] = np.where(h > 0, cv / np.where(h > 0, h, 1.0), 1.0)
+    return out
  
  
 def has_mcnu_full(weights_file):
@@ -1600,6 +1718,64 @@ def align_weights_rse(evtdf_file, weights_file, mcnu_df_in, src_cols_dict, verbo
     return wgt, aligned
  
  
+def _true_sig_rse(df_file, true_sig):
+    """(run, subrun, evt, mct) keys of the true-signal table (one row per signal ν)."""
+    i = true_sig.index
+    return _rse_keys(i.get_level_values(0), i.get_level_values(1),
+                     true_sig['nu_id'].fillna(-1).to_numpy(), hdr_rse(df_file))
+
+
+def align_true_signal_weights(df_file, weights_file, mcnu_df_in, src_cols_dict, true_sig, verbose=True):
+    """Universe weights of the combined mcnu sets for every true signal ν (incl. ν lost
+    before preselection), matched on (run, subrun, event, mct). NaN where unmatched.
+    Needed for the 'xsec'-mode signal (efficiency denominator in each universe)."""
+    tk = _true_sig_rse(df_file, true_sig)
+    wi = mcnu_df_in.index
+    wk = _rse_keys(wi.get_level_values(0), wi.get_level_values(1), wi.get_level_values(-1),
+                   hdr_rse(weights_file))
+    wk['_iloc'] = np.arange(len(wk), dtype=np.int64)
+    wk = wk[wk['run'] >= 0].drop_duplicates(['run', 'subrun', 'evt', 'mct'])
+    m = tk.merge(wk, on=['run', 'subrun', 'evt', 'mct'], how='left')
+    has = m['_iloc'].notna().values & (tk['mct'].values >= 0)
+    row = np.where(has, m['_iloc'].fillna(0).values, 0).astype(np.int64)
+    if verbose:
+        print(f'  true signal ν with weights: {has.sum():,}/{len(has):,} ({has.mean():.1%})')
+    cols = [c for cc in src_cols_dict.values() for c in cc]
+    arr = mcnu_df_in[cols].values[row].astype(np.float32)
+    arr[~has] = np.nan
+    return pd.DataFrame(arr, columns=cols, index=true_sig.index)
+
+
+def load_mcnu_full_true_signal(weights_file, df_file, true_sig, verbose=True):
+    """mcnu_full per-knob weights for every true signal ν (same matching as
+    load_mcnu_full_selected). NaN where unmatched."""
+    tk = _true_sig_rse(df_file, true_sig)
+    tk['_pos'] = np.arange(len(tk), dtype=np.int64)
+    look = tk[(tk['run'] >= 0) & (tk['mct'] >= 0)]
+    with pd.HDFStore(weights_file, mode='r') as store:
+        full_keys = sorted(k for k in store.keys() if _re.match(r'^/mcnu_full_\d+$', k))
+        full_cols = store[full_keys[0]].head(1).columns.tolist()
+    w_rse = hdr_rse(weights_file)
+    result = np.full((len(tk), len(full_cols)), np.nan, dtype=np.float32)
+    filled = np.zeros(len(tk), dtype=bool)
+    for fk in _tqdm_txt(full_keys, desc='loading mcnu_full (true signal)', leave=False):
+        with pd.HDFStore(weights_file, mode='r') as store:
+            chunk = store[fk]
+        ci = chunk.index
+        ck = _rse_keys(ci.get_level_values(0), ci.get_level_values(1), ci.get_level_values(-1), w_rse)
+        ck['_chunk_pos'] = np.arange(len(ck), dtype=np.int64)
+        m = look.merge(ck[ck['run'] >= 0], on=['run', 'subrun', 'evt', 'mct'], how='inner')
+        if len(m):
+            m = m.drop_duplicates('_pos')
+            m = m[~filled[m['_pos'].values]]
+            result[m['_pos'].values] = chunk.values[m['_chunk_pos'].values].astype(np.float32)
+            filled[m['_pos'].values] = True
+        del chunk, ck, m; gc.collect()
+    if verbose:
+        print(f'  true signal ν with mcnu_full weights: {filled.sum():,}/{len(tk):,} ({filled.mean():.1%})')
+    return pd.DataFrame(result, index=true_sig.index, columns=pd.MultiIndex.from_tuples(full_cols))
+
+
 def load_mcnu_full_selected(weights_file, df_file, sel_topo, final_stage, verbose=True):
     """mcnu_full per-dial weights for final-selection events, matched on
     (run, subrun, event, mct_index). Unmatched rows are NaN (filled downstream)."""
@@ -1661,30 +1837,69 @@ def _all_hdr(path):
         return pd.concat([st[k] for k in keys])
  
  
-def livetime_scales(data_file, offbeam_file, intime_file,
-                    duty_fraction=None, verbose=True):
-    """Normalization of off-beam data and in-time MC to the on-beam data.
-    on-beam  : number of BNB spills  = rows of pot_0 with TOR860 > 0
-    off-beam : number of gates       = Σ noffbeambnb over first_in_subrun rows
-    in-time  : generated windows     = Σ ngenevt over unique (run, subrun)
-    scale    = (1 − duty) × on-beam spills / (off-beam gates  or  in-time windows)
-    (in-time MC ↔ off-beam: intime_scale = offbeam_scale × gates / ngenevt)"""
-    duty = BEAM_DUTY_FRACTION if duty_fraction is None else duty_fraction
-    with pd.HDFStore(data_file, mode='r') as st:
-        pot0 = st['pot_0']
-    n_spills = int((pot0['TOR860'] > 0).sum())
+def nu_trigger_fraction(data_file, offbeam_file):
+    """Fraction f of BNB gates whose trigger came from a neutrino, measured from the data set.
+    A BNB gate triggers on a ν (prob. f) or, if not, on a cosmic at the off-beam rate R_off:
+        R_on = f + (1 − f)·R_off   →   f = (R_on − R_off) / (1 − R_off)
+    R_on  = triggered on-beam events / BNB gates (pot_0 rows with TOR860 > 0)
+    R_off = triggered off-beam events / off-beam gates (Σ noffbeambnb, first_in_subrun rows)
+    Binomial errors on both rates are propagated to f."""
+    with pd.HDFStore(data_file, mode='r') as st:      # all pot_<k> splits (large samples have several)
+        pot0 = pd.concat([st[k] for k in st.keys() if _re.match(r'^/pot_\d+$', k)])
+    g_on = int((pot0['TOR860'] > 0).sum())
+    on = _all_hdr(data_file)
+    n_on = int(on[['run', 'subrun', 'evt']].drop_duplicates().shape[0])
     ob = _all_hdr(offbeam_file)
-    n_gates = int(ob.loc[ob['first_in_subrun'].astype(bool), 'noffbeambnb'].sum())
+    g_off = int(ob.loc[ob['first_in_subrun'].astype(bool), 'noffbeambnb'].sum())
+    n_off = int(ob[['run', 'subrun', 'evt']].drop_duplicates().shape[0])
+    r_on, r_off = n_on / g_on, n_off / g_off
+    e_on, e_off = np.sqrt(r_on * (1 - r_on) / g_on), np.sqrt(r_off * (1 - r_off) / g_off)
+    f = (r_on - r_off) / (1 - r_off)
+    df_don, df_doff = 1 / (1 - r_off), (r_on - 1) / (1 - r_off) ** 2
+    return dict(f=f, f_err=float(np.hypot(df_don * e_on, df_doff * e_off)),
+                r_on=r_on, r_off=r_off, n_trig_on=n_on, n_trig_off=n_off,
+                gates_on=g_on, gates_off=g_off)
+
+
+def livetime_scales(data_file, offbeam_file, intime_file,
+                    duty_fraction='data', verbose=True):
+    """Normalization of off-beam data and in-time MC to the on-beam (BNB+light) data:
+        scale = (1 − f) × G_BNB / G_cosmic
+    G_BNB    : BNB gates           = rows of pot_0 with TOR860 > 0
+    G_cosmic : off-beam gates      = Σ noffbeambnb over first_in_subrun rows
+               in-time MC windows  = Σ ngenevt over unique (run, subrun)
+    f        : fraction of BNB gates whose trigger came from a neutrino. Data-driven
+               (duty_fraction='data', default): a BNB gate triggers on a ν (prob. f) or, if not,
+               on a cosmic with the off-beam trigger rate R_off, so R_on = f + (1 − f)·R_off →
+                   f = (R_on − R_off) / (1 − R_off),
+               R_on = triggered on-beam events / G_BNB, R_off = triggered off-beam events / G_off.
+               A number fixes f instead (BEAM_DUTY_FRACTION = 0.0725 was the old fixed value).
+    (in-time MC ↔ off-beam: intime_scale = offbeam_scale × gates / ngenevt)"""
+    with pd.HDFStore(data_file, mode='r') as st:
+        pot0 = pd.concat([st[k] for k in st.keys() if _re.match(r'^/pot_\d+$', k)])
+    ft = nu_trigger_fraction(data_file, offbeam_file)
+    n_spills, n_gates = ft['gates_on'], ft['gates_off']
+    n_trig_on, n_trig_off = ft['n_trig_on'], ft['n_trig_off']
+    r_on, r_off, f_data = ft['r_on'], ft['r_off'], ft['f']
+    ob = _all_hdr(offbeam_file)
     it = _all_hdr(intime_file)
     n_gen = int(it.drop_duplicates(['run', 'subrun'])['ngenevt'].sum())
+    f = f_data if duty_fraction == 'data' else float(duty_fraction)
     out = dict(onbeam_nspills=n_spills, offbeam_ngates=n_gates, intime_ngenevt=n_gen,
-               offbeam_scale=(1 - duty) * n_spills / n_gates,
-               intime_scale=(1 - duty) * n_spills / n_gen,
+               onbeam_ntrig=n_trig_on, offbeam_ntrig=n_trig_off, trig_rate_on=r_on, trig_rate_off=r_off,
+               f_data=f_data, f_fixed=BEAM_DUTY_FRACTION, f_used=f,
+               offbeam_scale=(1 - f) * n_spills / n_gates,
+               intime_scale=(1 - f) * n_spills / n_gen,
                n_offbeam_events=len(ob), n_intime_events=len(it))
     if verbose:
-        print(f"On-beam spills (pot_0, TOR860>0): {n_spills:,}  "
+        print(f"On-beam BNB gates (pot_0, TOR860>0): {n_spills:,}  "
               f"({pot0['TOR860'].sum()/max(n_spills, 1):.2e} POT/spill)")
-        print(f"Off-beam gates (noffbeambnb):     {n_gates:,}  → offbeam_scale = {out['offbeam_scale']:.6f}")
+        print(f"Trigger rate per gate: on-beam {n_trig_on:,}/{n_spills:,} = {r_on:.4%}   "
+              f"off-beam {n_trig_off:,}/{n_gates:,} = {r_off:.4%}")
+        print(f"ν-triggered gate fraction f = (R_on − R_off)/(1 − R_off) = {f_data:.4f} (data)   "
+              f"fixed value {BEAM_DUTY_FRACTION}   → using f = {f:.4f}")
+        print(f"Off-beam gates (noffbeambnb):     {n_gates:,}  → offbeam_scale = {out['offbeam_scale']:.6f}"
+              f"  ({(1 - f) / (1 - BEAM_DUTY_FRACTION):.4f} × the fixed-f value)")
         print(f"In-time generated (ngenevt):      {n_gen:,}  → intime_scale  = {out['intime_scale']:.6e}")
         print(f"Triggered fraction: off-beam {len(ob)/n_gates:.2%}   in-time {len(it)/n_gen:.2%}")
     return out

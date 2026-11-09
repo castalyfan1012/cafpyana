@@ -11,17 +11,22 @@ make_nuecc_evtdf_data(f)     — reco-only particle df, FM+FV preselected   (DAT
 make_nuecc_truth_info_df(f)  — per-interaction truth+presel metadata (ALL interactions)
 make_nuecc_statsdf(f)        — alias for make_nuecc_truth_info_df
 make_nuecc_wgtdf(f)          — BNB + GENIE universe weights (preselected nus only)
+make_nuecc_flashdf(f)        — per-interaction flash-match table, ALL interactions (MC)
+make_nuecc_flashdf_data(f)   — same for data (on-beam, off-beam)
 
 Output HDF5 keys (via nueCC_mc.py config)
 ------------------------------------------
     evt_0         particle-level df, FM+FV preselected, MC-truth merged
     truth_info_0  per-interaction metadata, ALL interactions pre-FM/FV cut
+    flash_0       per-interaction flash-match variables, ALL interactions pre-FM/FV
+                  cut (cosmic-only interactions prescaled, see FLASHDF_COSMIC_PRESCALE)
     hdr_0         run/subrun/event header
     pot_0         BNB POT per file
 
 Output HDF5 keys (via nueCC_data.py config)
 --------------------------------------------
     evt_0         reco-only particle-level df, FM+FV preselected
+    flash_0       per-interaction flash-match variables, ALL interactions pre-FM/FV cut
     hdr_0         run/subrun/event header
     pot_0         EXT POT per file (or BNB depending on run type)
 
@@ -101,6 +106,12 @@ try:
 except ImportError:
     _SPINE_FT_BRANCHES = None
 
+try:
+    from makedf.branches import (spineint_flashscores_branches as _FLASH_SCORE_BRANCHES,
+                                 spineint_flashvolumeids_branches as _FLASH_VOL_BRANCHES)
+except ImportError:
+    _FLASH_SCORE_BRANCHES = _FLASH_VOL_BRANCHES = None
+
 # ── Reco-only branch lists (for data mode) ────────────────────────────────────
 try:
     from makedf.makedf import (
@@ -127,6 +138,23 @@ MUON_THRESHOLD_MEV     = 50.0
 PID_ELECTRON           = 1
 PID_MUON               = 2
 
+# ── Columns dropped from evt (not used by the analysis; saves space) ─────────
+#    Only the reco/true copies of these fields go; branches.py stays unchanged
+#    because other analyses share it.
+EVT_DROP_FIELDS = ("cathode_offset", "is_cathode_crosser")
+
+# ── Flash table (flash_0): one row per reco interaction, before any cut ──────
+# MC cosmic-only interactions (truth_cat 7, ~90% of all reco interactions) are
+# kept 1 in FLASHDF_COSMIC_PRESCALE (deterministic in entry/interaction index)
+# with weight w_prescale = FLASHDF_COSMIC_PRESCALE, so the table stays small and
+# weighted histograms are unbiased. Every neutrino interaction and every data
+# interaction is kept (w_prescale = 1).
+FLASHDF_COSMIC_PRESCALE = 10
+# Opflash summary per event: largest flash with time inside this window [us]
+# (generous around the 1.6 us BNB spill, so the window itself can be studied).
+OPFLASH_BEAM_WINDOW_US  = (-2.0, 4.0)
+_OPFLASH_BRANCHES = ["rec.opflashes." + b for b in ("totalpe", "time")]
+
 # ── GENIE truth branches (rec.mc.nu, indexed by dlp_true.nu_id) ──────────────
 _MCNU_BRANCHES = ["rec.mc.nu." + b for b in [
     "E", "pdg", "iscc", "genie_mode", "position.x", "position.y", "position.z",
@@ -146,6 +174,7 @@ _COORD_IDX_MAP = {'x': 'I0', 'y': 'I1', 'z': 'I2'}
 _spine_cache      = {}
 _spine_data_cache = {}
 _truth_info_cache = {}
+_data_presel_cache = {}
 
 
 # ── MC spine loader (reco + truth merged) ─────────────────────────────────────
@@ -156,8 +185,80 @@ def _get_spine_df(f):
         _spine_cache.clear()
         _truth_info_cache.clear()
         gc.collect()
-        _spine_cache[fname] = make_all_spine_df(f)
+        _spine_cache[fname] = _complete_unmatched_reco(make_all_spine_df(f), f)
     return _spine_cache[fname]
+
+
+_XYZ = {"I0": "x", "I1": "y", "I2": "z"}
+
+
+def _complete_unmatched_reco(spine_df, f):
+    """
+    Same reco content for MC as for data (makedf.make_all_spine_df itself is unchanged).
+
+    make_all_spine_df builds the interaction rows from the reco→true match table
+    (rec.dlp.match_ids), so a reco interaction with NO interaction-level truth match is
+    either missing entirely (all its particles unmatched too) or kept with every
+    interaction-level reco field NaN (vertex, is_flash_matched, flash PE, ...). Either way it
+    fails FM / FV in MC, while the reco-only data loader keeps it with its real values.
+
+    Here the rows of those interactions are replaced by the reco-only rows (the loader used for
+    data, columns renamed to the MC convention: I0/I1/I2 → x/y/z where MC uses that). Truth
+    columns stay NaN (nu_id NaN → truth_cat 7, no neutrino); truth columns that the particle
+    match did fill are kept. Interactions with an interaction-level match are untouched.
+    """
+    try:
+        da = _get_spine_df_data(f)
+    except Exception as e:
+        warnings.warn(f"_complete_unmatched_reco: reco-only load failed, MC spine df unchanged — {e}")
+        return spine_df
+    if da is None or da.empty:
+        return spine_df
+
+    mc_cols = set(spine_df.columns)
+    ren = {}
+    for c in da.columns:
+        if c in mc_cols:
+            ren[c] = c
+            continue
+        alt = tuple(_XYZ.get(x, x) for x in (c if isinstance(c, tuple) else (c,)))
+        if alt in mc_cols:
+            ren[c] = alt
+    da = da[list(ren)].rename(columns=ren)
+
+    id_col = next((c for c in spine_df.columns
+                   if isinstance(c, tuple) and c[:3] == ("rec", "dlp", "id") and all(x == "" for x in c[3:])), None)
+    il = list(range(spine_df.index.nlevels - 1))
+    mc_inter = spine_df.index.droplevel(-1)
+    ok_inter = (mc_inter[spine_df[id_col].notna().to_numpy()].unique() if id_col is not None
+                else mc_inter.unique())
+    da_inter = da.index.droplevel(-1)
+    fix = da_inter[~da_inter.isin(ok_inter)].unique()
+    if len(fix) == 0:
+        _spine_data_cache.clear()
+        return spine_df
+
+    new = da[da_inter.isin(fix)].reindex(columns=spine_df.columns)
+    old = spine_df[mc_inter.isin(fix)]
+    if len(old):
+        new = new.combine_first(old.reindex(index=new.index))[spine_df.columns]   # keep particle truth
+    out = pd.concat([spine_df[~mc_inter.isin(fix)], new]).sort_index()
+    # keep the make_all_spine_df dtypes (concat with NaN rows upcasts int → float, float32 → float64)
+    for c, dt in spine_df.dtypes.items():
+        if out[c].dtype == dt:
+            continue
+        if np.issubdtype(dt, np.floating) or not out[c].isna().any():
+            try:
+                out[c] = out[c].astype(dt)
+            except (TypeError, ValueError):
+                pass
+    print(f"  MC spine: {len(fix)} reco interactions without an interaction-level truth match "
+          f"taken from the reco-only loader ({int((~fix.isin(mc_inter.unique())).sum())} were missing, "
+          f"{int(fix.isin(mc_inter.unique()).sum())} had NaN reco fields)")
+    _spine_data_cache.clear()
+    del da
+    gc.collect()
+    return out
 
 
 # ── Data spine loader (reco-only, no dlp_true branches) ───────────────────────
@@ -322,6 +423,18 @@ def _safe(fn, *args, **kwargs):
         return None
 
 
+def _leaf(col):
+    """Last non-empty part of a (multi-level) column name."""
+    parts = [p for p in (col if isinstance(col, tuple) else (col,)) if p != ""]
+    return parts[-1] if parts else ""
+
+
+def _drop_unused_fields(df):
+    """Remove EVT_DROP_FIELDS columns (reco and true) from a particle-level df."""
+    drop = [c for c in df.columns if _leaf(c) in EVT_DROP_FIELDS]
+    return df.drop(columns=drop) if drop else df
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # FIX: Vertex column lookup that handles both x/y/z and I0/I1/I2 naming
 # ══════════════════════════════════════════════════════════════════════════════
@@ -443,6 +556,130 @@ def _apply_presel(spine_df, flash_times_s=None, inter=None):
         passed_fv_reco = pd.Series(False, index=idx)
 
     return passed_fm, passed_fv_reco, idx, il
+
+
+# ── Flash-match table (all interactions, before FM / FV) ──────────────────────
+
+def _ragged_first(rec, branches, idx, how="first"):
+    """Per-interaction summary of a ragged rec.dlp.flash_* branch (one entry per
+    matched TPC volume; empty for unmatched interactions): first entry, or the
+    number of entries (how='size'). Returns NaN / 0 where absent."""
+    if _loadbranches is None or branches is None:
+        return pd.Series(np.nan, index=idx)
+    try:
+        raw = _loadbranches(rec, branches)
+    except Exception as e:
+        warnings.warn(f"_ragged_first: {branches} not loaded — {e}")
+        return pd.Series(np.nan, index=idx)
+    s = raw[raw.columns[0]]
+    g = s.groupby(level=list(range(s.index.nlevels - 1)))
+    out = g.size() if how == "size" else g.first()
+    return out.reindex(idx, fill_value=0 if how == "size" else np.nan)
+
+
+def _opflash_event_summary(rec, entries):
+    """Event-level optical-flash summary (all flashes, any interaction):
+    n_opflash, largest flash PE / time inside OPFLASH_BEAM_WINDOW_US, largest PE overall."""
+    cols = ["evt_n_opflash", "evt_beam_flash_pe", "evt_beam_flash_time", "evt_max_flash_pe"]
+    out = pd.DataFrame(np.nan, index=pd.Index(np.unique(entries), name="entry"), columns=cols)
+    if _loadbranches is None:
+        return out
+    try:
+        of = _loadbranches(rec, _OPFLASH_BRANCHES)
+    except Exception as e:
+        warnings.warn(f"_opflash_event_summary: rec.opflashes not loaded — {e}")
+        return out
+    of.columns = [_leaf(c) for c in of.columns]          # ('rec','opflashes','totalpe') → 'totalpe'
+    ent = of.index.get_level_values(0)
+    lo, hi = OPFLASH_BEAM_WINDOW_US
+    inw = of[(of["time"] > lo) & (of["time"] < hi)]
+    g_all = of.groupby(level=0)
+    out["evt_n_opflash"]    = g_all.size().reindex(out.index).fillna(0)
+    out["evt_max_flash_pe"] = g_all["totalpe"].max().reindex(out.index)
+    if len(inw):
+        imax = inw.groupby(level=0)["totalpe"].idxmax()
+        best = inw.loc[imax.values]
+        best.index = best.index.get_level_values(0)
+        out["evt_beam_flash_pe"]   = best["totalpe"].reindex(out.index)
+        out["evt_beam_flash_time"] = best["time"].reindex(out.index)
+    return out
+
+
+def _build_flash_table(spine_df, rec, passed_fm, passed_fv_reco, truth_cat=None):
+    """
+    One row per reco interaction (ALL, before flash-match or FV cut) with the
+    flash-match variables needed to study the FM cut itself (Lynn TN Fig. 1):
+
+      vtx_x/y/z, passed_fm, passed_fv_reco, is_flash_matched,
+      flash_total_pe (−1 if unmatched), flash_hypo_pe, flash_score, flash_time
+      (first matched flash, as used by the FM cut), n_flash (matched TPC volumes),
+      flash_volume_id, depositions_sum, size, num_primary_particles, is_contained,
+      is_time_contained, evt_* opflash summary (see _opflash_event_summary),
+      truth_cat (MC only), w_prescale.
+
+    SPINE stores only the winning match (n_flash entries = TPC volumes of that
+    one match, same score), so there is no runner-up flash score.
+    """
+    il    = list(range(spine_df.index.nlevels - 1))
+    inter = spine_df.groupby(level=il).first()
+    idx   = inter.index
+
+    def col(name):
+        # interaction-level reco field only: rec.dlp.<name> (not rec.dlp.particles.<name>,
+        # not rec.dlp_true.*) — _find_col matches on the last name part alone
+        for c in spine_df.columns:
+            parts = [p for p in (c if isinstance(c, tuple) else (c,)) if p != ""]
+            if len(parts) >= 2 and parts[-1] == name and parts[-2] == "dlp":
+                return inter[c]
+        return pd.Series(np.nan, index=idx)
+
+    out = pd.DataFrame(index=idx)
+    for k in ("x", "y", "z"):
+        c = _find_vertex_col(spine_df, k, f"!{BRANCH_TRUE}")
+        out[f"vtx_{k}"] = (inter[c] if c is not None else np.nan)
+    out["passed_fm"]             = passed_fm.reindex(idx, fill_value=False).astype(bool)
+    out["passed_fv_reco"]        = passed_fv_reco.reindex(idx, fill_value=False).astype(bool)
+    out["is_flash_matched"]      = col("is_flash_matched").fillna(0)
+    out["flash_total_pe"]        = col("flash_total_pe")
+    out["flash_hypo_pe"]         = col("flash_hypo_pe")
+    out["flash_score"]           = _ragged_first(rec, _FLASH_SCORE_BRANCHES, idx)
+    out["flash_time"]            = _ragged_first(rec, _SPINE_FT_BRANCHES, idx)
+    out["n_flash"]               = _ragged_first(rec, _SPINE_FT_BRANCHES, idx, how="size")
+    out["flash_volume_id"]       = _ragged_first(rec, _FLASH_VOL_BRANCHES, idx).fillna(-1)
+    out["depositions_sum"]       = col("depositions_sum")
+    out["size"]                  = col("size")
+    out["num_primary_particles"] = col("num_primary_particles")
+    out["is_contained"]          = col("is_contained").fillna(0)
+    out["is_time_contained"]     = col("is_time_contained").fillna(0)
+
+    ev = _opflash_event_summary(rec, idx.get_level_values(0))
+    out = pd.concat([out, ev.reindex(idx.get_level_values(0)).set_axis(idx)], axis=1)
+
+    w = np.ones(len(idx), dtype=np.float32)
+    if truth_cat is not None:
+        tc = truth_cat.reindex(idx).fillna(7).astype(np.int8)
+        out["truth_cat"] = tc
+        e   = np.asarray(idx.get_level_values(0), dtype=np.int64)
+        i   = np.asarray(idx.get_level_values(1), dtype=np.int64)
+        cos = (tc.values == 7)
+        keep_cos = ((e * 7919 + i) % FLASHDF_COSMIC_PRESCALE) == 0
+        keep = ~cos | keep_cos
+        w[cos] = FLASHDF_COSMIC_PRESCALE
+        out, w = out[keep], w[keep]
+    out["w_prescale"] = w
+
+    return out.astype({
+        "vtx_x": np.float32, "vtx_y": np.float32, "vtx_z": np.float32,
+        "passed_fm": bool, "passed_fv_reco": bool, "is_flash_matched": np.int8,
+        "flash_total_pe": np.float32, "flash_hypo_pe": np.float32,
+        "flash_score": np.float32, "flash_time": np.float32, "n_flash": np.int8,
+        "flash_volume_id": np.int8, "depositions_sum": np.float32, "size": np.float32,
+        "num_primary_particles": np.float32, "is_contained": np.int8,
+        "is_time_contained": np.int8, "evt_n_opflash": np.float32,
+        "evt_beam_flash_pe": np.float32, "evt_beam_flash_time": np.float32,
+        "evt_max_flash_pe": np.float32, "w_prescale": np.float32,
+        **({"truth_cat": np.int8} if truth_cat is not None else {}),
+    })
 
 
 # ── GENIE truth: one row per neutrino in rec.mc.nu ───────────────────────────
@@ -736,7 +973,7 @@ def make_nuecc_evtdf(f):
     except Exception as e:
         warnings.warn(f"make_nuecc_evtdf: MC CV merge skipped — {e}")
 
-    return spine_df
+    return _drop_unused_fields(spine_df)
 
 
 # ── Public maker 2: data evtdf (reco-only) ───────────────────────────────────
@@ -772,6 +1009,8 @@ def make_nuecc_evtdf_data(f):
             )
 
     passed_fm, passed_fv_reco, idx, il = _apply_presel(spine_df, flash_times_s)
+    _data_presel_cache.clear()
+    _data_presel_cache[str(f)] = (passed_fm, passed_fv_reco)
 
     presel_idx = idx[passed_fm & passed_fv_reco]
     n_total  = len(idx)
@@ -779,7 +1018,7 @@ def make_nuecc_evtdf_data(f):
     print(f"  data evtdf: {n_presel} / {n_total} interactions pass FM+FV presel")
 
     spine_df = spine_df[spine_df.index.droplevel(-1).isin(presel_idx)]
-    return spine_df
+    return _drop_unused_fields(spine_df)
 
 
 # ── Public maker 3: truth_info_df ────────────────────────────────────────────
@@ -795,6 +1034,44 @@ def make_nuecc_truth_info_df(f):
 def make_nuecc_statsdf(f):
     """Backward-compatible alias for make_nuecc_truth_info_df."""
     return make_nuecc_truth_info_df(f)
+
+
+# ── Public maker 3b: flash-match table (all interactions) ────────────────────
+
+def make_nuecc_flashdf(f):
+    """MC: per-interaction flash-match table for ALL reco interactions (before
+    FM / FV), with truth_cat; cosmic-only rows prescaled (see _build_flash_table).
+    Uses the same spine df (makedf.make_all_spine_df) and the same FM / FV flags as
+    truth_info / evt. Must run after make_nuecc_truth_info_df in the same file
+    (shares its caches)."""
+    ti = _get_truth_info(f)
+    if ti.empty:
+        return pd.DataFrame()
+    ti = ti[~ti["is_truth_only"]]
+    return _build_flash_table(_get_spine_df(f), f["recTree"],
+                              ti["passed_fm"], ti["passed_fv_reco"], truth_cat=ti["truth_cat"])
+
+
+def make_nuecc_flashdf_data(f):
+    """Data: per-interaction flash-match table for ALL reco interactions (before
+    FM / FV). Uses the FM / FV flags of make_nuecc_evtdf_data for the same file
+    (computed again if that maker did not run first)."""
+    spine_df = _get_spine_df_data(f)
+    if spine_df.empty:
+        return pd.DataFrame()
+    key = str(f)
+    if key in _data_presel_cache:
+        passed_fm, passed_fv_reco = _data_presel_cache[key]
+    else:
+        flash_times_s = None
+        if _loadbranches is not None and _SPINEINT_FLASHTIMES is not None:
+            try:
+                raw_ft = _loadbranches(f["recTree"], _SPINEINT_FLASHTIMES)
+                flash_times_s = raw_ft[raw_ft.columns[0]]
+            except Exception as e:
+                warnings.warn(f"make_nuecc_flashdf_data: flash_times load failed — {e}")
+        passed_fm, passed_fv_reco, _, _ = _apply_presel(spine_df, flash_times_s)
+    return _build_flash_table(spine_df, f["recTree"], passed_fm, passed_fv_reco)
 
 
 # Extra cross-section dials (module level: used by both wgtdf makers)

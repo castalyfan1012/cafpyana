@@ -3,6 +3,19 @@ nue_selection.py
 ----------------
 nueCC inclusive selection for SPINE DLP.
 
+Truth (signal / categories) comes from truth_info, written by
+makedf/make_nueCC_df.py from the GENIE neutrino (rec.mc.nu) matched to each
+reco interaction through rec.dlp_true.nu_id:
+    0 nueCC FV, exactly 1 primary e (KE >= 500 MeV)   1 nueCC out FV
+    2 numuCC (mu > 50 MeV) + pi0                       3 NC pi0
+    4 other numuCC                                      5 other NC
+    6 other nu                                          7 cosmic
+is_true_signal marks ONE row per true signal neutrino (the efficiency
+denominator; truth-only rows are added for unreconstructed signal), while
+truth_cat == 0 marks every reco interaction matched to a signal neutrino
+(the purity numerator).  Use stage_counts / signal_selected_mask below for
+cut-flow purity and efficiency so split neutrinos are counted once.
+
 Fiducial volume (fiducial_cut_tmp — matches C++ definition)
 ------------------------------------------------------------
     x_region  = (|x| > 5) & (|x| < 190)
@@ -60,15 +73,17 @@ CUT_LABELS = [
 # ── Shower-quality cuts ──────────────────────────────────────────────────────
 # Thresholds from the cumulative threshold scan (nh.threshold_plots_cumulative).
 # The THRESH_* names are kept because other cells/modules may import them.
-THRESH_PRIMARY_SCORE = 0.995     # leading e primary softmax (I1)   >
-THRESH_PID_SCORE     = 0.91      # leading e PID softmax (I1)       >
-THRESH_VERTEX_DIST   = 3.45      # conversion gap [cm]              <
-THRESH_DEDX          = 7.90      # start dE/dx [MeV/cm]             <   ← re-check after re-scan
+THRESH_PRIMARY_SCORE = 0.99     # leading e primary softmax (I1)   >
+THRESH_PID_SCORE     = 0.895      # leading e PID softmax (I1)       >
+THRESH_VERTEX_DIST   = 3.95      # conversion gap [cm]              <
+THRESH_DEDX          = 3.20      # start dE/dx upper edge [MeV/cm]  <   ← re-check after re-scan
+THRESH_DEDX_LO       = 1.28      # start dE/dx lower edge [MeV/cm]  >   (0 = no lower edge)
 THRESH_DIR_SPREAD    = 0.50      # directional spread               <   (not used)
 THRESH_AXIAL_SPREAD  = 0.00      # axial spread                     >   (not used)
 
 # Registry of every shower cut the code knows how to apply:
 #   cut name : (leading-electron column, direction, threshold, table label)
+#   direction ">" / "<" with a number, or "<>" with (lo, hi) for a window lo < x < hi
 # A cut is APPLIED only if its name is listed in CUT_NAMES_MORE below.
 SHOWER_CUTS = {
     "electron_primary_score": (("primary_scores", "I1"),   ">", THRESH_PRIMARY_SCORE, "Electron primary score"),
@@ -76,7 +91,7 @@ SHOWER_CUTS = {
     "vertex_distance"       : (("vertex_distance", ""),    "<", THRESH_VERTEX_DIST,   "Conversion gap"),
     "directional_spread"    : (("directional_spread", ""), "<", THRESH_DIR_SPREAD,    "Directional spread"),
     "axial_spread"          : (("axial_spread", ""),       ">", THRESH_AXIAL_SPREAD,  "Axial spread"),
-    "start_dedx"            : (("start_dedx", ""),         "<", THRESH_DEDX,          "Start dE/dx"),
+    "start_dedx"            : (("start_dedx", ""),         "<>", (THRESH_DEDX_LO, THRESH_DEDX), "Start dE/dx"),
 }
 
 # Cuts applied, in order.  Comment a line out to drop that cut — nothing else
@@ -155,17 +170,20 @@ def primary_muon_mask(evtdf):
 
 def classify_truth(evtdf, verbose=True):
     """
-    Assign each reconstructed interaction to a truth category.
+    Approximate truth category per reconstructed interaction from the
+    reco-matched dlp_true particles in evtdf.
 
-    FV uses fiducial_cut_tmp on the true interaction vertex (geometric cut,
-    not is_fiducial). Must match make_nueCC_df.py _build_truth_info exactly.
+    Only a fallback for plotting helpers when no truth categories are passed.
+    The analysis uses truth_info['truth_cat'] from make_nueCC_df.py, which is
+    built from the GENIE neutrino (no reco-fragment duplicates, no missing
+    unreconstructed muons) — the two can differ for a few % of interactions.
 
-    Categories (priority order, first match wins)
-    -----------------------------------------------
+    Categories (same numbering as truth_info, first match wins)
+    ------------------------------------------------------------
     0  nueCC FV (signal)   1  nueCC out FV
     2  numuCC + pi0         3  NC pi0
     4  other numuCC         5  other NC
-    6  cosmic               7  neutrino catch-all
+    6  other nu             7  cosmic
     """
     il  = inter_levels(evtdf)
     idx = evtdf.groupby(level=il).size().index
@@ -210,22 +228,24 @@ def classify_truth(evtdf, verbose=True):
         print(f"  true_muon    : {true_muon.sum():>8,}")
         print(f"  has_pi0      : {has_pi0.sum():>8,}")
 
-    cat = pd.Series(7, index=idx, dtype=int)
-    cat[~is_nu] = 6
-    nu = is_nu
-    cat[nu &  is_cc & ~is_fv  & true_elec]            = 1
-    cat[nu &  is_cc &  is_fv  & true_elec]            = 0   # signal
-    cat[nu &  is_cc & true_muon & has_pi0]             = 2
-    cat[nu & ~is_cc & has_pi0]                         = 3
-    cat[nu &  is_cc & true_muon & ~has_pi0]            = 4
-    cat[nu & ~is_cc & ~has_pi0]                        = 5
+    true_elec = true_elec.reindex(idx, fill_value=False)
+    nu  = is_nu.to_numpy()
+    cat = pd.Series(np.select(
+        [~nu,
+         nu &  is_cc &  is_fv & true_elec,
+         nu &  is_cc & ~is_fv & true_elec,
+         nu &  is_cc & true_muon & has_pi0,
+         nu & ~is_cc & has_pi0,
+         nu &  is_cc & true_muon,
+         nu & ~is_cc],
+        [7, 0, 1, 2, 3, 4, 5], default=6), index=idx, dtype=int)
 
     if verbose:
         labels = {
             0: "nueCC FV (signal)",  1: "nueCC out FV",
             2: "numuCC + pi0",       3: "NC pi0",
             4: "other numuCC",       5: "other NC",
-            6: "cosmic",             7: "other neutrino",
+            6: "other neutrino",     7: "cosmic",
         }
         print("\n=== Truth category summary ===")
         for c, lbl in labels.items():
@@ -397,8 +417,13 @@ def _shower_cut_pass(step, lead):
     col, cdir, thr, _ = SHOWER_CUTS[step]
     if col not in lead.columns:
         raise KeyError(f"{step}: column {col} not in reco particle columns")
-    v = lead[col]
-    return (v > thr) if cdir == ">" else (v < thr)      # NaN fails the cut
+    v = lead[col]                                       # NaN fails every cut
+    if cdir == "<>":
+        lo, hi = thr
+        return (v > lo) & (v < hi)
+    if cdir not in (">", "<"):
+        raise ValueError(f"{step}: unknown cut direction {cdir!r}")
+    return (v > thr) if cdir == ">" else (v < thr)
 
 
 # ── Extended cut flow (shower quality) ───────────────────────────────────────
@@ -438,9 +463,11 @@ def shower_qual_cuts(evtdf, flash_times_df=None):
 # ── True-signal denominator ───────────────────────────────────────────────────
 
 def true_signal_index(evtdf):
-    """Return interaction index of all true nueCC-in-FV signal interactions.
-    FV uses fiducial_cut_tmp on true vertex (matches classify_truth and
-    make_nueCC_df.py _build_truth_info).
+    """Return interaction index of reco interactions matched to true signal
+    (reco-matched approximation, see classify_truth).
+
+    NOT an efficiency denominator: evtdf only holds preselected interactions.
+    Use truth_info['is_true_signal'] (one row per true signal neutrino).
     """
     il = inter_levels(evtdf)
     ti = true_interactions(evtdf)
@@ -461,6 +488,84 @@ def true_signal_index(evtdf):
 
     sig = is_nu & is_cc & is_fv & prim_elec
     return sig[sig].index
+
+
+# ── Purity / efficiency from truth_info (neutrino-level signal) ──────────────
+
+def signal_nu_keys(truth_info):
+    """(file, entry, nu_id) per truth_info row — all index levels but the
+    interaction one, plus nu_id — used to group the reco interactions of one
+    neutrino.  nu_id is the 'mct_index' column, which make_nueCC_df.py fills
+    with rec.dlp_true.nu_id."""
+    if "mct_index" not in truth_info.columns:
+        raise KeyError("truth_info has no 'mct_index' (nu_id) column — "
+                       "load it (TRUTH_COLS) or remake the dfs")
+    idx = truth_info.index
+    lvls = [idx.get_level_values(i) for i in range(idx.nlevels - 1)]
+    return pd.MultiIndex.from_arrays(lvls + [truth_info["mct_index"].to_numpy()])
+
+
+def signal_selected_mask(truth_info, stage_idx):
+    """Bool array aligned to truth_info: True on the is_true_signal row of every
+    true signal neutrino with at least one truth_cat==0 interaction in stage_idx.
+
+    The is_true_signal row is chosen per neutrino by make_nueCC_df.py (presel >
+    FM rank), so it is not always the reco interaction that survives a later cut
+    when a neutrino is split into several interactions; this lifts the
+    selection to the neutrino level.
+    """
+    sig_row = truth_info["is_true_signal"].to_numpy(dtype=bool)
+    in_stage = truth_info.index.isin(stage_idx)
+    if "mct_index" not in truth_info.columns:          # old dfs: representative row only
+        return sig_row & in_stage
+    keys = signal_nu_keys(truth_info)
+    cat0 = truth_info["truth_cat"].to_numpy() == 0
+    sel_keys = keys[cat0 & in_stage].unique()
+    return sig_row & keys.isin(sel_keys)
+
+
+def stage_counts(truth_info, stage_idx):
+    """Cut-flow numbers for one stage.
+
+    n_sel   : reco interactions selected
+    n_sig   : selected interactions with truth_cat == 0 (purity numerator,
+              same counting as the stacked histograms)
+    n_nu    : true signal neutrinos with >= 1 selected signal interaction
+              (efficiency numerator)
+    purity  : n_sig / n_sel            (everything selected in the denominator)
+    eff     : n_nu / N true signal     (all true signal neutrinos, pre-cut)
+    """
+    reco = ~truth_info["is_truth_only"].to_numpy(dtype=bool) \
+        if "is_truth_only" in truth_info.columns else np.ones(len(truth_info), bool)
+    in_stage = truth_info.index.isin(stage_idx) & reco
+    n_sel = int(in_stage.sum())
+    n_sig = int((in_stage & (truth_info["truth_cat"].to_numpy() == 0)).sum())
+    n_nu  = int(signal_selected_mask(truth_info, stage_idx).sum())
+    n_den = int(truth_info["is_true_signal"].sum())
+    return dict(n_sel=n_sel, n_sig=n_sig, n_nu=n_nu,
+                purity=n_sig / n_sel if n_sel else float("nan"),
+                eff=n_nu / n_den if n_den else float("nan"))
+
+
+def true_signal_table(truth_info, stage_idx_dict):
+    """One row per true signal neutrino (the efficiency / response denominator):
+    true kinematics + one bool column sel_<stage> per stage (neutrino-level,
+    see signal_selected_mask).  Index = the is_true_signal rows of truth_info."""
+    sig = truth_info["is_true_signal"].to_numpy(dtype=bool)
+    out = pd.DataFrame(index=truth_info.index[sig])
+    for src, dst in [("true_leading_e_ke", "true_ke"),
+                     ("true_leading_e_costheta", "true_costheta"),
+                     ("true_leading_e_p", "true_p")]:
+        out[dst] = truth_info.loc[sig, src].to_numpy(dtype="float32")
+    if "mct_index" in truth_info.columns:
+        out["nu_id"] = truth_info.loc[sig, "mct_index"].to_numpy()
+    if "is_truth_only" in truth_info.columns:
+        out["is_truth_only"] = truth_info.loc[sig, "is_truth_only"].to_numpy(dtype=bool)
+    out["truth_cat"] = np.int8(0)
+    out["is_sig"] = True
+    for name, idx in stage_idx_dict.items():
+        out[f"sel_{name}"] = signal_selected_mask(truth_info, idx)[sig]
+    return out
 
 
 # ── Leading-electron observables ──────────────────────────────────────────────

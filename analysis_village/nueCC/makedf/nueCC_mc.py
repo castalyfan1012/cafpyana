@@ -44,6 +44,8 @@ from makedf.makedf import make_hdrdf, make_potdf_bnb
 # DFS   = [make_nuecc_evtdf, make_nuecc_statsdf, make_hdrdf, make_potdf_bnb]
 # NAMES = ["evt", "stats", "hdr", "pot"]
 
-from make_nueCC_df import make_nuecc_evtdf, make_nuecc_truth_info_df
-DFS   = [make_nuecc_evtdf, make_nuecc_truth_info_df, make_hdrdf, make_potdf_bnb]
-NAMES = ["evt", "truth_info", "hdr", "pot"]   # → truth_info_0 in HDF5
+from make_nueCC_df import make_nuecc_evtdf, make_nuecc_truth_info_df, make_nuecc_flashdf
+# flash: one row per reco interaction before FM/FV (flash-match study); runs after
+# truth_info so it reuses the cached spine df and truth categories
+DFS   = [make_nuecc_evtdf, make_nuecc_truth_info_df, make_nuecc_flashdf, make_hdrdf, make_potdf_bnb]
+NAMES = ["evt", "truth_info", "flash", "hdr", "pot"]   # → truth_info_0, flash_0 in HDF5
